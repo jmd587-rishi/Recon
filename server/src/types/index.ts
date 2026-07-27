@@ -257,3 +257,62 @@ export interface TableCountsRequest {
   warehouseId: string;
   tables: { schema: string; name: string }[];
 }
+
+// ---- Project summary (onboarding overview) ----
+
+export type TableKind = "fact" | "dimension" | "bridge" | "staging" | "other";
+
+export interface ProjectTableInfo {
+  schema: string;
+  name: string;
+  kind: TableKind;
+  rowCount: number | null;
+  columnCount: number | null;
+  comment: string | null;
+}
+
+export interface ProjectLayerSummary {
+  layer: LayerRef;
+  tables: ProjectTableInfo[];
+  totalRows: number | null;
+}
+
+export interface ProjectStats {
+  layerCount: number;
+  tableCount: number;
+  factTableCount: number;
+  dimensionTableCount: number;
+  otherTableCount: number;
+  totalRows: number | null;
+  lineageEdgeCount: number;
+  notebookCount: number;
+}
+
+export interface ProjectNarrative {
+  /** What this data project is, in plain English. */
+  overview: string;
+  /** How it's set up — the medallion architecture / layering. */
+  architecture: string;
+  /** How the pipeline actually runs data end to end. */
+  howItWorks: string;
+  /** Practical pointers for an engineer joining the project. */
+  onboardingTips: string[];
+}
+
+export interface ProjectSummary {
+  catalog: string;
+  warehouseId: string;
+  notebookRoot: string;
+  layers: ProjectLayerSummary[];
+  stats: ProjectStats;
+  lineage: LineageEdge[];
+  /** Null when Azure OpenAI is not configured — the structured summary is still returned. */
+  narrative: ProjectNarrative | null;
+}
+
+export interface ProjectSummaryRequest {
+  catalog: string;
+  warehouseId: string;
+  notebookRoot: string;
+  layers: LayerRef[];
+}

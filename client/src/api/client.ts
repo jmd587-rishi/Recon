@@ -5,6 +5,8 @@ import type {
   LevelAnalysisResponse,
   PipelineAnalysis,
   PipelineAnalyzeRequest,
+  ProjectSummary,
+  ProjectSummaryRequest,
   Schema,
   Table,
   TableCountsRequest,
@@ -77,4 +79,8 @@ export function getTableCounts(payload: TableCountsRequest) {
 
 export function analyzePipeline(payload: PipelineAnalyzeRequest) {
   return unwrap<PipelineAnalysis>(api.post("/pipeline/analyze", payload));
+}
+
+export function getProjectSummary(payload: ProjectSummaryRequest) {
+  return unwrap<ProjectSummary>(api.post("/pipeline/summary", payload));
 }

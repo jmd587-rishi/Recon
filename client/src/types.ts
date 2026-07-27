@@ -215,3 +215,57 @@ export interface TableCountsRequest {
   warehouseId: string;
   tables: { schema: string; name: string }[];
 }
+
+// ---- Project summary (onboarding overview) ----
+
+export type TableKind = "fact" | "dimension" | "bridge" | "staging" | "other";
+
+export interface ProjectTableInfo {
+  schema: string;
+  name: string;
+  kind: TableKind;
+  rowCount: number | null;
+  columnCount: number | null;
+  comment: string | null;
+}
+
+export interface ProjectLayerSummary {
+  layer: LayerRef;
+  tables: ProjectTableInfo[];
+  totalRows: number | null;
+}
+
+export interface ProjectStats {
+  layerCount: number;
+  tableCount: number;
+  factTableCount: number;
+  dimensionTableCount: number;
+  otherTableCount: number;
+  totalRows: number | null;
+  lineageEdgeCount: number;
+  notebookCount: number;
+}
+
+export interface ProjectNarrative {
+  overview: string;
+  architecture: string;
+  howItWorks: string;
+  onboardingTips: string[];
+}
+
+export interface ProjectSummary {
+  catalog: string;
+  warehouseId: string;
+  notebookRoot: string;
+  layers: ProjectLayerSummary[];
+  stats: ProjectStats;
+  lineage: LineageEdge[];
+  narrative: ProjectNarrative | null;
+}
+
+export interface ProjectSummaryRequest {
+  catalog: string;
+  warehouseId: string;
+  notebookRoot: string;
+  layers: LayerRef[];
+}

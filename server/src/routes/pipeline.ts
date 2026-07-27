@@ -1,9 +1,20 @@
 import { Router } from "express";
 import { computeLayerExclusions } from "../services/exclusionAnalyzer.js";
 import { listTables, listWarehouses, runSqlCount } from "../services/databricksClient.js";
-import { explainExclusionRules, LlmConfigError } from "../services/llmClient.js";
+import { explainExclusionRules, LlmConfigError, summarizeProject } from "../services/llmClient.js";
+import { buildProjectStats, classifyTable } from "../services/projectSummary.js";
 import { buildLineageGraph, scanAllLineageFacts } from "../services/tableLineage.js";
-import type { ExclusionRule, LayerExclusionResult, LayerRef, PipelineAnalysis, Table } from "../types/index.js";
+import type {
+  ExclusionRule,
+  LayerExclusionResult,
+  LayerRef,
+  PipelineAnalysis,
+  ProjectLayerSummary,
+  ProjectNarrative,
+  ProjectSummary,
+  ProjectTableInfo,
+  Table
+} from "../types/index.js";
 import { type ConnectedRequest, requireConnection } from "./requireConnection.js";
 
 export const pipelineRouter = Router();
@@ -142,6 +153,89 @@ pipelineRouter.post("/analyze", async (req, res) => {
 
     const analysis: PipelineAnalysis = { exclusions, lineage };
     res.json(analysis);
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+pipelineRouter.post("/summary", async (req, res) => {
+  const { databricksConnection: connection } = req as ConnectedRequest;
+  const { catalog, warehouseId, notebookRoot, layers } = req.body ?? {};
+
+  if (!catalog || !warehouseId || !isValidLayers(layers)) {
+    res.status(400).json({
+      error: "Expected body: { catalog, warehouseId, notebookRoot?, layers: [{ label, schema }, ...] } with at least 1 layer"
+    });
+    return;
+  }
+
+  const root = typeof notebookRoot === "string" && notebookRoot.length > 0 ? notebookRoot : "/";
+
+  try {
+    const tablesByLayer = await mapWithConcurrency(layers as LayerRef[], CONCURRENCY, async (layer) => ({
+      layer,
+      tables: await listTables(connection, catalog, layer.schema)
+    }));
+
+    const tableIndex = new Map<string, Table>();
+    for (const { tables } of tablesByLayer) {
+      for (const table of tables) tableIndex.set(table.name.toLowerCase(), table);
+    }
+
+    // Row counts are best-effort: a table may be a view, lack a running warehouse path, etc. — a
+    // failed count leaves rowCount null rather than failing the whole summary.
+    const summaryLayers: ProjectLayerSummary[] = await mapWithConcurrency(tablesByLayer, 1, async ({ layer, tables }) => {
+      const infos = await mapWithConcurrency(tables, CONCURRENCY, async (t): Promise<ProjectTableInfo> => {
+        let rowCount: number | null = null;
+        try {
+          rowCount = await runSqlCount(connection, warehouseId, catalog, layer.schema, t.name);
+        } catch {
+          rowCount = null;
+        }
+        return {
+          schema: layer.schema,
+          name: t.name,
+          kind: classifyTable(t.name, layer.label),
+          rowCount,
+          columnCount: t.columns?.length ?? null,
+          comment: t.comment ?? null
+        };
+      });
+      const totalRows = infos.reduce<number | null>(
+        (acc, i) => (i.rowCount === null ? acc : (acc ?? 0) + i.rowCount),
+        null
+      );
+      return { layer, tables: infos, totalRows };
+    });
+
+    const facts = await scanAllLineageFacts(connection, root);
+    const lineage = buildLineageGraph(facts, tableIndex);
+    const stats = buildProjectStats(summaryLayers, lineage);
+
+    let narrative: ProjectNarrative | null = null;
+    try {
+      narrative = await summarizeProject({
+        catalog,
+        notebookRoot: root,
+        layers: summaryLayers,
+        stats,
+        lineage: lineage.map((e) => ({ from: e.from, to: e.to }))
+      });
+    } catch (err) {
+      if (!(err instanceof LlmConfigError)) throw err;
+      // LLM not configured — still return the structured summary, just without the narrative.
+    }
+
+    const summary: ProjectSummary = {
+      catalog,
+      warehouseId,
+      notebookRoot: root,
+      layers: summaryLayers,
+      stats,
+      lineage,
+      narrative
+    };
+    res.json(summary);
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
   }

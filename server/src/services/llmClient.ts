@@ -1,5 +1,14 @@
 import axios from "axios";
-import type { CodeCandidate, LevelFinding, LevelReport, LevelSeverity, LogicValidationResult } from "../types/index.js";
+import type {
+  CodeCandidate,
+  LevelFinding,
+  LevelReport,
+  LevelSeverity,
+  LogicValidationResult,
+  ProjectLayerSummary,
+  ProjectNarrative,
+  ProjectStats
+} from "../types/index.js";
 
 export class LlmConfigError extends Error {}
 
@@ -458,4 +467,93 @@ export async function explainExclusionRules(rules: ExclusionRuleLlmInput[]): Pro
   if (rules.length === 0) return [];
   const content = await callAzureOpenAi(buildExclusionMessages(rules));
   return parseExclusionResponse(content, rules.length);
+}
+
+// ---- Project summary narrative (onboarding overview) ----
+
+export interface ProjectSummaryLlmInput {
+  catalog: string;
+  notebookRoot: string;
+  layers: ProjectLayerSummary[];
+  stats: ProjectStats;
+  lineage: { from: string; to: string }[];
+}
+
+export function buildProjectSummaryMessages(input: ProjectSummaryLlmInput): ChatMessage[] {
+  const layerBlock = input.layers
+    .map((l) => {
+      const tables = l.tables.length
+        ? l.tables
+            .map((t) => `    - ${t.name} [${t.kind}]${t.rowCount !== null ? ` — ${t.rowCount} rows` : ""}${t.comment ? ` — ${t.comment}` : ""}`)
+            .join("\n")
+        : "    (no tables)";
+      return `  Layer "${l.layer.label}" (schema ${l.layer.schema}):\n${tables}`;
+    })
+    .join("\n");
+
+  const lineageBlock = input.lineage.length
+    ? input.lineage.map((e) => `  ${e.from} -> ${e.to}`).join("\n")
+    : "  (no lineage edges discovered)";
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior data engineer writing an onboarding brief for someone who has just joined a " +
+        "Databricks medallion (bronze/silver/gold) data project and has never seen it before. You are given " +
+        "the catalog, the ordered medallion layers with their tables (each tagged fact/dimension/bridge/" +
+        "staging/other and, where known, row counts), aggregate stats, and the table-to-table lineage edges " +
+        "extracted from the transformation notebooks. Explain the project clearly and concretely, grounded " +
+        "ONLY in the data provided — never invent table names, counts, or business domains you weren't given. " +
+        "Write for a smart engineer who is new to THIS project, not new to data engineering. " +
+        'Respond with ONLY compact JSON: {"overview": "<2-4 sentences: what this data project is and what it produces>", ' +
+        '"architecture": "<2-4 sentences: how it is set up — the layers, what role each plays, how many fact vs dimension tables>", ' +
+        '"howItWorks": "<3-5 sentences: how data actually flows end to end through the layers, citing real lineage/tables>", ' +
+        '"onboardingTips": ["<short, concrete pointer for the new engineer>", ...]}. ' +
+        "No markdown, no text outside the JSON object."
+    },
+    {
+      role: "user",
+      content:
+        `Catalog: ${input.catalog}\n` +
+        `Notebook root scanned: ${input.notebookRoot}\n\n` +
+        `Headline stats: ${input.stats.layerCount} layers, ${input.stats.tableCount} tables ` +
+        `(${input.stats.factTableCount} fact, ${input.stats.dimensionTableCount} dimension, ${input.stats.otherTableCount} other), ` +
+        `${input.stats.lineageEdgeCount} lineage edges across ${input.stats.notebookCount} notebooks` +
+        `${input.stats.totalRows !== null ? `, ${input.stats.totalRows} total rows` : ""}.\n\n` +
+        `Layers and tables:\n${layerBlock}\n\n` +
+        `Table lineage (source -> target):\n${lineageBlock}`
+    }
+  ];
+}
+
+export function parseProjectSummaryResponse(raw: string): ProjectNarrative {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  try {
+    const parsed = JSON.parse(cleaned) as {
+      overview?: unknown;
+      architecture?: unknown;
+      howItWorks?: unknown;
+      onboardingTips?: unknown;
+    };
+    return {
+      overview: typeof parsed.overview === "string" ? parsed.overview : cleaned,
+      architecture: typeof parsed.architecture === "string" ? parsed.architecture : "",
+      howItWorks: typeof parsed.howItWorks === "string" ? parsed.howItWorks : "",
+      onboardingTips: Array.isArray(parsed.onboardingTips)
+        ? parsed.onboardingTips.filter((t): t is string => typeof t === "string")
+        : []
+    };
+  } catch {
+    return { overview: cleaned, architecture: "", howItWorks: "", onboardingTips: [] };
+  }
+}
+
+export async function summarizeProject(input: ProjectSummaryLlmInput): Promise<ProjectNarrative> {
+  const content = await callAzureOpenAi(buildProjectSummaryMessages(input));
+  return parseProjectSummaryResponse(content);
 }

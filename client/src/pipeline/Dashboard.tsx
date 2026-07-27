@@ -5,8 +5,9 @@ import "./pipeline.css";
 import { SectionExclusions } from "./SectionExclusions";
 import { SectionLayers } from "./SectionLayers";
 import { SectionLineage } from "./SectionLineage";
+import { SectionSummary } from "./SectionSummary";
 
-type Section = "layers" | "exclusions" | "lineage";
+type Section = "layers" | "exclusions" | "lineage" | "summary";
 
 export function Dashboard({
   catalog,
@@ -74,6 +75,9 @@ export function Dashboard({
           <button type="button" className={`pl-nav-item${section === "lineage" ? " on" : ""}`} onClick={() => setSection("lineage")}>
             S3 · Table lineage
           </button>
+          <button type="button" className={`pl-nav-item${section === "summary" ? " on" : ""}`} onClick={() => setSection("summary")}>
+            S4 · Project summary
+          </button>
         </aside>
 
         <div className="pl-main">
@@ -83,6 +87,9 @@ export function Dashboard({
           )}
           {section === "lineage" && (
             <SectionLineage analysis={analysis} analyzing={analyzing} error={analyzeError} onAnalyze={runAnalysis} />
+          )}
+          {section === "summary" && (
+            <SectionSummary catalog={catalog} layers={layers} warehouseId={warehouseId} notebookRoot={notebookRoot} />
           )}
         </div>
       </div>
