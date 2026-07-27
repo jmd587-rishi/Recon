@@ -1,0 +1,253 @@
+/* Recon AI "Problem 1: Raw to Data Mart" dashboard shell — layout/structure adapted from the
+   provided mockup, colors wired through this app's existing (dark-mode-aware) CSS variables from
+   index.css rather than the mockup's own fixed-light palette, except the sidebar which stays a
+   deliberately dark navy chrome regardless of theme, matching the mockup's two-tone shell. */
+
+.pipeline-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.pl-topbar {
+  height: 52px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 16px;
+}
+
+.pl-topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pl-mark {
+  width: 28px;
+  height: 28px;
+  background: var(--accent);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.pl-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-h);
+}
+
+.pl-org {
+  font-size: 10px;
+  color: var(--text);
+}
+
+.pl-topbar-crumb {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.pl-topbar-crumb b {
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.pl-topbar-right {
+  margin-left: auto;
+}
+
+.pl-body {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+}
+
+.pl-sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 52px;
+  max-height: calc(100vh - 52px);
+  overflow-y: auto;
+  background: #13161f;
+  border-right: 1px solid #1e2130;
+  padding: 12px 8px;
+}
+
+.pl-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #9aa1bd;
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 2px;
+  border: none;
+  background: transparent;
+  width: 100%;
+  text-align: left;
+}
+
+.pl-nav-item:hover {
+  background: #1e2333;
+  color: #c5cbe0;
+}
+
+.pl-nav-item.on {
+  background: #1e2a45;
+  color: #93b4fd;
+}
+
+.pl-main {
+  flex: 1;
+  min-width: 0;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pl-card {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.pl-card-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pl-card-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-h);
+}
+
+.pl-card-sub {
+  font-size: 11px;
+  color: var(--text);
+}
+
+.pl-tbl-wrap {
+  overflow-x: auto;
+}
+
+.pl-tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.pl-tbl th {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text);
+  padding: 7px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  background: var(--code-bg);
+  white-space: nowrap;
+}
+
+.pl-tbl td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-h);
+  vertical-align: top;
+}
+
+.pl-tbl tr:last-child td {
+  border-bottom: none;
+}
+
+.pl-mono {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.pl-layer-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pl-layer-tab {
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+}
+
+.pl-layer-tab.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.pl-rule-card {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border-left: 3px solid var(--border);
+  background: var(--code-bg);
+}
+
+.pl-rule-card.warn {
+  border-left-color: var(--warning);
+}
+
+.pl-rule-card.ok {
+  border-left-color: var(--success);
+}
+
+.pl-rule-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.pl-rule-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-h);
+}
+
+.pl-rule-body {
+  font-size: 12px;
+  color: var(--text-h);
+  line-height: 1.6;
+}
