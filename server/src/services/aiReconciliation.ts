@@ -389,6 +389,7 @@ export async function buildAiReconciliationSuite(
   return summarizeSuite({
     folderName: project.folderName,
     hops: built,
+    hopFacts: hops,
     columns,
     generatedBy: aiTables > 0 ? "ai" : "rules",
     notice: buildNotice(aiTables, plainTables, failures, hops)

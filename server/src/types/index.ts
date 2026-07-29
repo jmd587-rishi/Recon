@@ -591,6 +591,11 @@ export interface LocalReconciliationSuite {
   /** Why the result isn't wholly what was asked for — null when it is. */
   notice: string | null;
   hops: ReconHopScripts[];
+  /**
+   * Every hop's checks folded into one query, told apart by its `scope` column. This is the file to
+   * run — `hops[].bundle` is the same thing sliced per hop, for when only one is of interest.
+   */
+  projectBundle: { filename: string; sql: string };
   stats: {
     hopCount: number;
     scriptCount: number;
@@ -603,4 +608,79 @@ export interface LocalReconciliationSuite {
 export interface LocalReconciliationRequest {
   /** Ordered pipeline layers, most-raw first. Fewer than 2 writes every lineage pair as one scope. */
   layers?: LayerRef[];
+}
+
+// ---- Interactive lineage verification (`reconcile run`) ----
+//
+// These types are CLI-only — no `client/src/types.ts` counterpart, because nothing in the browser
+// app reaches this flow. The hand-sync rule in CLAUDE.md applies to shapes that cross the API.
+
+/**
+ * One correction to the extracted lineage, expressed against the *facts* rather than the graph.
+ *
+ * The diagram the user reviews is built from `LineageEdge`s, but `gatherReconciliationFacts` groups
+ * over `LineageFact`s, so an approval that only touched the graph would be cosmetic — the generated
+ * SQL would ignore it. `(notebookPath, cellIndex)` is the join between the two, which is why a
+ * `remove` carries the provenance of the edge it came from.
+ */
+export interface LineageOverride {
+  kind: "remove" | "add";
+  /** Source table of the edge, exactly as the SQL names it (lowercased, possibly unqualified). */
+  from: string;
+  /** Target table of the edge. */
+  to: string;
+  /** Statement the edge came from. Absent on an `add` the user invented rather than corrected. */
+  notebookPath?: string;
+  cellIndex?: number;
+  /** Why, in the user's or the model's words — replayed in the artifacts so a re-run is auditable. */
+  reason: string;
+}
+
+/** Per-edge commentary from the reviewer model, keyed by `"<from>-><to>"`. */
+export type LineageEdgeNotes = Record<string, string>;
+
+export interface LineageReview {
+  /** 2-4 sentences describing the pipeline as extracted — empty when the model wasn't reachable. */
+  narrative: string;
+  notes: LineageEdgeNotes;
+  /** Things worth a second look: suspicious fan-out, orphan tables, a layer skipped entirely. */
+  concerns: string[];
+  /**
+   * Corrections the model proposes. On the first pass these come from reading the SQL; on later
+   * passes they are the user's free-text instruction turned into structured edits. Always validated
+   * against the project's own tables before being applied — an invented table is dropped.
+   */
+  proposed: LineageOverride[];
+}
+
+/** One round of the verify loop, retained so `lineage-feedback.json` can show how we got here. */
+export interface LineageFeedbackRound {
+  round: number;
+  /** What the user typed when they rejected the lineage. */
+  instruction: string;
+  /** Overrides derived from that instruction and actually applied. */
+  applied: LineageOverride[];
+  /** Overrides the model proposed but which were rejected as naming unknown tables. */
+  discarded: LineageOverride[];
+}
+
+/** What `lineage/lineage.json` holds after the user approves. */
+export interface LineageArtifacts {
+  generatedAt: string;
+  projectName: string;
+  approved: boolean;
+  layers: LayerRef[];
+  edges: LineageEdge[];
+  tables: LocalTableRef[];
+  narrative: string;
+  concerns: string[];
+  notes: LineageEdgeNotes;
+  feedback: LineageFeedbackRound[];
+  stats: {
+    fileCount: number;
+    statementCount: number;
+    tableCount: number;
+    edgeCount: number;
+    layerCount: number;
+  };
 }

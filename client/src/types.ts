@@ -502,6 +502,11 @@ export interface LocalReconciliationSuite {
   /** Why the result isn't wholly what was asked for — null when it is. */
   notice: string | null;
   hops: ReconHopScripts[];
+  /**
+   * Every hop's checks folded into one query, told apart by its `scope` column. This is the file to
+   * run — `hops[].bundle` is the same thing sliced per hop, for when only one is of interest.
+   */
+  projectBundle: { filename: string; sql: string };
   stats: {
     hopCount: number;
     scriptCount: number;

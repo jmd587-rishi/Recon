@@ -3,9 +3,14 @@ import type {
   CellEvidence,
   CodeCandidate,
   CodeFixSeverity,
+  LayerRef,
   LevelFinding,
   LevelReport,
   LevelSeverity,
+  LineageEdge,
+  LineageOverride,
+  LineageReview,
+  LocalTableRef,
   LogicValidationResult,
   ProjectLayerSummary,
   ProjectNarrative,
@@ -955,4 +960,175 @@ export async function writeReconciliationScripts(
     ...options
   });
   return parseReconciliationResponse(content);
+}
+
+// ---- Lineage review: narrate the extracted graph, and turn corrections into structured edits ----
+
+/**
+ * How many edges the prompt carries. Past this the narrative stops improving and the call starts
+ * risking the output budget, so the rest are summarised as a count instead.
+ */
+const MAX_REVIEW_EDGES = 400;
+
+export interface LineageReviewInput {
+  projectName: string;
+  layers: LayerRef[];
+  edges: LineageEdge[];
+  tables: LocalTableRef[];
+  /**
+   * What the user typed after rejecting the lineage. Absent on the first pass — and that difference
+   * is load-bearing: without an instruction the model may only describe what was extracted, never
+   * propose changes to it. See `reviewLineage`.
+   */
+  userInstruction?: string;
+  /** Corrections already applied in earlier rounds, so the model doesn't re-propose them. */
+  priorOverrides?: LineageOverride[];
+}
+
+function reviewSystemPrompt(correcting: boolean): string {
+  const base =
+    "You are a senior data engineer reviewing the table-to-table lineage that a static SQL parser " +
+    "extracted from a data project. You are given the project's pipeline layers, its tables, and the " +
+    "extracted edges (source table -> target table), each with the file and statement it came from. " +
+    "Ground everything ONLY in what you are given — never mention a table that is not in the list. ";
+
+  const output = correcting
+    ? 'Respond with ONLY compact JSON: {"narrative": "<2-4 sentences describing the pipeline as it now stands>", ' +
+      '"concerns": ["<something in the lineage worth a second look>", ...], ' +
+      '"notes": {"<from>-><to>": "<short note about that edge>", ...}, ' +
+      '"proposed": [{"kind": "add"|"remove", "from": "<source table>", "to": "<target table>", "reason": "<why>"}, ...]}. ' +
+      "The user has told you what is wrong with the lineage. Translate their correction into the " +
+      "smallest set of `proposed` edits that satisfies it. Every `from` and `to` MUST be a table from " +
+      "the supplied list, written exactly as it appears there. Propose nothing the user did not ask for."
+    : 'Respond with ONLY compact JSON: {"narrative": "<2-4 sentences: what this pipeline does, in terms of its real layers and tables>", ' +
+      '"concerns": ["<something in the lineage worth a second look>", ...], ' +
+      '"notes": {"<from>-><to>": "<short note about that edge>", ...}, "proposed": []}. ' +
+      "Describe and question the lineage; do NOT propose edits to it — `proposed` must be an empty " +
+      "array. If an edge looks wrong, say so in `concerns` and let the user decide. " +
+      "Good concerns: a table nothing writes, a layer that is skipped entirely, one target with a " +
+      "suspicious number of sources, a fan-out that looks like a join gone wrong.";
+
+  return `${base}${output} No markdown, no text outside the JSON object.`;
+}
+
+export function buildLineageReviewMessages(input: LineageReviewInput): ChatMessage[] {
+  const correcting = typeof input.userInstruction === "string" && input.userInstruction.trim().length > 0;
+
+  const layerBlock = input.layers.length
+    ? input.layers.map((l, i) => `  ${i + 1}. ${l.label} (schema ${l.schema})`).join("\n")
+    : "  (none detected — every table is being treated as one scope)";
+
+  const tableBlock = input.tables.length
+    ? input.tables
+        .map((t) => `  ${t.qualified}${t.written && t.read ? " [written, read]" : t.written ? " [written]" : " [read]"}`)
+        .join("\n")
+    : "  (none)";
+
+  const shown = input.edges.slice(0, MAX_REVIEW_EDGES);
+  const edgeBlock = shown.length
+    ? shown.map((e) => `  ${e.from} -> ${e.to}   (${e.notebookPath} #${e.cellIndex})`).join("\n") +
+      (input.edges.length > shown.length ? `\n  ... and ${input.edges.length - shown.length} more edges` : "")
+    : "  (no lineage edges were extracted)";
+
+  const priorBlock = input.priorOverrides?.length
+    ? `\n\nCorrections already applied in earlier rounds (do not repeat these):\n` +
+      input.priorOverrides.map((o) => `  ${o.kind} ${o.from} -> ${o.to} (${o.reason})`).join("\n")
+    : "";
+
+  const instructionBlock = correcting
+    ? `\n\nThe user reviewed this lineage and says it is wrong:\n"""\n${input.userInstruction!.trim()}\n"""\n` +
+      "Turn that into `proposed` edits."
+    : "";
+
+  return [
+    { role: "system", content: reviewSystemPrompt(correcting) },
+    {
+      role: "user",
+      content:
+        `Project: ${input.projectName}\n\n` +
+        `Pipeline layers, most-raw first:\n${layerBlock}\n\n` +
+        `Tables (${input.tables.length}):\n${tableBlock}\n\n` +
+        `Extracted lineage (${input.edges.length} edges):\n${edgeBlock}` +
+        priorBlock +
+        instructionBlock
+    }
+  ];
+}
+
+export function parseLineageReviewResponse(raw: string): LineageReview {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  const empty: LineageReview = { narrative: "", notes: {}, concerns: [], proposed: [] };
+
+  try {
+    const parsed = JSON.parse(cleaned) as {
+      narrative?: unknown;
+      concerns?: unknown;
+      notes?: unknown;
+      proposed?: unknown;
+    };
+
+    const notes: LineageReview["notes"] = {};
+    if (parsed.notes && typeof parsed.notes === "object" && !Array.isArray(parsed.notes)) {
+      for (const [key, value] of Object.entries(parsed.notes as Record<string, unknown>)) {
+        if (typeof value === "string" && value.trim()) notes[key.trim().toLowerCase()] = value;
+      }
+    }
+
+    const proposed: LineageOverride[] = Array.isArray(parsed.proposed)
+      ? parsed.proposed.flatMap((item) => {
+          if (!item || typeof item !== "object") return [];
+          const rec = item as Record<string, unknown>;
+          const kind = rec.kind === "add" || rec.kind === "remove" ? rec.kind : null;
+          const from = typeof rec.from === "string" ? rec.from.trim() : "";
+          const to = typeof rec.to === "string" ? rec.to.trim() : "";
+          if (!kind || !from || !to) return [];
+          return [
+            {
+              kind,
+              from,
+              to,
+              reason: typeof rec.reason === "string" && rec.reason.trim() ? rec.reason.trim() : "requested by the user"
+            }
+          ];
+        })
+      : [];
+
+    return {
+      narrative: typeof parsed.narrative === "string" ? parsed.narrative : "",
+      concerns: Array.isArray(parsed.concerns)
+        ? parsed.concerns.filter((c): c is string => typeof c === "string" && c.trim().length > 0)
+        : [],
+      notes,
+      proposed
+    };
+  } catch {
+    // An unparsable answer costs the narrative, not the run — the graph itself came from the parser.
+    return { ...empty, narrative: cleaned.slice(0, 600) };
+  }
+}
+
+/**
+ * Reviews the extracted lineage, and — only when the user has said what is wrong with it — turns
+ * that instruction into structured edits.
+ *
+ * The asymmetry is deliberate. The lineage itself is extracted deterministically by
+ * `tableLineage.ts`; the model's job is to explain it and to interpret corrections, never to invent
+ * edges of its own accord. So `proposed` is discarded outright unless the caller passed a
+ * `userInstruction` — the same instinct behind `aiReconciliation.ts` refusing to let a model name a
+ * column it wasn't given. Callers must still run the result through
+ * `lineageOverrides.validateOverrides` before applying it, which drops any edit naming a table the
+ * project never mentions.
+ */
+export async function reviewLineage(input: LineageReviewInput, options: LlmCallOptions = {}): Promise<LineageReview> {
+  const correcting = typeof input.userInstruction === "string" && input.userInstruction.trim().length > 0;
+  const content = await callAzureOpenAi(buildLineageReviewMessages(input), {
+    label: `lineage review ${input.projectName}${correcting ? " (correction)" : ""}`,
+    ...options
+  });
+  const review = parseLineageReviewResponse(content);
+  return correcting ? review : { ...review, proposed: [] };
 }

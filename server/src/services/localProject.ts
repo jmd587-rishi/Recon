@@ -140,6 +140,20 @@ export function parseLocalProject(folderName: string, inputs: LocalSqlFileInput[
     file.facts = file.facts.map((fact) => qualifyTargetByPath(fact, knownSchemas));
   }
 
+  return { folderName, files, facts: files.flatMap((f) => f.facts), scan: buildScanResult(folderName, files, skipped) };
+}
+
+/**
+ * Derives the scan — tables, schemas, lineage graph and stats — from already-parsed files.
+ *
+ * Split out of `parseLocalProject` so `lineageOverrides.ts` can rebuild it after the user corrects
+ * an edge, rather than keeping a second copy of these rules that could drift from this one.
+ */
+export function buildScanResult(
+  folderName: string,
+  files: ParsedLocalFile[],
+  skipped: LocalSkippedFile[]
+): LocalScanResult {
   const facts = files.flatMap((f) => f.facts);
 
   const tables = new Map<string, LocalTableRef>();
@@ -179,7 +193,7 @@ export function parseLocalProject(folderName: string, inputs: LocalSqlFileInput[
     Array.from(tables.values()).flatMap((t) => (t.schema ? [t.schema] : []))
   ).sort();
 
-  const scan: LocalScanResult = {
+  return {
     folderName,
     files: fileSummaries,
     skipped,
@@ -194,8 +208,6 @@ export function parseLocalProject(folderName: string, inputs: LocalSqlFileInput[
       lineageEdgeCount: lineage.length
     }
   };
-
-  return { folderName, files, facts, scan };
 }
 
 export interface LocalCandidateSelection {

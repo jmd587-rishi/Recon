@@ -79,6 +79,10 @@ function buildReadme(suite: LocalReconciliationSuite): string {
 export function buildReconciliationZip(suite: LocalReconciliationSuite): Blob {
   const files: Record<string, Uint8Array> = {};
 
+  // The whole pipeline as one query, at the root — the file to run. The per-hop folders below are
+  // the same checks sliced up, for when only one hop is of interest.
+  files[suite.projectBundle.filename] = strToU8(suite.projectBundle.sql);
+
   for (const hop of suite.hops) {
     if (hop.scripts.length === 0) continue;
     files[`${hop.folder}/${hop.bundle.filename}`] = strToU8(hop.bundle.sql);

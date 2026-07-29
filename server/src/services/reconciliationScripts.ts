@@ -8,7 +8,7 @@ import type {
   ReconScript
 } from "../types/index.js";
 import { type LocalProject, splitQualifiedTable } from "./localProject.js";
-import { buildHopBundle } from "./reconciliationBundle.js";
+import { buildHopBundle, buildProjectBundle } from "./reconciliationBundle.js";
 import { type ColumnIndex, type ColumnInfo, buildColumnIndex, type TableColumns } from "./sqlColumns.js";
 import { isTempTable, type LineageFact } from "./tableLineage.js";
 import { extractWherePredicate } from "./whereClauseAnalyzer.js";
@@ -680,18 +680,27 @@ export function assembleHop(hop: ReconHopFacts, scripts: ReconScript[], folderNa
 export function summarizeSuite(params: {
   folderName: string;
   hops: ReconHopScripts[];
+  /** The facts behind `hops`, in the same order — needed to fold them into one query. */
+  hopFacts: ReconHopFacts[];
   columns: ColumnIndex;
   generatedBy: LocalReconciliationSuite["generatedBy"];
   notice: string | null;
 }): LocalReconciliationSuite {
-  const { folderName, hops, columns, generatedBy, notice } = params;
+  const { folderName, hops, hopFacts, columns, generatedBy, notice } = params;
   const tablesInScope = unique(hops.flatMap((hop) => hop.scripts.flatMap((s) => [s.targetTable, ...s.sourceTables])));
+
+  const byFolder = new Map(hops.map((hop) => [hop.folder, hop.scripts]));
+  const projectBundle = buildProjectBundle(
+    hopFacts.map((hop) => ({ hop, scripts: byFolder.get(hop.folder) ?? [] })),
+    folderName
+  );
 
   return {
     folderName,
     generatedBy,
     notice,
     hops,
+    projectBundle,
     stats: {
       hopCount: hops.length,
       scriptCount: hops.reduce((n, hop) => n + hop.scripts.length, 0),
@@ -735,6 +744,7 @@ export function buildReconciliationSuite(
   return summarizeSuite({
     folderName: project.folderName,
     hops: built,
+    hopFacts: hops,
     columns,
     generatedBy: "rules",
     notice
