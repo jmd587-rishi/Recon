@@ -9,15 +9,20 @@ import { buildReconciliationZip, reconciliationZipFilename } from "./reconciliat
  * The reconciliation-script tab of the uploaded-folder dashboard: the SQL a data engineer would
  * otherwise hand-write to prove a hop moved the rows it should have.
  *
- * The scripts are written by the model, from the folder's own lineage, column lists, filters and
- * transformation SQL — so this costs LLM calls, which is why the generated suite is held by
- * `LocalDashboard` rather than here: switching to another tab and back must not pay for it twice.
+ * Each script has two halves. The standard checks are derived from the folder's own lineage and
+ * column lists and are always present; the checks marked `ai` were written by the model after
+ * reading the transformation SQL, and are the part that costs LLM calls — which is why the suite is
+ * held by `LocalDashboard` rather than here: switching tabs and back must not pay for it twice.
  */
 
 function hopLabel(hop: ReconHopScripts): string {
   return hop.fromLayer && hop.toLayer
     ? `${hop.fromLayer.label.toUpperCase()} → ${hop.toLayer.label.toUpperCase()}`
     : "ALL TABLES";
+}
+
+function countAi(script: ReconScript): number {
+  return script.checks.filter((check) => check.source === "ai").length;
 }
 
 function downloadSql(filename: string, sql: string) {
@@ -27,6 +32,7 @@ function downloadSql(filename: string, sql: string) {
 /** One generated script: what it keys on and what it totals, with the SQL a click away. */
 function ScriptCard({ script, folder }: { script: ReconScript; folder: string }) {
   const [open, setOpen] = useState(false);
+  const ai = countAi(script);
 
   return (
     <div className="pl-rule-card ok">
@@ -35,6 +41,7 @@ function ScriptCard({ script, folder }: { script: ReconScript; folder: string })
         <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
           <span className="pl-card-sub">
             {script.checks.length} check{script.checks.length === 1 ? "" : "s"}
+            {ai > 0 && ` · ${ai} for this transformation`}
           </span>
           <span className={`pl-sev pl-sev-${script.keyConfidence === "none" ? "warning" : "info"}`}>
             key: {script.keyColumns.join(", ") || "not found"}
@@ -71,7 +78,9 @@ function ScriptCard({ script, folder }: { script: ReconScript; folder: string })
       ))}
 
       <div className="pl-code-head">
-        <span className="pl-card-sub">{script.checks.map((c) => c.title).join(" · ")}</span>
+        <span className="pl-card-sub">
+          {script.checks.map((c) => (c.source === "ai" ? `${c.title} [ai]` : c.title)).join(" · ")}
+        </span>
         <span style={{ display: "flex", gap: 6 }}>
           <button type="button" className="btn-sm" onClick={() => setOpen((v) => !v)}>
             {open ? "Hide SQL" : "Show SQL"}
@@ -129,6 +138,7 @@ export function SectionLocalReconciliation({
 
   const hops = suite?.hops ?? [];
   const active = hops[Math.min(activeIdx, Math.max(0, hops.length - 1))];
+  const aiChecks = hops.reduce((n, hop) => n + hop.scripts.reduce((m, s) => m + countAi(s), 0), 0);
 
   return (
     <>
@@ -137,8 +147,8 @@ export function SectionLocalReconciliation({
           <div className="pl-card-title">
             Reconciliation scripts{" "}
             {suite && (
-              <span className={`chip ${suite.generatedBy === "ai" ? "chip-ok" : "chip-warn"}`}>
-                {suite.generatedBy === "ai" ? "written by AI" : "standard checks"}
+              <span className={`chip ${aiChecks > 0 ? "chip-ok" : "chip-warn"}`}>
+                {aiChecks > 0 ? `+${aiChecks} written for this pipeline` : "standard checks only"}
               </span>
             )}
           </div>
@@ -190,11 +200,12 @@ export function SectionLocalReconciliation({
           out, date windows that leave a gap.
         </p>
         <p className="hint" style={{ margin: 0 }}>
-          Every table and column name the model was allowed to use was extracted from your SQL first, and any check
-          naming a table this project doesn't have is dropped before you see it — so read them before you run them, but
-          they aren't inventions. Nothing was measured: an uploaded folder has no database behind it. A key marked{" "}
-          <i>inferred</i> was guessed from column naming — the duplicate-key check inside each script tells you whether
-          the guess holds.
+          The standard checks are derived from your declared columns, so they cannot name a column a table hasn't got,
+          and they are written whether or not the model answers. The ones marked <span className="pl-mono">[ai]</span>{" "}
+          are the model's additions — checked back against the same column lists, with anything naming a table or column
+          this project doesn't have dropped before you see it. Nothing was measured: an uploaded folder has no database
+          behind it. A key marked <i>inferred</i> was guessed from column naming — the duplicate-key check inside each
+          script tells you whether the guess holds.
         </p>
         {suite?.notice && (
           <p className="hint" style={{ margin: "8px 0 0" }}>
@@ -203,7 +214,12 @@ export function SectionLocalReconciliation({
         )}
       </div>
 
-      {loading && !suite && <p className="hint">Reading the SQL and asking the model to write the scripts...</p>}
+      {loading && !suite && (
+        <p className="hint">
+          Deriving the standard checks from your column lists, then asking the model what else this transformation
+          calls for — a few calls run at once, so this is about as long as one of them.
+        </p>
+      )}
 
       {active && (
         <>

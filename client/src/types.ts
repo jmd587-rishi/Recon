@@ -437,12 +437,20 @@ export type ReconCheckKind =
   /** A check the model wrote for this specific transformation — grain, window, cast, date gap. */
   | "custom";
 
+/**
+ * Who wrote a check. `recon` is derived mechanically from the declared columns and cannot name a
+ * column the table lacks; `ai` was written from the transformation SQL and is the half worth reading
+ * before you run it. Every script carries both, so the standard checks survive an LLM failure.
+ */
+export type ReconCheckSource = "recon" | "ai";
+
 /** One runnable query inside a reconciliation script. */
 export interface ReconCheck {
   kind: ReconCheckKind;
   title: string;
   description: string;
   sql: string;
+  source: ReconCheckSource;
 }
 
 /** Whether the key the join checks use was declared by DDL, guessed from names, or not found. */

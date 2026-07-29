@@ -15,11 +15,49 @@ import type {
 
 export class LlmConfigError extends Error {}
 
-// Reconciliation prompts can carry several notebook code snippets, and this deployment is a
-// reasoning model, so 30s (axios's default-ish ceiling used elsewhere) is too tight — bump it up.
-const LLM_TIMEOUT_MS = 120_000;
+/**
+ * The deployment didn't answer inside the caller's budget, or answered but was cut off mid-JSON.
+ *
+ * Distinguished from a generic failure because it is the one error a fan-out can *degrade* around:
+ * a batch that timed out can be retried smaller, or its tables handed to the template writer, while
+ * the rest of the run keeps whatever it already produced. See `aiReconciliation.ts`.
+ */
+export class LlmTimeoutError extends Error {}
 
-async function callAzureOpenAi(messages: ChatMessage[]): Promise<string> {
+/**
+ * Default ceiling for one call. Prompts here carry several SQL statements and the deployment is
+ * typically a reasoning model, so the 30s used for Databricks REST is far too tight. Callers that
+ * fan out many small calls pass their own, shorter, budget rather than inheriting this one — a
+ * single 120s call is exactly the failure mode this default exists to *avoid*.
+ */
+const LLM_TIMEOUT_MS = envInt("AZURE_OPENAI_TIMEOUT_MS", 120_000, 5_000, 600_000);
+
+/**
+ * `reasoning.effort` for reasoning deployments (`low` | `medium` | `high`).
+ *
+ * Left unset by default because sending `reasoning` to a non-reasoning deployment is rejected
+ * outright. On a reasoning deployment, setting it to `low` is the single biggest latency win
+ * available here: the reconciliation prompt is grounded extraction, not open-ended problem solving.
+ */
+const REASONING_EFFORT = process.env.AZURE_OPENAI_REASONING_EFFORT?.trim().toLowerCase();
+
+/** Reads a positive integer from the environment, clamped, falling back on anything unparsable. */
+export function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw) || raw <= 0) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(raw)));
+}
+
+export interface LlmCallOptions {
+  /** Per-call timeout. A fan-out sets this well below `LLM_TIMEOUT_MS` so one slow call can't stall it. */
+  timeoutMs?: number;
+  /** Ceiling on generated tokens. Keeps one oversized answer from running past the timeout. */
+  maxOutputTokens?: number;
+  /** Names the call in the log line, so a fan-out's calls can be told apart. */
+  label?: string;
+}
+
+async function callAzureOpenAi(messages: ChatMessage[], options: LlmCallOptions = {}): Promise<string> {
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const apiKey = process.env.AZURE_OPENAI_API_KEY;
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
@@ -34,18 +72,23 @@ async function callAzureOpenAi(messages: ChatMessage[]): Promise<string> {
   // (https://<resource>.openai.azure.com/openai/v1/responses), so POST straight to it
   // rather than building a classic /openai/deployments/{name}/chat/completions URL.
   const url = endpoint.replace(/\/+$/, "");
-  const body = { model: deployment, input: messages };
+  const body: Record<string, unknown> = { model: deployment, input: messages };
+  if (options.maxOutputTokens) body.max_output_tokens = options.maxOutputTokens;
+  if (REASONING_EFFORT) body.reasoning = { effort: REASONING_EFFORT };
 
-  console.log("[llmClient] sending request", { url, model: deployment, messageCount: messages.length });
+  const timeout = options.timeoutMs ?? LLM_TIMEOUT_MS;
+  const label = options.label ?? "call";
+
+  console.log("[llmClient] sending request", { label, url, model: deployment, messageCount: messages.length, timeout });
   const startedAt = Date.now();
 
   try {
     const res = await axios.post(url, body, {
       headers: { "api-key": apiKey, "Content-Type": "application/json" },
-      timeout: LLM_TIMEOUT_MS,
+      timeout,
     });
 
-    console.log("[llmClient] received response", { status: res.status, elapsedMs: Date.now() - startedAt });
+    console.log("[llmClient] received response", { label, status: res.status, elapsedMs: Date.now() - startedAt });
 
     const content =
       res.data?.output_text ??
@@ -53,19 +96,35 @@ async function callAzureOpenAi(messages: ChatMessage[]): Promise<string> {
         ?.flatMap((item: any) => item?.content ?? [])
         ?.find((c: any) => c?.type === "output_text" || c?.type === "text")?.text;
 
+    // A response cut off at `max_output_tokens` comes back 200 with truncated (so unparsable) text.
+    // That is a "ask for less" failure, not a broken deployment, so it takes the retryable path.
+    if (res.data?.status === "incomplete") {
+      const reason = res.data?.incomplete_details?.reason ?? "unknown";
+      console.warn("[llmClient] response was truncated", { label, reason });
+      if (reason === "max_output_tokens") {
+        throw new LlmTimeoutError(`Azure OpenAI ran out of output budget for ${label} before finishing its answer.`);
+      }
+    }
+
     if (!content) {
       throw new Error("Azure OpenAI response did not include any message content.");
     }
     return content;
   } catch (err) {
+    if (err instanceof LlmTimeoutError) throw err;
     if (axios.isAxiosError(err)) {
+      const elapsedMs = Date.now() - startedAt;
+      if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
+        console.error("[llmClient] request timed out", { label, elapsedMs, timeout });
+        throw new LlmTimeoutError(`Azure OpenAI did not answer ${label} within ${timeout}ms.`);
+      }
       const detail = err.response?.data && typeof err.response.data === "object"
         ? JSON.stringify(err.response.data)
         : err.message;
-      console.error("[llmClient] request failed", { elapsedMs: Date.now() - startedAt, detail });
+      console.error("[llmClient] request failed", { label, elapsedMs, detail });
       throw new Error(`Azure OpenAI request failed: ${detail}`);
     }
-    console.error("[llmClient] unexpected error", { elapsedMs: Date.now() - startedAt, err });
+    console.error("[llmClient] unexpected error", { label, elapsedMs: Date.now() - startedAt, err });
     throw err instanceof Error ? err : new Error(String(err));
   }
 }
@@ -717,7 +776,14 @@ export async function suggestLevelCodeFixes(
 
 // ---- Reconciliation scripts for an uploaded SQL folder ----
 
-/** One target table's grounding, rendered for the prompt by `aiReconciliation.ts`. */
+/**
+ * One target table's grounding, rendered for the prompt by `aiReconciliation.ts`.
+ *
+ * The model is *not* asked for the six schema-derived checks — `reconciliationScripts.templateChecks`
+ * already writes those from the exact column lists, faster and with no chance of a hallucinated name.
+ * It is asked only for what it alone can contribute: the checks this particular transformation calls
+ * for, which need the SQL to be read. `existingChecks` is what it has already been saved from writing.
+ */
 export interface ReconTargetPrompt {
   targetTable: string;
   sourceTables: string[];
@@ -729,6 +795,8 @@ export interface ReconTargetPrompt {
   joinHints: { source: string; columns: string[] }[];
   measureHint: string;
   filterHint: string[];
+  /** Titles of the checks Recon has already written for this table — not to be repeated. */
+  existingChecks: string[];
   /** The transformation SQL itself, trimmed — what lets the model see the actual grain and joins. */
   transformationSql: { path: string; statementIndex: number; sql: string }[];
 }
@@ -757,6 +825,9 @@ const RECON_KINDS: readonly ReconCheckKind[] = [
   "custom"
 ];
 
+/** Upper bound on the pipeline-specific checks asked for per table, named in the prompt. */
+export const MAX_CUSTOM_CHECKS_PER_TARGET = 4;
+
 export function buildReconciliationMessages(hopLabel: string, targets: ReconTargetPrompt[]): ChatMessage[] {
   const block = targets
     .map((t) => {
@@ -767,7 +838,10 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         `key columns found: ${t.keyHint}`,
         ...t.joinHints.map((j) => `shares with ${j.source}: ${j.columns.join(", ")}`),
         `measure columns found: ${t.measureHint}`,
-        ...t.filterHint.map((f) => `filter the transformation applies: ${f}`)
+        ...t.filterHint.map((f) => `filter the transformation applies: ${f}`),
+        `checks ALREADY WRITTEN for this table (do not repeat these): ${
+          t.existingChecks.length > 0 ? t.existingChecks.join("; ") : "(none — the schema grounded none of them)"
+        }`
       ];
       for (const stmt of t.transformationSql) {
         lines.push(`transformation SQL — ${stmt.path} (statement ${stmt.statementIndex}):`, "```sql", stmt.sql, "```");
@@ -780,18 +854,24 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
     {
       role: "system",
       content:
-        "You are a senior data engineer writing the reconciliation SQL that proves one hop of a data " +
-        "pipeline moved the rows it should have. For each target table you are given its sources, the " +
-        "exact column list of every table involved, the key and measure columns a static analysis found, " +
-        "the filters the transformation applies, and the transformation SQL itself. " +
-        "Write the checks an experienced engineer would actually run against this specific pipeline: the " +
-        "standard ones — row counts against each source, totals for the money/quantity columns that " +
-        "should tie out, source keys missing from the target, target keys with no source row, duplicate " +
-        "keys, null keys — AND the checks this particular transformation calls for, which you can only " +
-        "know by reading its SQL: aggregation grain changes, dedup that can drop rows, join fan-out, " +
-        "window functions that need a partition to be complete, null-coalescing that moves a total, date " +
-        "windows or incremental filters that leave a gap, hardcoded values, and type casts that can null " +
-        "a value out. " +
+        "You are a senior data engineer reviewing one hop of a data pipeline. For each target table you " +
+        "are given its sources, the exact column list of every table involved, the key and measure " +
+        "columns a static analysis found, the filters the transformation applies, and the transformation " +
+        "SQL itself. " +
+        "The standard reconciliation checks — row counts against each source, totals for the shared " +
+        "money/quantity columns, source keys missing from the target, target keys with no source row, " +
+        "duplicate keys, null keys — HAVE ALREADY BEEN WRITTEN and are listed under `checks ALREADY " +
+        "WRITTEN` for each table. Do not write them again. " +
+        "Your job is only the checks those standard ones miss, which you can know only by reading this " +
+        "transformation's SQL. Look specifically for: an aggregation that changes grain (so a row count " +
+        "is expected to differ and something else must tie out), dedup or DISTINCT that can silently " +
+        "drop rows, a join that can fan out, a window function that needs its partition to be complete, " +
+        "ISNULL/COALESCE that moves a total, a date window or incremental predicate that can leave a " +
+        "gap, a hardcoded value, and a CAST that can null a value out or truncate it. " +
+        `Write at most ${MAX_CUSTOM_CHECKS_PER_TARGET} such checks per table. Fewer is better than ` +
+        "padding: only write a check when you can point at the line of transformation SQL that makes it " +
+        "necessary. If the transformation is a plain column-for-column copy, return no checks for it and " +
+        "say so in `notes` — that is a correct and useful answer. " +
         "HARD RULES, they matter more than completeness: " +
         "(1) Use ONLY the table and column names given to you above. Never invent, guess, pluralise or " +
         "abbreviate a column name. If a check would need a column that is not listed, do not write that " +
@@ -802,10 +882,11 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         "(4) A check must return NO rows when the data is correct, except count/total comparisons, which " +
         "return one row per pair being compared. " +
         "(5) `description` states in one or two sentences what a non-empty result means for this " +
-        "pipeline — not what the SQL syntactically does. " +
+        "pipeline, and names the part of the transformation that motivated the check — not what the SQL " +
+        "syntactically does. " +
         'Respond with ONLY compact JSON: {"scripts": [{"targetTable": "<exact name from the input>", ' +
-        '"summary": "<1-2 sentences: what this hop does to the data and what these checks prove>", ' +
-        '"checks": [{"kind": "row_count|measure_totals|missing_keys|orphan_keys|duplicate_keys|null_keys|custom", ' +
+        '"summary": "<1-2 sentences: what this transformation does to the data and what to watch>", ' +
+        '"checks": [{"kind": "measure_totals|missing_keys|orphan_keys|duplicate_keys|null_keys|custom", ' +
         '"title": "<short label>", "description": "<what a non-empty result means>", "sql": "<the statement>"}], ' +
         '"notes": ["<a check you could not write, and why>"]}]}, one entry per target table. ' +
         "No markdown, no text outside the JSON object."
@@ -865,9 +946,13 @@ export function parseReconciliationResponse(raw: string): ReconLlmScript[] {
 
 export async function writeReconciliationScripts(
   hopLabel: string,
-  targets: ReconTargetPrompt[]
+  targets: ReconTargetPrompt[],
+  options: LlmCallOptions = {}
 ): Promise<ReconLlmScript[]> {
   if (targets.length === 0) return [];
-  const content = await callAzureOpenAi(buildReconciliationMessages(hopLabel, targets));
+  const content = await callAzureOpenAi(buildReconciliationMessages(hopLabel, targets), {
+    label: `recon ${hopLabel} [${targets.map((t) => t.targetTable).join(", ")}]`,
+    ...options
+  });
   return parseReconciliationResponse(content);
 }
