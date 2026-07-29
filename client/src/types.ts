@@ -490,7 +490,8 @@ export interface ReconHopScripts {
   toLayer: LayerRef | null;
   folder: string;
   scripts: ReconScript[];
-  controlTotals: { filename: string; sql: string };
+  /** The whole hop as one query, returning one status row per check. The file to run. */
+  bundle: { filename: string; sql: string };
   notes: string[];
 }
 

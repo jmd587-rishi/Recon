@@ -19,6 +19,10 @@ import type { LayerRef, LocalReconciliationSuite } from "../types/index.js";
  * isn't configured — just reading straight off disk and writing straight back to disk instead of
  * going through the browser's upload/zip round trip.
  *
+ * What lands on disk is one `.sql` per hop: `reconciliationBundle.ts`'s single query, which returns
+ * the hop's whole reconciliation as one status table. The per-table scripts the same suite carries
+ * are written only on `--split` — one file you can run beats a folder you have to work through.
+ *
  * `reconcile layers` runs only the scan + layer-detection step, so a schema-naming convention the
  * heuristic doesn't recognise can be sorted out with `--layers` before spending an LLM call on it.
  */
@@ -27,7 +31,7 @@ const USAGE = `
 reconcile <command> [options]
 
 Commands:
-  scripts     Write reconciliation SQL for the current project into a governance/ folder
+  scripts     Write one reconciliation query per hop into a governance/ folder
   layers      Detect and print the pipeline layers only — writes nothing
 
 Options:
@@ -36,6 +40,7 @@ Options:
   --layers a,b,c      Schema names, most-raw first, overriding auto-detection
   --env-file <path>   .env file with AZURE_OPENAI_* settings (default: <dir>/.env, then ./.env)
   --no-ai             Skip the reviewer model — write only the schema-derived standard checks
+  --split             Also write the per-table scripts, a folder per hop, beside the one query
   --max-files <n>     Cap on how many .sql files are read (default: ${5000})
   -h, --help          Show this help
 
@@ -44,6 +49,7 @@ Examples:
   reconcile layers
   reconcile scripts
   reconcile scripts --layers raw,staged,mart --out recon
+  reconcile scripts --split
 `.trim();
 
 interface Args {
@@ -53,11 +59,21 @@ interface Args {
   layers: string[] | null;
   envFile: string | null;
   useAi: boolean;
+  split: boolean;
   maxFiles: number | undefined;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: "help", dir: process.cwd(), out: "governance", layers: null, envFile: null, useAi: true, maxFiles: undefined };
+  const args: Args = {
+    command: "help",
+    dir: process.cwd(),
+    out: "governance",
+    layers: null,
+    envFile: null,
+    useAi: true,
+    split: false,
+    maxFiles: undefined
+  };
 
   const rest = [...argv];
   const first = rest[0];
@@ -93,6 +109,9 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--no-ai":
         args.useAi = false;
+        break;
+      case "--split":
+        args.split = true;
         break;
       case "--max-files":
         args.maxFiles = Number(next());
@@ -178,16 +197,27 @@ function printLayers(schemas: string[], layers: LayerRef[]): void {
   console.log("Override with --layers a,b,c if this is wrong.");
 }
 
-async function writeSuite(dir: string, outName: string, suite: LocalReconciliationSuite): Promise<void> {
+/**
+ * One `.sql` per hop by default — the hop's whole reconciliation as a single query — and, with
+ * `--split`, the per-table scripts behind it in a folder alongside.
+ */
+async function writeSuite(dir: string, outName: string, suite: LocalReconciliationSuite, split: boolean): Promise<void> {
   const outRoot = path.join(dir, outName);
   await mkdir(outRoot, { recursive: true });
 
+  const written: string[] = [];
   for (const hop of suite.hops) {
-    const hopDir = path.join(outRoot, hop.folder);
-    await mkdir(hopDir, { recursive: true });
-    await writeFile(path.join(hopDir, hop.controlTotals.filename), hop.controlTotals.sql, "utf8");
-    for (const script of hop.scripts) {
-      await writeFile(path.join(hopDir, script.filename), script.sql, "utf8");
+    const file = `${hop.folder}.sql`;
+    await writeFile(path.join(outRoot, file), hop.bundle.sql, "utf8");
+    written.push(`${file}  (${hop.scripts.length} table${hop.scripts.length === 1 ? "" : "s"} in one query)`);
+
+    if (split && hop.scripts.length > 0) {
+      const hopDir = path.join(outRoot, hop.folder);
+      await mkdir(hopDir, { recursive: true });
+      for (const script of hop.scripts) {
+        await writeFile(path.join(hopDir, script.filename), script.sql, "utf8");
+      }
+      written.push(`${hop.folder}/  (${hop.scripts.length} per-table script${hop.scripts.length === 1 ? "" : "s"})`);
     }
   }
 
@@ -199,23 +229,26 @@ async function writeSuite(dir: string, outName: string, suite: LocalReconciliati
     `Reconciliation scripts for ${suite.folderName}`,
     `Generated: ${new Date().toISOString()}`,
     "",
-    `${suite.stats.hopCount} hop(s), ${suite.stats.scriptCount} script(s), ${suite.stats.checkCount} check(s) ` +
+    `${suite.stats.hopCount} hop(s), ${suite.stats.scriptCount} table(s), ${suite.stats.checkCount} check(s) ` +
       `(${aiChecks} written by the reviewer model, ${suite.stats.checkCount - aiChecks} derived from the schema).`,
+    "",
+    "One .sql per hop, each a single query returning one status row per check. Run it and read the",
+    "`status` column: PASS everywhere means the hop ties out. The detail queries behind any count are",
+    "at the foot of the same file, commented out.",
+    ...(split ? ["", "--split also wrote the per-table scripts, one folder per hop."] : []),
     ...(suite.notice ? ["", suite.notice] : []),
     "",
     ...suite.hops.map(
       (hop) =>
-        `${hop.folder}/ (${hop.fromLayer && hop.toLayer ? `${hop.fromLayer.label} -> ${hop.toLayer.label}` : "whole project"}): ` +
-        `${hop.controlTotals.filename}, ${hop.scripts.map((s) => s.filename).join(", ") || "(no tables found for this hop)"}`
+        `${hop.folder}.sql (${hop.fromLayer && hop.toLayer ? `${hop.fromLayer.label} -> ${hop.toLayer.label}` : "whole project"}): ` +
+        `${hop.scripts.map((s) => s.targetTable).join(", ") || "(no tables found for this hop)"}`
     )
   ];
   await writeFile(path.join(outRoot, "SUMMARY.txt"), `${summaryLines.join("\n")}\n`, "utf8");
 
   console.log("");
   console.log(`Wrote ${outRoot}`);
-  for (const hop of suite.hops) {
-    console.log(`  ${hop.folder}/  (${hop.scripts.length} script${hop.scripts.length === 1 ? "" : "s"})`);
-  }
+  for (const line of written) console.log(`  ${line}`);
   if (suite.notice) console.log(`\nNote: ${suite.notice}`);
 }
 
@@ -247,7 +280,7 @@ async function runScripts(args: Args): Promise<void> {
     }
   }
 
-  await writeSuite(args.dir, args.out, suite);
+  await writeSuite(args.dir, args.out, suite, args.split);
 }
 
 async function runLayers(args: Args): Promise<void> {

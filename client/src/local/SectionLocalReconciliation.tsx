@@ -115,7 +115,7 @@ export function SectionLocalReconciliation({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeIdx, setActiveIdx] = useState(0);
-  const [showTotals, setShowTotals] = useState(false);
+  const [showBundle, setShowBundle] = useState(false);
 
   const generate = useCallback(async () => {
     setLoading(true);
@@ -226,35 +226,36 @@ export function SectionLocalReconciliation({
           <div className="pl-card">
             <div className="pl-card-header">
               <div>
-                <div className="pl-card-title">Control totals — {hopLabel(active)}</div>
+                <div className="pl-card-title">One query — {hopLabel(active)}</div>
                 <div className="pl-card-sub">
-                  Every source/target pair in this hop counted in one query. Run it first, then open the script for any
-                  pair whose <span className="pl-mono">row_diff</span> you can't explain.
+                  Every check for every table in this hop, folded into a single query that returns one row each with a{" "}
+                  <span className="pl-mono">status</span> of PASS, REVIEW or FAIL. Run this one; the per-table scripts
+                  below are the detail behind any row you need to chase.
                 </div>
               </div>
             </div>
             <div style={{ padding: 14 }}>
               <div className="pl-code-head">
                 <span className="pl-card-sub pl-mono">
-                  {active.folder}/{active.controlTotals.filename}
+                  {active.folder}/{active.bundle.filename}
                 </span>
                 <span style={{ display: "flex", gap: 6 }}>
-                  <button type="button" className="btn-sm" onClick={() => setShowTotals((v) => !v)}>
-                    {showTotals ? "Hide SQL" : "Show SQL"}
+                  <button type="button" className="btn-sm" onClick={() => setShowBundle((v) => !v)}>
+                    {showBundle ? "Hide SQL" : "Show SQL"}
                   </button>
-                  <CopyButton text={active.controlTotals.sql} label="Copy" />
+                  <CopyButton text={active.bundle.sql} label="Copy" />
                   <button
                     type="button"
                     className="btn-sm"
-                    onClick={() => downloadSql(active.controlTotals.filename, active.controlTotals.sql)}
+                    onClick={() => downloadSql(active.bundle.filename, active.bundle.sql)}
                   >
                     ↓ .sql
                   </button>
                 </span>
               </div>
-              {showTotals && (
+              {showBundle && (
                 <pre className="pl-code">
-                  <code>{active.controlTotals.sql}</code>
+                  <code>{active.bundle.sql}</code>
                 </pre>
               )}
             </div>

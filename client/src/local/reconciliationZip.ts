@@ -3,8 +3,9 @@ import type { LocalReconciliationSuite, ReconHopScripts } from "../types";
 
 /**
  * Packs the generated reconciliation SQL into one zip — a folder per pipeline hop
- * (`raw_to_stage/`, `stage_to_transformation/`, …), each holding that hop's control-totals query and
- * one script per target table, plus a README that says what every file checks.
+ * (`raw_to_stage/`, `stage_to_transformation/`, …), each holding that hop's whole reconciliation as
+ * one runnable query (`00_reconciliation.sql`) and one script per target table behind it, plus a
+ * README that says what every file checks.
  *
  * Built in the browser from the suite already in memory, the same way `pipeline/corrections.ts`
  * bundles corrected notebooks. Folder and file names come from the server so the README, the zip and
@@ -21,10 +22,11 @@ function buildReadme(suite: LocalReconciliationSuite): string {
     "",
     `Generated ${new Date().toISOString().slice(0, 10)} by Recon, from the SQL in \`${suite.folderName}\`.`,
     "",
-    "One folder per pipeline hop. In each: `00_control_totals.sql` counts every source/target pair in",
-    "that hop side by side — run it first — and one script per target table holds the detailed checks",
-    "(row counts, measure totals, keys that went missing, keys with no source, duplicate keys, null",
-    "keys).",
+    "One folder per pipeline hop. In each: `00_reconciliation.sql` is the hop's whole reconciliation as",
+    "a single query — row counts, measure totals, keys that went missing, keys with no source,",
+    "duplicate keys, null keys, for every table the hop builds — returning one row per check with a",
+    "`status` of PASS, REVIEW or FAIL. Run that one file. The per-table scripts beside it are the same",
+    "checks written out a table at a time, for when a number needs chasing down.",
     "",
     suite.generatedBy === "ai"
       ? "The checks were written by Recon's reviewer model, which was given the transformation SQL and the"
@@ -79,7 +81,7 @@ export function buildReconciliationZip(suite: LocalReconciliationSuite): Blob {
 
   for (const hop of suite.hops) {
     if (hop.scripts.length === 0) continue;
-    files[`${hop.folder}/${hop.controlTotals.filename}`] = strToU8(hop.controlTotals.sql);
+    files[`${hop.folder}/${hop.bundle.filename}`] = strToU8(hop.bundle.sql);
     for (const script of hop.scripts) {
       files[`${hop.folder}/${script.filename}`] = strToU8(script.sql);
     }

@@ -575,8 +575,12 @@ export interface ReconHopScripts {
   /** Folder this hop occupies in the zip, e.g. `raw_to_stage`. */
   folder: string;
   scripts: ReconScript[];
-  /** Every pair in the hop counted in one query — the sheet an engineer eyeballs first. */
-  controlTotals: { filename: string; sql: string };
+  /**
+   * The whole hop as one runnable query: every check above folded into a single
+   * `WITH … SELECT … UNION ALL …` that returns one status row per check. This is the file to run;
+   * `scripts` is the per-table detail behind it.
+   */
+  bundle: { filename: string; sql: string };
   notes: string[];
 }
 
