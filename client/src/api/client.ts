@@ -3,6 +3,12 @@ import type {
   Catalog,
   LevelAnalysisRequest,
   LevelAnalysisResponse,
+  LevelFixReport,
+  LevelFixRequest,
+  LocalFixReport,
+  LocalFixRequest,
+  LocalScanRequest,
+  LocalScanResult,
   PipelineAnalysis,
   PipelineAnalyzeRequest,
   ProjectSummary,
@@ -83,4 +89,17 @@ export function analyzePipeline(payload: PipelineAnalyzeRequest) {
 
 export function getProjectSummary(payload: ProjectSummaryRequest) {
   return unwrap<ProjectSummary>(api.post("/pipeline/summary", payload));
+}
+
+export function getLevelFixes(payload: LevelFixRequest) {
+  return unwrap<LevelFixReport>(api.post("/levels/fixes", payload));
+}
+
+/** Uploads the SQL files located in a local folder and gets back lineage + discovered schemas. */
+export function scanLocalFolder(payload: LocalScanRequest) {
+  return unwrap<LocalScanResult>(api.post("/local/scan", payload));
+}
+
+export function getLocalGovernance(payload: LocalFixRequest) {
+  return unwrap<LocalFixReport>(api.post("/local/governance", payload));
 }

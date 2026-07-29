@@ -165,11 +165,20 @@ export interface LogicValidationResponse extends LogicValidationResult {
 
 // ---- Guided level-by-level reconciliation wizard ----
 
+/**
+ * The role a layer plays in the pipeline, inferred client-side from the schema name. Roles are
+ * architecture-neutral: "gold", "datamart" and "presentation" all infer `serve`. Optional because
+ * a layer the user added by hand may not resemble any known naming convention.
+ */
+export type LayerRole = "ingest" | "clean" | "transform" | "serve";
+
 export interface LayerRef {
-  /** Human label for the medallion layer, e.g. "bronze". */
+  /** Human label for the layer — defaults to the schema's own name, e.g. "staged" or "bronze". */
   label: string;
   /** Actual Unity Catalog schema name backing that layer. */
   schema: string;
+  /** Inferred pipeline role, used only as a hint for heuristics and prompts. */
+  role?: LayerRole;
 }
 
 export interface SelectedNotebook {
@@ -315,4 +324,182 @@ export interface ProjectSummaryRequest {
   warehouseId: string;
   notebookRoot: string;
   layers: LayerRef[];
+}
+
+// ---- Governance: per-level code-fix suggestions ----
+
+export type CodeFixSeverity = "info" | "warning" | "error";
+
+/** A measured source -> target row count for one write statement in the hop. */
+export interface RowCountPair {
+  sourceTable: string;
+  sourceRows: number | null;
+  targetTable: string;
+  targetRows: number | null;
+  /** `targetRows - sourceRows`, or null when either count couldn't be run. */
+  delta: number | null;
+}
+
+/** A WHERE predicate measured against its source table via `COUNT(*) WHERE NOT (predicate)`. */
+export interface FilterDrop {
+  predicateSql: string;
+  sourceTable: string;
+  excludedRows: number | null;
+}
+
+/** Everything measured about one notebook cell, attached to the fix that touches that cell. */
+export interface CellEvidence {
+  notebookPath: string;
+  cellIndex: number;
+  rowCounts: RowCountPair[];
+  filters: FilterDrop[];
+}
+
+/** Hop-wide measurements gathered before the LLM call — null when no warehouse was supplied. */
+export interface HopEvidence {
+  cells: CellEvidence[];
+  /** Same-named tables on both sides of the hop whose counts differ. */
+  mismatches: StageMismatch[];
+  /** True when the per-review statement budget was hit and some cells went unmeasured. */
+  truncated: boolean;
+}
+
+export type FixVerificationStatus = "verified" | "unverified" | "failed";
+
+export interface FixVerification {
+  status: FixVerificationStatus;
+  /** Why the check landed where it did — shown verbatim in the UI. */
+  reason: string;
+  originalRows: number | null;
+  correctedRows: number | null;
+  /** `correctedRows - originalRows`, or null when either count didn't run. */
+  delta: number | null;
+}
+
+export interface CodeFix {
+  notebookPath: string;
+  cellIndex: number;
+  title: string;
+  severity: CodeFixSeverity;
+  /** Why this change prevents a reconciliation error (dropped/duplicated rows, wrong join, etc.). */
+  rationale: string;
+  /** The cell's code as-is (what was sent to the model). */
+  originalCode: string;
+  /** Copy-paste-ready corrected version of the cell. */
+  correctedCode: string;
+  /** Counts measured for this cell before the fix was requested; null without a warehouse. */
+  evidence: CellEvidence | null;
+  /** Result of re-checking the corrected code; null without a warehouse. */
+  verification: FixVerification | null;
+}
+
+export interface NotebookCorrection {
+  notebookPath: string;
+  /** Suggested download filename, e.g. `load_fact_sales.corrected.py`. */
+  filename: string;
+  language: NotebookMeta["language"];
+  /** The full notebook rebuilt in Databricks source format with the fixes applied — downloadable. */
+  correctedSource: string;
+  changedCells: number;
+}
+
+export interface LevelFixReport {
+  fromLayer: LayerRef;
+  toLayer: LayerRef;
+  status: "ok" | "warning" | "error";
+  summary: string;
+  /** Notebooks found to write the target layer for this hop. */
+  analyzedNotebooks: string[];
+  fixes: CodeFix[];
+  corrections: NotebookCorrection[];
+  /** Counts measured across the hop, or null when no warehouse was supplied. */
+  evidence: HopEvidence | null;
+}
+
+export interface LevelFixRequest {
+  catalog: string;
+  notebookRoot: string;
+  fromLayer: LayerRef;
+  toLayer: LayerRef;
+  /** Optional — without it the review is code-only and skips evidence + verification. */
+  warehouseId?: string;
+}
+
+// ---- Local SQL folder analysis (no Databricks connection required) ----
+
+/** One SQL file located inside an uploaded folder, sent as plain text. */
+export interface LocalSqlFileInput {
+  /** Path relative to the uploaded folder, e.g. `etl/silver/load_orders.sql`. */
+  path: string;
+  content: string;
+}
+
+export interface LocalSkippedFile {
+  path: string;
+  reason: string;
+}
+
+export interface LocalFileSummary {
+  path: string;
+  statementCount: number;
+  bytes: number;
+  /** Tables the file writes / reads, exactly as the SQL names them (lowercased). */
+  writes: string[];
+  reads: string[];
+}
+
+export interface LocalTableRef {
+  /** The table as written in the SQL, lowercased — `silver.orders`, or `orders` when unqualified. */
+  qualified: string;
+  /** Schema segment of `qualified`, or null when the SQL never qualifies the table. */
+  schema: string | null;
+  name: string;
+  written: boolean;
+  read: boolean;
+}
+
+export interface LocalProjectStats {
+  fileCount: number;
+  statementCount: number;
+  tableCount: number;
+  schemaCount: number;
+  lineageEdgeCount: number;
+}
+
+export interface LocalScanResult {
+  folderName: string;
+  files: LocalFileSummary[];
+  skipped: LocalSkippedFile[];
+  tables: LocalTableRef[];
+  /** Every schema qualifier seen in the SQL — the client turns these into pipeline layers. */
+  schemas: string[];
+  lineage: LineageEdge[];
+  stats: LocalProjectStats;
+}
+
+export interface LocalScanRequest {
+  folderName?: string;
+  files: LocalSqlFileInput[];
+}
+
+/** Omit both layers to review every located statement as a single scope. */
+export interface LocalFixRequest {
+  fromLayer?: LayerRef;
+  toLayer?: LayerRef;
+}
+
+export interface LocalFixReport {
+  /** Null when the review covered the whole folder rather than one hop. */
+  fromLayer: LayerRef | null;
+  toLayer: LayerRef | null;
+  status: "ok" | "warning" | "error";
+  summary: string;
+  /** Files that contributed at least one statement to the review. */
+  analyzedFiles: string[];
+  /** `notebookPath` is the file's relative path and `cellIndex` its statement ordinal in that file. */
+  fixes: CodeFix[];
+  /** Whole SQL files rebuilt with the corrected statements spliced back in. */
+  corrections: NotebookCorrection[];
+  /** True when the statement budget capped how much of the folder was reviewed. */
+  truncated: boolean;
 }

@@ -1,3 +1,4 @@
+import type { LocalProject } from "../services/localProject.js";
 import type {
   Catalog,
   ConnectionConfig,
@@ -21,6 +22,7 @@ interface State {
   stageMismatches: StageMismatch[];
   lineageSourceTable: string | null;
   lineageTransformations: LineageTransformation[];
+  localProject: LocalProject | null;
 }
 
 const state: State = {
@@ -33,7 +35,8 @@ const state: State = {
   reconciliationResults: [],
   stageMismatches: [],
   lineageSourceTable: null,
-  lineageTransformations: []
+  lineageTransformations: [],
+  localProject: null
 };
 
 export function schemaKey(catalogName: string): string {
@@ -115,6 +118,17 @@ export const memoryStore = {
     return { sourceTable: state.lineageSourceTable, transformations: state.lineageTransformations };
   },
 
+  // The uploaded SQL folder lives here so a governance review doesn't have to re-upload every file
+  // per hop. Unlike everything above it is *not* tied to a Databricks connection — local analysis
+  // works with no workspace at all — but `reset()` still clears it, since reset means "forget
+  // everything this process knows".
+  setLocalProject(project: LocalProject | null): void {
+    state.localProject = project;
+  },
+  getLocalProject(): LocalProject | null {
+    return state.localProject;
+  },
+
   reset(): void {
     state.connection = null;
     state.catalogs = [];
@@ -126,5 +140,6 @@ export const memoryStore = {
     state.stageMismatches = [];
     state.lineageSourceTable = null;
     state.lineageTransformations = [];
+    state.localProject = null;
   }
 };

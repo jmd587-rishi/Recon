@@ -8,6 +8,7 @@ import { catalogRouter } from "./routes/catalog.js";
 import { connectionsRouter } from "./routes/connections.js";
 import { levelsRouter } from "./routes/levels.js";
 import { lineageRouter } from "./routes/lineage.js";
+import { localRouter } from "./routes/local.js";
 import { notebooksRouter } from "./routes/notebooks.js";
 import { pipelineRouter } from "./routes/pipeline.js";
 import { reconcileRouter } from "./routes/reconcile.js";
@@ -28,7 +29,9 @@ const app = express();
 const PORT = Number(process.env.PORT ?? 4000);
 
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+// Generous limit because /api/local/scan posts the text of every SQL file in an uploaded folder in
+// one request; the route caps file count and total bytes itself.
+app.use(express.json({ limit: "25mb" }));
 
 app.use("/api/connections", connectionsRouter);
 app.use("/api/catalogs", catalogRouter);
@@ -39,6 +42,7 @@ app.use("/api/lineage", lineageRouter);
 app.use("/api/validate-logic", validateLogicRouter);
 app.use("/api/levels", levelsRouter);
 app.use("/api/pipeline", pipelineRouter);
+app.use("/api/local", localRouter);
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });

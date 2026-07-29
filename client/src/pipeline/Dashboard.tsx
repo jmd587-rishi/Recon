@@ -3,11 +3,12 @@ import { analyzePipeline } from "../api/client";
 import type { LayerRef, PipelineAnalysis } from "../types";
 import "./pipeline.css";
 import { SectionExclusions } from "./SectionExclusions";
+import { SectionGovernance } from "./SectionGovernance";
 import { SectionLayers } from "./SectionLayers";
 import { SectionLineage } from "./SectionLineage";
 import { SectionSummary } from "./SectionSummary";
 
-type Section = "layers" | "exclusions" | "lineage" | "summary";
+type Section = "layers" | "exclusions" | "lineage" | "summary" | "governance";
 
 export function Dashboard({
   catalog,
@@ -78,6 +79,13 @@ export function Dashboard({
           <button type="button" className={`pl-nav-item${section === "summary" ? " on" : ""}`} onClick={() => setSection("summary")}>
             S4 · Project summary
           </button>
+          <button
+            type="button"
+            className={`pl-nav-item${section === "governance" ? " on" : ""}`}
+            onClick={() => setSection("governance")}
+          >
+            S5 · Governance &amp; fixes
+          </button>
         </aside>
 
         <div className="pl-main">
@@ -90,6 +98,9 @@ export function Dashboard({
           )}
           {section === "summary" && (
             <SectionSummary catalog={catalog} layers={layers} warehouseId={warehouseId} notebookRoot={notebookRoot} />
+          )}
+          {section === "governance" && (
+            <SectionGovernance catalog={catalog} layers={layers} warehouseId={warehouseId} notebookRoot={notebookRoot} />
           )}
         </div>
       </div>

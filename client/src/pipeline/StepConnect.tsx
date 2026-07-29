@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
 import { disconnect, getConnectionStatus, testConnection } from "../api/client";
 
-export function StepConnect({ onConnected }: { onConnected: (host: string) => void }) {
+export function StepConnect({
+  onConnected,
+  onUseLocalFolder
+}: {
+  onConnected: (host: string) => void;
+  onUseLocalFolder: () => void;
+}) {
   const [host, setHost] = useState("");
   const [token, setToken] = useState("");
   const [connectedHost, setConnectedHost] = useState<string | null>(null);
@@ -51,6 +57,9 @@ export function StepConnect({ onConnected }: { onConnected: (host: string) => vo
           </button>
         </div>
         <div className="step-actions">
+          <button type="button" className="btn-ghost" onClick={onUseLocalFolder}>
+            Analyze a local SQL folder instead
+          </button>
           <button type="button" onClick={() => onConnected(connectedHost)}>
             Next: choose catalog →
           </button>
@@ -89,6 +98,13 @@ export function StepConnect({ onConnected }: { onConnected: (host: string) => vo
         </button>
       </form>
       {error && <p className="error">{error}</p>}
+
+      <div className="local-alt">
+        <span className="hint">No workspace to hand? Recon can read SQL straight off your machine.</span>
+        <button type="button" className="btn-ghost" onClick={onUseLocalFolder}>
+          Analyze a local SQL folder →
+        </button>
+      </div>
     </div>
   );
 }

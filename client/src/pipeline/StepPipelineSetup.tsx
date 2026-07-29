@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getCatalogs, getSchemas, getWarehouses } from "../api/client";
 import type { Catalog, LayerRef, Schema, Warehouse } from "../types";
 import { detectLayers } from "../wizard/layers";
+import { LayerEditor } from "./LayerEditor";
 import { NotebookRootPicker } from "./NotebookRootPicker";
 
 export function StepPipelineSetup({
@@ -51,7 +52,7 @@ export function StepPipelineSetup({
     try {
       const res = await getSchemas(name);
       setSchemas(res.schemas);
-      setLayers(detectLayers(res.schemas));
+      setLayers(detectLayers(res.schemas.map((s) => s.name)));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -59,30 +60,7 @@ export function StepPipelineSetup({
     }
   }
 
-  function updateLayer(index: number, patch: Partial<LayerRef>) {
-    setLayers((prev) => prev.map((l, i) => (i === index ? { ...l, ...patch } : l)));
-  }
-
-  function removeLayer(index: number) {
-    setLayers((prev) => prev.filter((_, i) => i !== index));
-  }
-
-  function move(index: number, dir: -1 | 1) {
-    setLayers((prev) => {
-      const next = [...prev];
-      const target = index + dir;
-      if (target < 0 || target >= next.length) return prev;
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  }
-
-  function addLayer() {
-    const used = new Set(layers.map((l) => l.schema));
-    const firstFree = schemas.find((s) => !used.has(s.name));
-    setLayers((prev) => [...prev, { label: "", schema: firstFree?.name ?? "" }]);
-  }
-
+  const schemaNames = useMemo(() => schemas.map((s) => s.name), [schemas]);
   const completeLayers = layers.filter((l) => l.label.trim() && l.schema.trim());
   const canContinue = completeLayers.length >= 1 && warehouseId.trim().length > 0;
 
@@ -90,8 +68,9 @@ export function StepPipelineSetup({
     <div className="step-body">
       <h2>Pipeline setup</h2>
       <p className="hint">
-        Pick a catalog — Recon auto-detects the medallion layers from schema names and orders them. Adjust the
-        order, labels, or schemas if needed, then choose the SQL warehouse and notebook folder to analyze.
+        Pick a catalog — Recon proposes a pipeline from the schema names and orders it most-raw first. Any layering
+        works: bronze/silver/gold, raw → staged → transformation → datamart, or your own. Adjust the order, labels, or
+        schemas, then choose the SQL warehouse and notebook folder to analyze.
       </p>
 
       <label className="form-label">
@@ -109,59 +88,7 @@ export function StepPipelineSetup({
       {loadingSchemas && <p className="hint">Loading schemas...</p>}
       {error && <p className="error">{error}</p>}
 
-      {catalog && !loadingSchemas && (
-        <div className="layers-editor">
-          <div className="layers-editor-head">
-            <h3>Layers (top = most raw)</h3>
-            <button type="button" className="btn-ghost" onClick={addLayer} disabled={layers.length >= schemas.length}>
-              + Add layer
-            </button>
-          </div>
-
-          {layers.length === 0 && (
-            <p className="hint">
-              No medallion layers were auto-detected from the schema names. Add them manually below.
-            </p>
-          )}
-
-          <ul className="layer-rows">
-            {layers.map((layer, i) => (
-              <li key={i} className="layer-row">
-                <div className="layer-order">
-                  <button type="button" onClick={() => move(i, -1)} disabled={i === 0} aria-label="Move up">
-                    ▲
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => move(i, 1)}
-                    disabled={i === layers.length - 1}
-                    aria-label="Move down"
-                  >
-                    ▼
-                  </button>
-                </div>
-                <input
-                  className="layer-label-input"
-                  placeholder="label (e.g. raw)"
-                  value={layer.label}
-                  onChange={(e) => updateLayer(i, { label: e.target.value })}
-                />
-                <select value={layer.schema} onChange={(e) => updateLayer(i, { schema: e.target.value })}>
-                  <option value="">Select schema...</option>
-                  {schemas.map((s) => (
-                    <option key={s.name} value={s.name}>
-                      {s.name}
-                    </option>
-                  ))}
-                </select>
-                <button type="button" className="chip-x layer-remove" onClick={() => removeLayer(i)} aria-label="Remove layer">
-                  ×
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      {catalog && !loadingSchemas && <LayerEditor schemas={schemaNames} layers={layers} onChange={setLayers} />}
 
       {catalog && (
         <div className="layers-editor">

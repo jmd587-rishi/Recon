@@ -18,7 +18,7 @@ function cleanIdentifier(ref: string): string {
  * extraction), but the inner `SELECT ... WHERE ...` on its own usually is. Isolating it from the
  * first `SELECT` keyword lets the AST path handle CTAS/INSERT-SELECT the same as a bare SELECT.
  */
-function innerSelect(sql: string): string | null {
+export function innerSelect(sql: string): string | null {
   const idx = sql.search(/\bselect\b/i);
   return idx >= 0 ? sql.slice(idx) : null;
 }
@@ -32,7 +32,7 @@ function astWherePredicate(sql: string): string | null {
       if (!where) return null;
       return parser.exprToSQL(where as never, { database });
     } catch {
-      // try next dialect
+      // try next dialect/
     }
   }
   return null;

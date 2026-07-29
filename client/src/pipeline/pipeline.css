@@ -216,6 +216,28 @@
   color: #fff;
 }
 
+/* Per-tab review state — "✓" once a level has a report, "…" while it's in flight. */
+.pl-tab-state {
+  margin-left: 6px;
+  opacity: 0.75;
+}
+
+/* Cross-level bar: review every hop, then take the whole set away as one zip. */
+.pl-bundle-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+}
+
+.pl-bundle-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .pl-rule-card {
   padding: 10px 12px;
   border-radius: 8px;
@@ -334,4 +356,135 @@
   color: var(--warning);
   background: var(--warning-bg);
   border-color: var(--warning);
+}
+
+/* ---- S5: governance & code fixes ---- */
+.pl-sev {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.pl-sev-info {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+
+.pl-sev-warning {
+  color: var(--warning);
+  background: var(--warning-bg);
+  border-color: var(--warning);
+}
+
+.pl-sev-error {
+  color: var(--danger);
+  background: var(--warning-bg);
+  border-color: var(--danger);
+}
+
+.pl-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0 4px;
+}
+
+.pl-code {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-h);
+  white-space: pre;
+}
+
+.pl-corr-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+}
+
+/* Measured row counts shown under a fix — the evidence the model reasoned over. */
+.pl-evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 6px 0 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+}
+
+.pl-evidence-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pl-evidence-text {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-h);
+}
+
+.pl-delta {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.pl-delta.up {
+  color: var(--warning);
+}
+
+.pl-delta.down {
+  color: var(--danger);
+}
+
+.pl-verify {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  cursor: help;
+}
+
+.pl-verify-verified {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.pl-verify-unverified {
+  color: var(--text);
+}
+
+.pl-verify-failed {
+  color: var(--danger);
+  background: var(--warning-bg);
+  border-color: var(--danger);
 }

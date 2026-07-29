@@ -1,6 +1,8 @@
 import axios from "axios";
 import type {
+  CellEvidence,
   CodeCandidate,
+  CodeFixSeverity,
   LevelFinding,
   LevelReport,
   LevelSeverity,
@@ -102,7 +104,8 @@ export function buildAnalysisMessages(input: MismatchLlmInput): ChatMessage[] {
       role: "system",
       content:
         "You are a data engineering assistant reviewing Databricks notebook code to explain row-count " +
-        "mismatches between two adjacent stages of a medallion pipeline (e.g. bronze -> silver -> gold). " +
+        "mismatches between two adjacent stages of a layered data pipeline. The stage names are given to " +
+        "you below — use them as-is and do not assume a particular layering convention. " +
         "You are given candidate SQL snippets pulled from notebooks that reference the table. " +
         "Pick the single snippet most likely responsible for the mismatch (filters, joins that drop rows, " +
         "dedup/DISTINCT logic, incorrect date windows, aggregations that change grain, etc.), or none if the " +
@@ -171,8 +174,8 @@ export function buildLineageMessages(sourceTable: string, candidates: LineageCan
       role: "system",
       content:
         "You are a data engineering assistant explaining how a single source table is transformed into " +
-        "several downstream tables in a Databricks medallion pipeline (e.g. one silver table feeding " +
-        "multiple gold tables). You are given one candidate query/snippet per downstream table. " +
+        "several downstream tables in a Databricks pipeline — one upstream table fanning out into multiple " +
+        "downstream ones. You are given one candidate query/snippet per downstream table. " +
         "For each candidate, in 1-3 sentences explain what the transformation does in plain English: " +
         "aggregations, filters, joins, dedup, grain changes, and renamed/derived columns. " +
         'Respond with ONLY compact JSON: {"explanations": [{"targetTable": "<exact target table from input>", "explanation": "<1-3 sentences>"}, ...]}, ' +
@@ -313,9 +316,9 @@ export function buildLevelMessages(input: LevelLlmInput): ChatMessage[] {
     {
       role: "system",
       content:
-        "You are a senior data engineering reconciliation reviewer. You are given one 'level' of a medallion " +
-        "pipeline — a source layer feeding an adjacent target layer (e.g. bronze -> silver, or silver -> gold) — " +
-        "the tables selected at each layer, the notebook transformation code that moves data between them, and " +
+        "You are a senior data engineering reconciliation reviewer. You are given one 'level' of a layered data " +
+        "pipeline — a source layer feeding an adjacent target layer — the layer names as this project actually " +
+        "uses them, the tables selected at each layer, the notebook code that moves data between them, and " +
         "business context supplied by the user. Assess two things: (1) code quality of the transformation, and " +
         "(2) whether the transformation risks a RECONCILIATION error between source and target — dropped or " +
         "duplicated rows, wrong join keys or join types, missing/incorrect filters or dedup, grain changes, null " +
@@ -413,10 +416,10 @@ export function buildExclusionMessages(rules: ExclusionRuleLlmInput[]): ChatMess
     {
       role: "system",
       content:
-        "You are a data engineering assistant explaining exclusion rules found in Databricks medallion " +
+        "You are a data engineering assistant explaining exclusion rules found in Databricks " +
         "pipeline notebooks — WHERE predicates on the SQL statement that writes each table, which determine " +
-        "which source rows get dropped as data moves between layers (e.g. raw -> staging -> transform -> " +
-        "dim -> fact). For each rule, in 1-3 sentences explain in plain business English what kind of rows " +
+        "which source rows get dropped as data moves from one layer of the pipeline to the next. " +
+        "For each rule, in 1-3 sentences explain in plain business English what kind of rows " +
         "it excludes and why that's plausible (test/internal data, drafts, intercompany elimination, zero-value " +
         "records, etc.), and flag it as 'warning' rather than 'ok' if the predicate looks like it could be " +
         "unintentionally dropping legitimate rows (e.g. an overly broad filter, a sign/inequality that looks " +
@@ -500,11 +503,13 @@ export function buildProjectSummaryMessages(input: ProjectSummaryLlmInput): Chat
       role: "system",
       content:
         "You are a senior data engineer writing an onboarding brief for someone who has just joined a " +
-        "Databricks medallion (bronze/silver/gold) data project and has never seen it before. You are given " +
-        "the catalog, the ordered medallion layers with their tables (each tagged fact/dimension/bridge/" +
-        "staging/other and, where known, row counts), aggregate stats, and the table-to-table lineage edges " +
-        "extracted from the transformation notebooks. Explain the project clearly and concretely, grounded " +
-        "ONLY in the data provided — never invent table names, counts, or business domains you weren't given. " +
+        "Databricks data project and has never seen it before. You are given the catalog, the project's " +
+        "ordered pipeline layers with their tables (each tagged fact/dimension/bridge/staging/other and, " +
+        "where known, row counts), aggregate stats, and the table-to-table lineage edges extracted from the " +
+        "transformation notebooks. Explain the project clearly and concretely, grounded ONLY in the data " +
+        "provided — never invent table names, counts, or business domains you weren't given. Describe the " +
+        "layering using the project's own layer names; do not relabel it as bronze/silver/gold unless those " +
+        "are the names you were actually given. " +
         "Write for a smart engineer who is new to THIS project, not new to data engineering. " +
         'Respond with ONLY compact JSON: {"overview": "<2-4 sentences: what this data project is and what it produces>", ' +
         '"architecture": "<2-4 sentences: how it is set up — the layers, what role each plays, how many fact vs dimension tables>", ' +
@@ -556,4 +561,155 @@ export function parseProjectSummaryResponse(raw: string): ProjectNarrative {
 export async function summarizeProject(input: ProjectSummaryLlmInput): Promise<ProjectNarrative> {
   const content = await callAzureOpenAi(buildProjectSummaryMessages(input));
   return parseProjectSummaryResponse(content);
+}
+
+// ---- Governance: per-level code-fix suggestions ----
+
+export interface CodeFixCandidate {
+  /** Stable index the model refers back to so we can map the fix onto the exact cell. */
+  index: number;
+  notebookPath: string;
+  cellIndex: number;
+  language: string;
+  code: string;
+  /** Row counts measured for this cell, when a warehouse was available. */
+  evidence?: CellEvidence | null;
+  /** What `cellIndex` counts — "cell" for notebooks, "statement" for standalone SQL files. */
+  unit?: string;
+}
+
+/** The pipeline hop under review, or null when the whole project is reviewed as one scope. */
+export interface CodeFixHop {
+  from: string;
+  to: string;
+}
+
+function formatCount(value: number | null): string {
+  return value === null ? "unavailable" : value.toLocaleString("en-US");
+}
+
+/** Renders a cell's measured counts as prompt lines, or "" when nothing was measured. */
+export function formatCellEvidence(evidence: CellEvidence | null | undefined): string {
+  if (!evidence) return "";
+  const lines: string[] = [];
+
+  for (const rc of evidence.rowCounts) {
+    const delta =
+      rc.delta === null ? "" : ` (${rc.delta > 0 ? "+" : ""}${rc.delta.toLocaleString("en-US")} rows at the target)`;
+    lines.push(`source ${rc.sourceTable} = ${formatCount(rc.sourceRows)} rows -> target ${rc.targetTable} = ${formatCount(rc.targetRows)}${delta}`);
+  }
+
+  for (const f of evidence.filters) {
+    lines.push(`filter \`${f.predicateSql}\` excludes ${formatCount(f.excludedRows)} rows from ${f.sourceTable}`);
+  }
+
+  if (lines.length === 0) return "";
+  return `measured: ${lines.join("\n              ")}`;
+}
+
+export interface CodeFixLlmResult {
+  status: "ok" | "warning" | "error";
+  summary: string;
+  fixes: { index: number; title: string; severity: CodeFixSeverity; rationale: string; correctedCode: string }[];
+}
+
+const FIX_SEVERITIES: readonly CodeFixSeverity[] = ["info", "warning", "error"];
+
+export function buildCodeFixMessages(hop: CodeFixHop | null, candidates: CodeFixCandidate[]): ChatMessage[] {
+  const unit = candidates[0]?.unit ?? "cell";
+  const codeBlock = candidates.length
+    ? candidates
+        .map((c) => {
+          const evidence = formatCellEvidence(c.evidence);
+          const header = `[${c.index}] ${c.notebookPath} (${c.unit ?? "cell"} ${c.cellIndex}, ${c.language}):`;
+          return `${header}${evidence ? `\n    ${evidence}` : ""}\n\`\`\`\n${c.code}\n\`\`\``;
+        })
+        .join("\n\n")
+    : `(no transformation code was found for ${hop ? "this hop" : "this project"})`;
+
+  const hasEvidence = candidates.some((c) => formatCellEvidence(c.evidence));
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a data engineering governance gatekeeper reviewing " +
+        (hop
+          ? `the Databricks transformation code that moves data from the ${hop.from} layer to the ${hop.to} layer ` +
+            "of a layered data pipeline. Your job is to prevent RECONCILIATION errors between the two layers: "
+          : "the SQL transformation code of a data pipeline project. Your job is to prevent RECONCILIATION errors " +
+            "between what each statement reads and what it writes: ") +
+        "silently dropped rows, duplicated rows from bad joins (wrong " +
+        "keys or join type / fan-out), missing or wrong filters, dedup at the wrong grain, aggregation grain changes, " +
+        "unsafe null handling, unsafe casts that null out values, and incremental-load gaps. " +
+        `For EACH provided ${unit} that needs changes, rewrite it into a corrected, copy-paste-ready version that keeps ` +
+        `the original intent but is reconciliation-safe, and preserve the ${unit}'s language and formatting. Only include ` +
+        `${unit}s that genuinely need changes — omit ${unit}s that are already fine. Set status to 'ok' when no ${unit} needs ` +
+        "changes, 'warning' for minor risks, and 'error' when a change is needed to avoid a likely reconciliation break. " +
+        (hasEvidence
+          ? `Some ${unit}s carry a 'measured:' line with real row counts taken from the warehouse. Treat those numbers as ` +
+            "ground truth: cite them in the rationale when they explain a gap, and when the code looks risky but the " +
+            "counts show no gap, say so explicitly instead of raising the severity. "
+          : "") +
+        'Respond with ONLY compact JSON: {"status": "ok|warning|error", "summary": "<2-4 sentence overview>", ' +
+        '"fixes": [{"index": <int index from the list>, "title": "<short label of the fix>", "severity": "info|warning|error", ' +
+        '"rationale": "<1-3 sentences: which reconciliation error this prevents, citing the code>", ' +
+        `"correctedCode": "<the full corrected ${unit} body>"}]}. ` +
+        "No markdown, no text outside the JSON object."
+    },
+    {
+      role: "user",
+      content:
+        (hop ? `Hop: ${hop.from} -> ${hop.to}` : "Scope: every SQL statement found in the uploaded project folder") +
+        `\n\nTransformation ${unit}s:\n${codeBlock}`
+    }
+  ];
+}
+
+export function parseCodeFixResponse(raw: string, candidateCount: number): CodeFixLlmResult {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  try {
+    const parsed = JSON.parse(cleaned) as { status?: unknown; summary?: unknown; fixes?: unknown };
+    const status = STATUSES.includes(parsed.status as LevelReport["status"])
+      ? (parsed.status as CodeFixLlmResult["status"])
+      : "warning";
+    const summary = typeof parsed.summary === "string" ? parsed.summary : cleaned;
+    const fixes = Array.isArray(parsed.fixes)
+      ? parsed.fixes.flatMap((f): CodeFixLlmResult["fixes"] => {
+          if (typeof f !== "object" || f === null) return [];
+          const rec = f as Record<string, unknown>;
+          const index = typeof rec.index === "number" ? Math.trunc(rec.index) : -1;
+          if (index < 0 || index >= candidateCount) return [];
+          if (typeof rec.correctedCode !== "string") return [];
+          const severity = FIX_SEVERITIES.includes(rec.severity as CodeFixSeverity)
+            ? (rec.severity as CodeFixSeverity)
+            : "warning";
+          return [
+            {
+              index,
+              title: typeof rec.title === "string" && rec.title.trim() ? rec.title : "Suggested fix",
+              severity,
+              rationale: typeof rec.rationale === "string" ? rec.rationale : "",
+              correctedCode: rec.correctedCode
+            }
+          ];
+        })
+      : [];
+
+    return { status, summary, fixes };
+  } catch {
+    return { status: "warning", summary: cleaned, fixes: [] };
+  }
+}
+
+export async function suggestLevelCodeFixes(
+  hop: CodeFixHop | null,
+  candidates: CodeFixCandidate[]
+): Promise<CodeFixLlmResult> {
+  const content = await callAzureOpenAi(buildCodeFixMessages(hop, candidates));
+  return parseCodeFixResponse(content, candidates.length);
 }

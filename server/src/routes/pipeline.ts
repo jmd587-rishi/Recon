@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { CONCURRENCY, mapWithConcurrency } from "../services/concurrency.js";
 import { computeLayerExclusions } from "../services/exclusionAnalyzer.js";
 import { listTables, listWarehouses, runSqlCount } from "../services/databricksClient.js";
 import { explainExclusionRules, LlmConfigError, summarizeProject } from "../services/llmClient.js";
@@ -20,21 +21,6 @@ import { type ConnectedRequest, requireConnection } from "./requireConnection.js
 export const pipelineRouter = Router();
 
 pipelineRouter.use(requireConnection);
-
-const CONCURRENCY = 5;
-
-async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await fn(items[i]);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
-}
 
 function isValidLayers(layers: unknown): layers is LayerRef[] {
   if (!Array.isArray(layers) || layers.length === 0) return false;
@@ -195,7 +181,7 @@ pipelineRouter.post("/summary", async (req, res) => {
         return {
           schema: layer.schema,
           name: t.name,
-          kind: classifyTable(t.name, layer.label),
+          kind: classifyTable(t.name, layer),
           rowCount,
           columnCount: t.columns?.length ?? null,
           comment: t.comment ?? null

@@ -1,24 +1,31 @@
-import type { LineageEdge, ProjectLayerSummary, ProjectStats, TableKind } from "../types/index.js";
+import type { LayerRef, LineageEdge, ProjectLayerSummary, ProjectStats, TableKind } from "../types/index.js";
+
+/** Roles whose tables are pre-modeling by definition, whatever the project calls those layers. */
+const PRE_MODELING_ROLES = new Set(["ingest", "clean"]);
 
 /**
- * Classifies a table into a warehouse-modeling role from its name (and, as a weak hint, the label of
- * the medallion layer it lives in). Purely heuristic — Unity Catalog doesn't record whether a table
- * is a fact or a dimension — matching the common `fact_*`/`dim_*` (and short `f_*`/`d_*`) naming
- * conventions, plus bridge/mapping tables and staging tables. Everything else falls through to
- * "other" (raw landing tables, lookups that don't follow a convention, etc.).
+ * Classifies a table into a warehouse-modeling role from its name (and, as a weak hint, the layer it
+ * lives in). Purely heuristic — Unity Catalog doesn't record whether a table is a fact or a
+ * dimension — matching the common `fact_*`/`dim_*` (and short `f_*`/`d_*`) naming conventions, plus
+ * bridge/mapping tables and staging tables. Everything else falls through to "other" (landing
+ * tables, lookups that don't follow a convention, etc.).
+ *
+ * The layer hint reads the inferred `role` rather than the label, so a project whose layers are
+ * named `raw`/`staged`/`transformation`/`datamart` classifies the same as a bronze/silver/gold one.
+ * It falls back to matching the label directly for layers the user named something unrecognizable.
  */
-export function classifyTable(tableName: string, layerLabel?: string): TableKind {
+export function classifyTable(tableName: string, layer?: LayerRef): TableKind {
   const name = tableName.toLowerCase();
-  const layer = (layerLabel ?? "").toLowerCase();
 
   if (/^(fact|fct|f)[_]/.test(name) || name.includes("_fact") || name.endsWith("_facts")) return "fact";
   if (/^(dim|dm|d)[_]/.test(name) || name.includes("_dim") || name.endsWith("_dimension")) return "dimension";
   if (/^(bridge|br|map|xref|link)[_]/.test(name) || name.includes("bridge") || name.includes("_map")) return "bridge";
-  if (
-    /^(stg|stage|staging|tmp|temp|wrk|work)[_]/.test(name) ||
-    name.startsWith("stg") ||
-    /\b(raw|bronze|stag)/.test(layer)
-  ) {
+
+  const preModelingLayer = layer?.role
+    ? PRE_MODELING_ROLES.has(layer.role)
+    : /\b(raw|bronze|land|ingest|stag|stg)/.test((layer?.label ?? "").toLowerCase());
+
+  if (/^(stg|stage|staging|tmp|temp|wrk|work)[_]/.test(name) || name.startsWith("stg") || preModelingLayer) {
     return "staging";
   }
   return "other";

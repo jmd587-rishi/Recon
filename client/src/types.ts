@@ -127,9 +127,12 @@ export interface LogicValidationResponse extends LogicValidationResult {
 
 // ---- Guided level-by-level reconciliation wizard ----
 
+export type LayerRole = "ingest" | "clean" | "transform" | "serve";
+
 export interface LayerRef {
   label: string;
   schema: string;
+  role?: LayerRole;
 }
 
 export interface SelectedNotebook {
@@ -268,4 +271,156 @@ export interface ProjectSummaryRequest {
   warehouseId: string;
   notebookRoot: string;
   layers: LayerRef[];
+}
+
+// ---- Governance: per-level code-fix suggestions ----
+
+export type CodeFixSeverity = "info" | "warning" | "error";
+
+export interface RowCountPair {
+  sourceTable: string;
+  sourceRows: number | null;
+  targetTable: string;
+  targetRows: number | null;
+  delta: number | null;
+}
+
+export interface FilterDrop {
+  predicateSql: string;
+  sourceTable: string;
+  excludedRows: number | null;
+}
+
+export interface CellEvidence {
+  notebookPath: string;
+  cellIndex: number;
+  rowCounts: RowCountPair[];
+  filters: FilterDrop[];
+}
+
+export interface HopEvidence {
+  cells: CellEvidence[];
+  mismatches: StageMismatch[];
+  truncated: boolean;
+}
+
+export type FixVerificationStatus = "verified" | "unverified" | "failed";
+
+export interface FixVerification {
+  status: FixVerificationStatus;
+  reason: string;
+  originalRows: number | null;
+  correctedRows: number | null;
+  delta: number | null;
+}
+
+export interface CodeFix {
+  notebookPath: string;
+  cellIndex: number;
+  title: string;
+  severity: CodeFixSeverity;
+  rationale: string;
+  originalCode: string;
+  correctedCode: string;
+  evidence: CellEvidence | null;
+  verification: FixVerification | null;
+}
+
+export interface NotebookCorrection {
+  notebookPath: string;
+  filename: string;
+  language: NotebookMeta["language"];
+  correctedSource: string;
+  changedCells: number;
+}
+
+export interface LevelFixReport {
+  fromLayer: LayerRef;
+  toLayer: LayerRef;
+  status: "ok" | "warning" | "error";
+  summary: string;
+  analyzedNotebooks: string[];
+  fixes: CodeFix[];
+  corrections: NotebookCorrection[];
+  evidence: HopEvidence | null;
+}
+
+export interface LevelFixRequest {
+  catalog: string;
+  notebookRoot: string;
+  fromLayer: LayerRef;
+  toLayer: LayerRef;
+  warehouseId?: string;
+}
+
+// ---- Local SQL folder analysis (no Databricks connection required) ----
+
+export interface LocalSqlFileInput {
+  /** Path relative to the uploaded folder, e.g. `etl/silver/load_orders.sql`. */
+  path: string;
+  content: string;
+}
+
+export interface LocalSkippedFile {
+  path: string;
+  reason: string;
+}
+
+export interface LocalFileSummary {
+  path: string;
+  statementCount: number;
+  bytes: number;
+  writes: string[];
+  reads: string[];
+}
+
+export interface LocalTableRef {
+  qualified: string;
+  schema: string | null;
+  name: string;
+  written: boolean;
+  read: boolean;
+}
+
+export interface LocalProjectStats {
+  fileCount: number;
+  statementCount: number;
+  tableCount: number;
+  schemaCount: number;
+  lineageEdgeCount: number;
+}
+
+export interface LocalScanResult {
+  folderName: string;
+  files: LocalFileSummary[];
+  skipped: LocalSkippedFile[];
+  tables: LocalTableRef[];
+  /** Every schema qualifier seen in the SQL — turned into pipeline layers by `detectLayers`. */
+  schemas: string[];
+  lineage: LineageEdge[];
+  stats: LocalProjectStats;
+}
+
+export interface LocalScanRequest {
+  folderName?: string;
+  files: LocalSqlFileInput[];
+}
+
+/** Omit both layers to review every located statement as a single scope. */
+export interface LocalFixRequest {
+  fromLayer?: LayerRef;
+  toLayer?: LayerRef;
+}
+
+export interface LocalFixReport {
+  /** Null when the review covered the whole folder rather than one hop. */
+  fromLayer: LayerRef | null;
+  toLayer: LayerRef | null;
+  status: "ok" | "warning" | "error";
+  summary: string;
+  analyzedFiles: string[];
+  /** `notebookPath` is the file's relative path and `cellIndex` its statement ordinal in that file. */
+  fixes: CodeFix[];
+  corrections: NotebookCorrection[];
+  truncated: boolean;
 }

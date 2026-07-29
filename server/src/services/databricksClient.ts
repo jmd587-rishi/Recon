@@ -203,15 +203,26 @@ async function pollStatement(c: AxiosInstance, statementId: string): Promise<Sta
   throw new Error(`SQL statement ${statementId} did not complete within the timeout.`);
 }
 
-/** Runs an arbitrary `SELECT COUNT(*) ...` statement and returns the single scalar result. */
-export async function runCountStatement(config: ConnectionConfig, warehouseId: string, statement: string): Promise<number> {
+/**
+ * Runs an arbitrary `SELECT COUNT(*) ...` statement and returns the single scalar result.
+ * `context` sets the statement's default catalog/schema, so notebook SQL that leaves tables
+ * unqualified (`FROM customer`) still resolves.
+ */
+export async function runCountStatement(
+  config: ConnectionConfig,
+  warehouseId: string,
+  statement: string,
+  context?: { catalog?: string; schema?: string }
+): Promise<number> {
   const c = client(config);
 
   try {
     const res = await c.post("/api/2.0/sql/statements", {
       warehouse_id: warehouseId,
       statement,
-      wait_timeout: "30s"
+      wait_timeout: "30s",
+      ...(context?.catalog ? { catalog: context.catalog } : {}),
+      ...(context?.schema ? { schema: context.schema } : {})
     });
     let body = res.data as StatementResponse;
     if (body.status.state === "PENDING" || body.status.state === "RUNNING") {
