@@ -424,3 +424,85 @@ export interface LocalFixReport {
   corrections: NotebookCorrection[];
   truncated: boolean;
 }
+
+// ---- Reconciliation scripts generated from an uploaded SQL folder ----
+
+export type ReconCheckKind =
+  | "row_count"
+  | "measure_totals"
+  | "missing_keys"
+  | "orphan_keys"
+  | "duplicate_keys"
+  | "null_keys"
+  /** A check the model wrote for this specific transformation — grain, window, cast, date gap. */
+  | "custom";
+
+/** One runnable query inside a reconciliation script. */
+export interface ReconCheck {
+  kind: ReconCheckKind;
+  title: string;
+  description: string;
+  sql: string;
+}
+
+/** Whether the key the join checks use was declared by DDL, guessed from names, or not found. */
+export type ReconKeyConfidence = "declared" | "inferred" | "none";
+
+export interface ReconColumnSource {
+  table: string;
+  /** `ddl`, `select`, `insert`, `unknown` — with ` (partial)` when a `SELECT *` wasn't expandable. */
+  origin: string;
+  columnCount: number;
+}
+
+export interface ReconScript {
+  targetTable: string;
+  sourceTables: string[];
+  /** Filename inside the hop's folder, e.g. `03_fact_arr.sql`. */
+  filename: string;
+  /** The model's one-line read of what this hop does and what the checks prove; "" without one. */
+  summary: string;
+  keyColumns: string[];
+  keyConfidence: ReconKeyConfidence;
+  keyReason: string;
+  measureColumns: string[];
+  /** WHERE predicates the building statements apply — the expected, explainable row loss. */
+  knownFilters: string[];
+  builtBy: { path: string; statementIndex: number }[];
+  columnSources: ReconColumnSource[];
+  checks: ReconCheck[];
+  notes: string[];
+  /** The whole script, header comment included. This is what lands in the zip. */
+  sql: string;
+}
+
+export interface ReconHopScripts {
+  /** Both null when the folder had no inferable layers and everything was written as one scope. */
+  fromLayer: LayerRef | null;
+  toLayer: LayerRef | null;
+  folder: string;
+  scripts: ReconScript[];
+  controlTotals: { filename: string; sql: string };
+  notes: string[];
+}
+
+export interface LocalReconciliationSuite {
+  folderName: string;
+  /** `ai` when the model wrote the checks, `rules` when Azure OpenAI wasn't configured. */
+  generatedBy: "ai" | "rules";
+  /** Why the result isn't wholly what was asked for — null when it is. */
+  notice: string | null;
+  hops: ReconHopScripts[];
+  stats: {
+    hopCount: number;
+    scriptCount: number;
+    checkCount: number;
+    tablesWithColumns: number;
+    tablesWithoutColumns: number;
+  };
+}
+
+export interface LocalReconciliationRequest {
+  /** Ordered pipeline layers, most-raw first. Fewer than 2 writes every lineage pair as one scope. */
+  layers?: LayerRef[];
+}

@@ -89,7 +89,8 @@ const MERGE_INTO_RE = new RegExp(`merge\\s+into\\s+(${IDENT})`, "i");
 const FROM_JOIN_RE = new RegExp(`\\b(?:from|join|using)\\s+(${IDENT})`, "gi");
 const INTO_RE = new RegExp(`\\binto\\s+(${IDENT})`, "gi");
 
-function stripSqlComments(sql: string): string {
+/** Drops `--` line comments and `/* *\/` block comments. Shared with `sqlColumns.ts`. */
+export function stripSqlComments(sql: string): string {
   return sql.replace(/--.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
 }
 

@@ -7,6 +7,8 @@ import {
   rebuildCorrectedFiles,
   selectLocalCandidates
 } from "../services/localProject.js";
+import { buildAiReconciliationSuite } from "../services/aiReconciliation.js";
+import { buildReconciliationSuite } from "../services/reconciliationScripts.js";
 import { memoryStore } from "../store/memoryStore.js";
 import type { CodeFix, LayerRef, LocalFixReport, LocalSqlFileInput } from "../types/index.js";
 
@@ -82,6 +84,47 @@ localRouter.get("/scan", (_req, res) => {
 localRouter.delete("/", (_req, res) => {
   memoryStore.setLocalProject(null);
   res.json({ cleared: true });
+});
+
+/**
+ * Reconciliation scripts for the uploaded folder, written by the model from the folder's own
+ * lineage, column lists, filters and transformation SQL.
+ *
+ * Unlike `/governance` this doesn't 503 when Azure OpenAI is unconfigured: it falls back to Recon's
+ * standard schema-derived checks and says so in `generatedBy`/`notice`, because a folder analysed
+ * offline should still come away with the mechanical half rather than an error page. A configured
+ * endpoint that then *fails* is a different matter and still 502s.
+ */
+localRouter.post("/reconciliation", async (req, res) => {
+  const project = memoryStore.getLocalProject();
+  if (!project) {
+    res.status(409).json({ error: "No SQL folder has been uploaded yet. Upload a folder before generating scripts." });
+    return;
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const layers = body.layers ?? [];
+  if (!Array.isArray(layers) || !layers.every(isLayerRef)) {
+    res.status(400).json({ error: "Expected body: { layers: [{ label, schema }, ...] } — ordered most-raw first." });
+    return;
+  }
+
+  try {
+    res.json(await buildAiReconciliationSuite(project, layers));
+  } catch (err) {
+    if (err instanceof LlmConfigError) {
+      res.json(
+        buildReconciliationSuite(
+          project,
+          layers,
+          "Azure OpenAI isn't configured, so these are Recon's standard schema-derived checks rather than " +
+            "scripts written for this pipeline. Set AZURE_OPENAI_* in server/.env and regenerate."
+        )
+      );
+      return;
+    }
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 localRouter.post("/governance", async (req, res) => {

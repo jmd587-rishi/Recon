@@ -9,7 +9,8 @@ import type {
   LogicValidationResult,
   ProjectLayerSummary,
   ProjectNarrative,
-  ProjectStats
+  ProjectStats,
+  ReconCheckKind
 } from "../types/index.js";
 
 export class LlmConfigError extends Error {}
@@ -712,4 +713,161 @@ export async function suggestLevelCodeFixes(
 ): Promise<CodeFixLlmResult> {
   const content = await callAzureOpenAi(buildCodeFixMessages(hop, candidates));
   return parseCodeFixResponse(content, candidates.length);
+}
+
+// ---- Reconciliation scripts for an uploaded SQL folder ----
+
+/** One target table's grounding, rendered for the prompt by `aiReconciliation.ts`. */
+export interface ReconTargetPrompt {
+  targetTable: string;
+  sourceTables: string[];
+  /** `name type` per column, per table — the only names the model is allowed to use. */
+  columns: { table: string; columns: string; note: string }[];
+  /** Key columns the static analysis found, and how sure it is. */
+  keyHint: string;
+  /** Per-source join columns, when the two sides share any. */
+  joinHints: { source: string; columns: string[] }[];
+  measureHint: string;
+  filterHint: string[];
+  /** The transformation SQL itself, trimmed — what lets the model see the actual grain and joins. */
+  transformationSql: { path: string; statementIndex: number; sql: string }[];
+}
+
+export interface ReconLlmCheck {
+  kind: ReconCheckKind;
+  title: string;
+  description: string;
+  sql: string;
+}
+
+export interface ReconLlmScript {
+  targetTable: string;
+  summary: string;
+  checks: ReconLlmCheck[];
+  notes: string[];
+}
+
+const RECON_KINDS: readonly ReconCheckKind[] = [
+  "row_count",
+  "measure_totals",
+  "missing_keys",
+  "orphan_keys",
+  "duplicate_keys",
+  "null_keys",
+  "custom"
+];
+
+export function buildReconciliationMessages(hopLabel: string, targets: ReconTargetPrompt[]): ChatMessage[] {
+  const block = targets
+    .map((t) => {
+      const lines = [
+        `### ${t.targetTable}`,
+        `sources (in the order the statement reads them): ${t.sourceTables.join(", ") || "(none)"}`,
+        ...t.columns.map((c) => `columns of ${c.table}${c.note ? ` [${c.note}]` : ""}: ${c.columns}`),
+        `key columns found: ${t.keyHint}`,
+        ...t.joinHints.map((j) => `shares with ${j.source}: ${j.columns.join(", ")}`),
+        `measure columns found: ${t.measureHint}`,
+        ...t.filterHint.map((f) => `filter the transformation applies: ${f}`)
+      ];
+      for (const stmt of t.transformationSql) {
+        lines.push(`transformation SQL — ${stmt.path} (statement ${stmt.statementIndex}):`, "```sql", stmt.sql, "```");
+      }
+      return lines.join("\n");
+    })
+    .join("\n\n");
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior data engineer writing the reconciliation SQL that proves one hop of a data " +
+        "pipeline moved the rows it should have. For each target table you are given its sources, the " +
+        "exact column list of every table involved, the key and measure columns a static analysis found, " +
+        "the filters the transformation applies, and the transformation SQL itself. " +
+        "Write the checks an experienced engineer would actually run against this specific pipeline: the " +
+        "standard ones — row counts against each source, totals for the money/quantity columns that " +
+        "should tie out, source keys missing from the target, target keys with no source row, duplicate " +
+        "keys, null keys — AND the checks this particular transformation calls for, which you can only " +
+        "know by reading its SQL: aggregation grain changes, dedup that can drop rows, join fan-out, " +
+        "window functions that need a partition to be complete, null-coalescing that moves a total, date " +
+        "windows or incremental filters that leave a gap, hardcoded values, and type casts that can null " +
+        "a value out. " +
+        "HARD RULES, they matter more than completeness: " +
+        "(1) Use ONLY the table and column names given to you above. Never invent, guess, pluralise or " +
+        "abbreviate a column name. If a check would need a column that is not listed, do not write that " +
+        "check — say so in `notes` instead. " +
+        "(2) Portable SQL only: no TOP, no LIMIT, no temp tables, no vendor-specific functions, nothing " +
+        "that runs on only one engine. It must run unchanged on SQL Server and on Databricks SQL. " +
+        "(3) Every check is ONE self-contained statement ending in a semicolon. " +
+        "(4) A check must return NO rows when the data is correct, except count/total comparisons, which " +
+        "return one row per pair being compared. " +
+        "(5) `description` states in one or two sentences what a non-empty result means for this " +
+        "pipeline — not what the SQL syntactically does. " +
+        'Respond with ONLY compact JSON: {"scripts": [{"targetTable": "<exact name from the input>", ' +
+        '"summary": "<1-2 sentences: what this hop does to the data and what these checks prove>", ' +
+        '"checks": [{"kind": "row_count|measure_totals|missing_keys|orphan_keys|duplicate_keys|null_keys|custom", ' +
+        '"title": "<short label>", "description": "<what a non-empty result means>", "sql": "<the statement>"}], ' +
+        '"notes": ["<a check you could not write, and why>"]}]}, one entry per target table. ' +
+        "No markdown, no text outside the JSON object."
+    },
+    {
+      role: "user",
+      content: `Pipeline hop: ${hopLabel}\n\nTarget tables to reconcile:\n\n${block}`
+    }
+  ];
+}
+
+export function parseReconciliationResponse(raw: string): ReconLlmScript[] {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  try {
+    const parsed = JSON.parse(cleaned) as { scripts?: unknown };
+    const scripts = Array.isArray(parsed.scripts) ? parsed.scripts : [];
+
+    return scripts.flatMap((entry): ReconLlmScript[] => {
+      if (typeof entry !== "object" || entry === null) return [];
+      const rec = entry as Record<string, unknown>;
+      if (typeof rec.targetTable !== "string" || !rec.targetTable.trim()) return [];
+
+      const checks: ReconLlmCheck[] = Array.isArray(rec.checks)
+        ? rec.checks.flatMap((c): ReconLlmCheck[] => {
+            if (typeof c !== "object" || c === null) return [];
+            const check = c as Record<string, unknown>;
+            // A check with no SQL is not a check — there is nothing to run and nothing to fix.
+            if (typeof check.sql !== "string" || !check.sql.trim()) return [];
+            return [
+              {
+                kind: RECON_KINDS.includes(check.kind as ReconCheckKind) ? (check.kind as ReconCheckKind) : "custom",
+                title: typeof check.title === "string" && check.title.trim() ? check.title.trim() : "Check",
+                description: typeof check.description === "string" ? check.description : "",
+                sql: check.sql.trim()
+              }
+            ];
+          })
+        : [];
+
+      return [
+        {
+          targetTable: rec.targetTable.trim().toLowerCase(),
+          summary: typeof rec.summary === "string" ? rec.summary : "",
+          checks,
+          notes: Array.isArray(rec.notes) ? rec.notes.filter((n): n is string => typeof n === "string") : []
+        }
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function writeReconciliationScripts(
+  hopLabel: string,
+  targets: ReconTargetPrompt[]
+): Promise<ReconLlmScript[]> {
+  if (targets.length === 0) return [];
+  const content = await callAzureOpenAi(buildReconciliationMessages(hopLabel, targets));
+  return parseReconciliationResponse(content);
 }

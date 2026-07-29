@@ -503,3 +503,92 @@ export interface LocalFixReport {
   /** True when the statement budget capped how much of the folder was reviewed. */
   truncated: boolean;
 }
+
+// ---- Reconciliation scripts generated from an uploaded SQL folder ----
+
+export type ReconCheckKind =
+  | "row_count"
+  | "measure_totals"
+  | "missing_keys"
+  | "orphan_keys"
+  | "duplicate_keys"
+  | "null_keys"
+  /** A check the model wrote for this specific transformation — grain, window, cast, date gap. */
+  | "custom";
+
+/** One runnable query inside a reconciliation script. */
+export interface ReconCheck {
+  kind: ReconCheckKind;
+  title: string;
+  /** What running it tells you — written into the script as the comment above the query. */
+  description: string;
+  sql: string;
+}
+
+/** Whether the key the join checks use was declared by DDL, guessed from names, or not found. */
+export type ReconKeyConfidence = "declared" | "inferred" | "none";
+
+/** Where a table's column list came from, so the UI can say how solid the script's ground is. */
+export interface ReconColumnSource {
+  table: string;
+  /** `ddl`, `select`, `insert`, `unknown` — with ` (partial)` when a `SELECT *` wasn't expandable. */
+  origin: string;
+  columnCount: number;
+}
+
+/** The reconciliation script for one target table and the sources feeding it across a hop. */
+export interface ReconScript {
+  targetTable: string;
+  sourceTables: string[];
+  /** Filename inside the hop's folder, e.g. `03_fact_arr.sql`. */
+  filename: string;
+  /** The model's one-line read of what this hop does and what the checks prove; "" without one. */
+  summary: string;
+  keyColumns: string[];
+  keyConfidence: ReconKeyConfidence;
+  /** How those key columns were chosen, quoted in the script header. */
+  keyReason: string;
+  measureColumns: string[];
+  /** WHERE predicates the building statements apply — the expected, explainable row loss. */
+  knownFilters: string[];
+  builtBy: { path: string; statementIndex: number }[];
+  columnSources: ReconColumnSource[];
+  checks: ReconCheck[];
+  /** Checks that were skipped, and why — the script says the same thing in its header. */
+  notes: string[];
+  /** The whole script, header comment included. This is what lands in the zip. */
+  sql: string;
+}
+
+export interface ReconHopScripts {
+  /** Both null when the folder had no inferable layers and everything was written as one scope. */
+  fromLayer: LayerRef | null;
+  toLayer: LayerRef | null;
+  /** Folder this hop occupies in the zip, e.g. `raw_to_stage`. */
+  folder: string;
+  scripts: ReconScript[];
+  /** Every pair in the hop counted in one query — the sheet an engineer eyeballs first. */
+  controlTotals: { filename: string; sql: string };
+  notes: string[];
+}
+
+export interface LocalReconciliationSuite {
+  folderName: string;
+  /** `ai` when the model wrote the checks, `rules` when Azure OpenAI wasn't configured. */
+  generatedBy: "ai" | "rules";
+  /** Why the result isn't wholly what was asked for — null when it is. */
+  notice: string | null;
+  hops: ReconHopScripts[];
+  stats: {
+    hopCount: number;
+    scriptCount: number;
+    checkCount: number;
+    tablesWithColumns: number;
+    tablesWithoutColumns: number;
+  };
+}
+
+export interface LocalReconciliationRequest {
+  /** Ordered pipeline layers, most-raw first. Fewer than 2 writes every lineage pair as one scope. */
+  layers?: LayerRef[];
+}

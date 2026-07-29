@@ -7,6 +7,8 @@ import type {
   LevelFixRequest,
   LocalFixReport,
   LocalFixRequest,
+  LocalReconciliationRequest,
+  LocalReconciliationSuite,
   LocalScanRequest,
   LocalScanResult,
   PipelineAnalysis,
@@ -102,4 +104,9 @@ export function scanLocalFolder(payload: LocalScanRequest) {
 
 export function getLocalGovernance(payload: LocalFixRequest) {
   return unwrap<LocalFixReport>(api.post("/local/governance", payload));
+}
+
+/** Reconciliation SQL for the uploaded folder — one script per target table, grouped by hop. */
+export function getLocalReconciliation(payload: LocalReconciliationRequest) {
+  return unwrap<LocalReconciliationSuite>(api.post("/local/reconciliation", payload));
 }
