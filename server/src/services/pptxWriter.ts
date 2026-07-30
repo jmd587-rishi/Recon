@@ -157,16 +157,18 @@ function edgeId(from: string, to: string): string {
 }
 
 /**
- * Which vertical line each arrow's middle segment runs along.
+ * Where each arrow turns — the `adj1` of its connector, as a fraction of its own span.
  *
- * `bentConnector3` bends at the midpoint of its span unless its adjust list says otherwise, and an empty
- * `<a:avLst/>` means every arrow crossing the same gutter puts its vertical segment on *exactly* the same
- * X. On a four-layer pipeline that was six arrows drawn as one line, twice over — the flow could not be
- * traced, which is the whole job of the picture.
+ * A connector inflects at the midpoint of its span unless its adjust list says otherwise, and an empty
+ * `<a:avLst/>` means every arrow crossing the same gutter turns at *exactly* the same X. With the
+ * orthogonal preset that drew six arrows as one line on a four-layer pipeline, twice over. Curves are far
+ * more forgiving — two curves with different endpoints cross rather than coincide — but lanes still earn
+ * their keep: they stop the curves into one column from stacking into a single thick sweep, and they cost
+ * nothing, since `curvedConnector3` reads the same `adj1`.
  *
- * So each arrow gets its own lane in the gutter it crosses. Lanes are ordered by target row and then
- * source row, which means the arrows feeding one table take adjacent lanes and read as a bundle
- * converging on it, rather than as unrelated lines that happen to end up nearby.
+ * Each arrow gets its own lane in the gutter it crosses. Lanes are ordered by target row and then source
+ * row, which means the arrows feeding one table take adjacent lanes and read as a bundle converging on
+ * it, rather than as unrelated lines that happen to end up nearby.
  *
  * The gutter chosen is the one immediately before the target's column: the single strip of empty space
  * every arrow into that column must cross, whether it comes from the column next door or from three
@@ -205,10 +207,16 @@ export function bendLanes(component: DiagramComponent): Map<string, number> {
 /**
  * One edge as a connector bound to both shapes.
  *
- * `idx="3"` is the right-hand connection site of `roundRect` and `idx="1"` the left-hand one, so a
- * forward edge leaves the source's right edge and arrives at the target's left. A backward edge — a
- * table rebuilt from something later in the pipeline — gets `curvedConnector3`, which bows clear of the
- * boxes between them the way `dagLayout`'s bezier does, rather than cutting straight back through them.
+ * `curvedConnector3` for every edge, not `bentConnector3`. The review page draws each edge as a cubic
+ * bezier with horizontal tangents at both ends (`dagLayout.edgeCurve`), and this is the preset that
+ * matches that shape: a smooth S leaving the source's right edge and arriving at the target's left.
+ * Orthogonal connectors were perfectly legible once they had lanes, but the deck is supposed to be the
+ * diagram that was approved, and right-angled arrows are a different picture. It also happens to be the
+ * right choice for a backward edge — a table rebuilt from something later in the pipeline — which bows
+ * clear of the boxes between rather than cutting back through them.
+ *
+ * `idx="3"` is the right-hand connection site of `roundRect` and `idx="1"` the left-hand one, which is
+ * what gives the curve its horizontal tangents and keeps every arrow flowing left to right.
  *
  * The line takes its **source table's schema colour** rather than the page's uniform grey. The page can
  * afford grey because clicking a table dims everything off its path; a slide has no focus mode, so the
@@ -241,11 +249,11 @@ function connector(
     cy: Math.abs(end.y - start.y)
   };
 
-  const geometry = c.backward
-    ? `<a:prstGeom prst="curvedConnector3"><a:avLst/></a:prstGeom>`
-    : `<a:prstGeom prst="bentConnector3"><a:avLst>${
-        adj === undefined ? "" : `<a:gd name="adj1" fmla="val ${adj}"/>`
-      }</a:avLst></a:prstGeom>`;
+  // A backward edge takes no lane (it crosses no gutter), so its adjust list is left at the default.
+  const geometry =
+    `<a:prstGeom prst="curvedConnector3"><a:avLst>${
+      adj === undefined ? "" : `<a:gd name="adj1" fmla="val ${adj}"/>`
+    }</a:avLst></a:prstGeom>`;
 
   return (
     `<p:cxnSp><p:nvCxnSpPr><p:cNvPr id="${id}" name="${clean(`${from.qualified} to ${to.qualified}`)}"/>` +
