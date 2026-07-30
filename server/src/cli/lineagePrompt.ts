@@ -3,7 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
+import { buildDiagramComponents } from "../services/diagramComponents.js";
 import { buildLineageDiagram } from "../services/lineageDiagram.js";
+import { buildPptx } from "../services/pptxWriter.js";
 import { LlmConfigError, LlmTimeoutError, reviewLineage } from "../services/llmClient.js";
 import { applyLineageOverrides, diffEdges, validateOverrides } from "../services/lineageOverrides.js";
 import type { LocalProject } from "../services/localProject.js";
@@ -147,24 +149,56 @@ function openInBrowser(target: string): void {
   }
 }
 
+/** Sits beside `lineage.html`, so the editable copy is one click from the picture being reviewed. */
+const DECK_FILENAME = "lineage.pptx";
+
+/**
+ * Writes the review page and, next to it, the same diagram as an editable deck.
+ *
+ * The deck is written here rather than only by `reconcile diagrams` because this is the moment someone
+ * is looking at the graph and deciding what to do with it — being told to run another command to take it
+ * away is a worse answer than the file already being there. Both are rewritten together after every
+ * correction round, so the deck can never show a lineage the page has moved on from.
+ *
+ * A deck that fails to build must not take the review down with it: the page is what the user is about
+ * to be asked to approve, and the export is a convenience. So the failure costs the link and nothing
+ * else.
+ */
 async function writeDiagram(
   options: VerifyOptions,
   project: LocalProject,
   layers: LayerRef[],
   review: LineageReview
 ): Promise<string> {
-  const diagram = buildLineageDiagram({
+  const graph = {
     projectName: project.folderName,
     edges: project.scan.lineage,
     layers,
-    tables: project.scan.tables,
-    narrative: review.narrative,
-    concerns: review.concerns,
-    notes: review.notes
-  });
+    tables: project.scan.tables
+  };
 
   const outDir = path.join(options.dir, options.lineageOut);
   await mkdir(outDir, { recursive: true });
+
+  let deckFile: string | undefined;
+  try {
+    const deck = buildPptx(buildDiagramComponents(graph), {
+      title: `${project.folderName} — lineage`
+    });
+    await writeFile(path.join(outDir, DECK_FILENAME), deck);
+    deckFile = DECK_FILENAME;
+  } catch (err) {
+    console.log(`  (couldn't write ${DECK_FILENAME}: ${err instanceof Error ? err.message : String(err)})`);
+  }
+
+  const diagram = buildLineageDiagram({
+    ...graph,
+    narrative: review.narrative,
+    concerns: review.concerns,
+    notes: review.notes,
+    deckFile
+  });
+
   const htmlPath = path.join(outDir, "lineage.html");
   await writeFile(htmlPath, diagram.html, "utf8");
   return htmlPath;

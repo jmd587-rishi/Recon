@@ -10,6 +10,7 @@ import { LlmConfigError } from "../services/llmClient.js";
 import type { LocalProject } from "../services/localProject.js";
 import { buildReconciliationSuite } from "../services/reconciliationScripts.js";
 import { buildLocalProject, collectSourceFiles } from "./collectSourceFiles.js";
+import { describeDiagrams, writeDiagramArtifacts } from "./diagramArtifacts.js";
 import {
   applyApprovedLineage,
   findTemplate,
@@ -55,6 +56,13 @@ import type { LayerRef, LineageArtifacts, LocalReconciliationSuite } from "../ty
  * lineage, the generated scripts) so the document describes the run rather than a fresh guess at it.
  * `run` offers it as its last question, since by then everything it would read is in memory already —
  * the template comes bundled with this package, so there is nothing to supply for that to work.
+ *
+ * `reconcile diagrams` writes the lineage as things you can paste: a .pptx whose every table is a real
+ * PowerPoint shape with editable text and whose every arrow is a connector bound to the shapes it joins,
+ * plus one Office-importable .svg per component. The split is by hop, with the same names the governance
+ * folder uses, so `bronze_to_silver.svg` and `bronze_to_silver.sql` are the same hop. It needs no LLM and
+ * no `.env` at all — the shapes are derived from the graph — so it is the one command that cannot
+ * degrade. `document` writes them too, since a write-up without its diagrams is half delivered.
  */
 
 const USAGE = `
@@ -64,6 +72,7 @@ Commands:
   run         Layers, lineage, scripts and — if you say yes — the document, in one pass
   scripts     Write one reconciliation query per hop into a governance/ folder
   document    Write the whole pipeline up as a Word document and a Markdown file
+  diagrams    Write the lineage as editable PowerPoint shapes and Office-ready SVGs
   layers      Detect and print the pipeline layers only — writes nothing
 
 Options:
@@ -71,6 +80,8 @@ Options:
   --out <name>         Output folder name, created under --dir (default: governance)
   --lineage-out <name> Folder for the lineage diagram and data (default: lineage)
   --doc-out <name>    document: folder for the document (default: documentation)
+  --diagrams-out <name> Folder for the deck and the SVGs (default: diagrams)
+  --no-diagrams       document: skip the diagrams that normally accompany it
   --template <path>   Word template to render into (default: the one bundled with Recon)
   --layers a,b,c      Schema names, most-raw first, overriding auto-detection
   --env-file <path>   .env file with AZURE_OPENAI_* settings (default: <dir>/.env, then ./.env)
@@ -91,17 +102,19 @@ Examples:
   reconcile layers
   reconcile scripts
   reconcile document
+  reconcile diagrams
   reconcile run --layers raw,staged,mart --out recon
   reconcile run --auto-approve --document
   reconcile scripts --split
 `.trim();
 
 interface Args {
-  command: "run" | "scripts" | "document" | "layers" | "help";
+  command: "run" | "scripts" | "document" | "diagrams" | "layers" | "help";
   dir: string;
   out: string;
   lineageOut: string;
   docOut: string;
+  diagramsOut: string;
   template: string | null;
   layers: string[] | null;
   envFile: string | null;
@@ -110,6 +123,8 @@ interface Args {
   autoApprove: boolean;
   /** run: true/false force it either way, null asks once the scripts are written. */
   document: boolean | null;
+  /** document: whether the diagrams accompany it. `diagrams` writes them regardless. */
+  diagrams: boolean;
   noOpen: boolean;
   split: boolean;
   oneFile: boolean;
@@ -123,6 +138,7 @@ function parseArgs(argv: string[]): Args {
     out: "governance",
     lineageOut: "lineage",
     docOut: "documentation",
+    diagramsOut: "diagrams",
     template: null,
     layers: null,
     envFile: null,
@@ -130,6 +146,7 @@ function parseArgs(argv: string[]): Args {
     includeNotebooks: true,
     autoApprove: false,
     document: null,
+    diagrams: true,
     noOpen: false,
     split: false,
     oneFile: false,
@@ -138,7 +155,13 @@ function parseArgs(argv: string[]): Args {
 
   const rest = [...argv];
   const first = rest[0];
-  if (first === "run" || first === "scripts" || first === "document" || first === "layers") {
+  if (
+    first === "run" ||
+    first === "scripts" ||
+    first === "document" ||
+    first === "diagrams" ||
+    first === "layers"
+  ) {
     args.command = first;
     rest.shift();
   } else if (first === "-h" || first === "--help" || first === undefined) {
@@ -164,6 +187,12 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--doc-out":
         args.docOut = next();
+        break;
+      case "--diagrams-out":
+        args.diagramsOut = next();
+        break;
+      case "--no-diagrams":
+        args.diagrams = false;
         break;
       case "--template":
         args.template = next();
@@ -233,7 +262,7 @@ function loadEnv(dir: string, explicit: string | null): void {
 async function scanProject(args: Args): Promise<LocalProject> {
   const scan = await collectSourceFiles(args.dir, {
     maxFiles: args.maxFiles,
-    excludeDirs: [args.out, args.lineageOut, args.docOut],
+    excludeDirs: [args.out, args.lineageOut, args.docOut, args.diagramsOut],
     includeNotebooks: args.includeNotebooks
   });
 
@@ -388,7 +417,10 @@ async function writeSuite(
   console.log(`Wrote ${outRoot}`);
   for (const line of written) console.log(`  ${line}`);
   if (suite.notice) console.log(`\nNote: ${suite.notice}`);
-  if (suggestDocument) console.log("\nWrite this up as a document with: reconcile document");
+  if (suggestDocument) {
+    console.log("\nWrite this up as a document with: reconcile document");
+    console.log("Export the lineage as editable PowerPoint shapes with: reconcile diagrams");
+  }
 }
 
 /** The governance half, shared by `scripts` and the tail of `run`. */
@@ -474,6 +506,7 @@ async function runFull(args: Args): Promise<void> {
 
     console.log(`\nLineage approved. Wrote ${lineageDir}`);
     console.log("  lineage.html  (the diagram you just reviewed)");
+    console.log("  lineage.pptx  (the same diagram as editable PowerPoint shapes — copy them into Word)");
     console.log("  lineage.json  (the approved graph)");
     if (result.artifacts.feedback.length > 0) {
       console.log(`  lineage-feedback.json  (${result.artifacts.feedback.length} round(s) of corrections)`);
@@ -504,12 +537,16 @@ async function wantsDocument(args: Args, session: PromptSession | null): Promise
 
   if (!session) {
     console.log("\nWrite this up as a document with: reconcile document  (or --document to include it here)");
+    console.log("Or just the diagram you approved, as editable PowerPoint shapes: reconcile diagrams");
     return false;
   }
 
   const answer = await askChoice(session.ask, "\nWrite this up as a document as well? [yes] / no: ");
   if (answer === "yes") return true;
   console.log("Skipped. Run `reconcile document` later if you change your mind — it reads what was just written.");
+  // Worth saying here rather than only in `diagrams --help`: the user has just spent the last few
+  // minutes looking at the diagram, so this is the moment they want to know they can take it with them.
+  console.log("To take the diagram itself into Word or PowerPoint as editable shapes: reconcile diagrams");
   return false;
 }
 
@@ -575,6 +612,85 @@ async function writeDocument(args: Args, inputs: DocumentInputs): Promise<void> 
     console.log("");
     console.log(`Note: ${notice}`);
   }
+
+  if (args.diagrams) {
+    console.log("");
+    await writeDiagrams(args, inputs.project, inputs.layers);
+  }
+}
+
+/**
+ * The deck and the SVGs, shared by `diagrams` and the tail of `document`.
+ *
+ * Takes the project rather than a folder for the same reason `writeDocument` does — `run` and
+ * `document` already hold the corrected one, and re-deriving it would risk drawing a lineage the user
+ * has already rejected.
+ */
+async function writeDiagrams(args: Args, project: LocalProject, layers: LayerRef[]): Promise<void> {
+  const written = await writeDiagramArtifacts(
+    args.dir,
+    args.diagramsOut,
+    {
+      projectName: project.folderName,
+      edges: project.scan.lineage,
+      layers,
+      tables: project.scan.tables
+    },
+    new Date()
+  );
+
+  console.log(`Wrote ${written.dir}`);
+  for (const file of written.files) console.log(`  ${file}`);
+  console.log("");
+  console.log(`${written.components.length} diagram(s) — the overview, then one per hop:`);
+  for (const line of describeDiagrams(written)) console.log(`  ${line}`);
+  console.log("");
+  console.log("Open the .pptx, select a slide's shapes and paste them into Word or your own deck — the");
+  console.log("boxes stay draggable and the text stays editable. README.txt covers the .svg route.");
+
+  if (written.emptyCount > 0) {
+    console.log("");
+    console.log(
+      `Note: ${written.emptyCount} hop(s) had no lineage to draw and were written as a slide saying so, ` +
+        "rather than left out. Check that --layers matches the schema names the SQL uses."
+    );
+  }
+}
+
+async function runDiagrams(args: Args): Promise<void> {
+  // No `loadEnv` and no `--no-ai` handling: the shapes are derived from the graph, so this command has
+  // no LLM step to configure or to fall back from.
+  const scanned = await scanProject(args);
+
+  const lineage = await readLineageArtifacts(args.dir, args.lineageOut);
+  const corrected = applyApprovedLineage(scanned, lineage);
+  const project = corrected.project;
+
+  if (lineage) {
+    console.log(
+      `Found ${args.lineageOut}/lineage.json — ${lineage.approved ? "approved" : "not approved"} lineage from ${
+        lineage.generatedAt.slice(0, 10) || "an earlier run"
+      }.`
+    );
+    if (corrected.applied > 0) console.log(`  Replayed ${corrected.applied} recorded correction(s) onto this scan.`);
+    if (corrected.stale > 0) {
+      console.log(`  ${corrected.stale} recorded correction(s) no longer match the SQL and were left out.`);
+    }
+  } else {
+    console.log(`No ${args.lineageOut}/lineage.json here, so the diagrams draw the lineage as extracted.`);
+  }
+
+  // Same precedence as `document`: an approved layer order beats re-detection, an explicit --layers
+  // beats both. The hop split has to match the one the scripts were built for or the file names lie.
+  const layers = args.layers
+    ? resolveLayers(project.scan.schemas, args.layers)
+    : lineage?.layers.length
+      ? lineage.layers
+      : resolveLayers(project.scan.schemas, null);
+  printLayers(project.scan.schemas, layers);
+
+  console.log("");
+  await writeDiagrams(args, project, layers);
 }
 
 async function runDocument(args: Args): Promise<void> {
@@ -635,6 +751,7 @@ async function main(): Promise<void> {
     if (args.command === "run") await runFull(args);
     else if (args.command === "scripts") await runScripts(args);
     else if (args.command === "document") await runDocument(args);
+    else if (args.command === "diagrams") await runDiagrams(args);
     else await runLayers(args);
   } catch (err) {
     console.error(`\nError: ${err instanceof Error ? err.message : String(err)}`);
