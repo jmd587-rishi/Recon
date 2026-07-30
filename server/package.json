@@ -7,7 +7,8 @@
     "reconcile": "dist/cli/reconcile.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "templates"
   ],
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -22,6 +23,7 @@
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
+    "fflate": "^0.8.3",
     "node-sql-parser": "^4.18.0"
   },
   "devDependencies": {

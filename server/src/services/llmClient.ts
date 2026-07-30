@@ -3,6 +3,7 @@ import type {
   CellEvidence,
   CodeCandidate,
   CodeFixSeverity,
+  HopBusinessContext,
   LayerRef,
   LevelFinding,
   LevelReport,
@@ -12,6 +13,7 @@ import type {
   LineageReview,
   LocalTableRef,
   LogicValidationResult,
+  ProjectDocumentationProse,
   ProjectLayerSummary,
   ProjectNarrative,
   ProjectStats,
@@ -1131,4 +1133,264 @@ export async function reviewLineage(input: LineageReviewInput, options: LlmCallO
   });
   const review = parseLineageReviewResponse(content);
   return correcting ? review : { ...review, proposed: [] };
+}
+
+// ---- Documentation: the prose half of `reconcile document` ----
+//
+// Two calls, split the way the document is: one for the whole project (introduction, layering,
+// lineage) and one per hop (what that transformation means in business terms). The split is what keeps
+// each prompt grounded in something it can actually see — the project call gets the shape of the
+// pipeline, the hop calls get the SQL — and it means a hop whose call fails costs that hop's context
+// rather than the whole document.
+
+/** Same grounding discipline as every other prompt here, in the words this pair of calls needs. */
+const DOC_GROUNDING =
+  "Ground every sentence in the data you are given and nothing else. Never name a table, column, " +
+  "file or metric that does not appear in the input, and never state a row count, a schedule, an " +
+  "owner or a tool that was not given to you. Where the code does not reveal a business purpose, say " +
+  "what the transformation does mechanically rather than inventing a purpose for it. Use the " +
+  "project's own layer names; do not relabel them as bronze/silver/gold unless those are the names " +
+  "you were given. Write plainly, for an engineer or analyst who has never seen this project. Plain " +
+  "prose only — no markdown, no bullet characters, no headings inside the strings.";
+
+/** Trims and drops the blanks from a JSON string array, keeping at most `max` entries. */
+function textList(value: unknown, max: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .slice(0, max);
+}
+
+export interface DocumentationLlmInput {
+  projectName: string;
+  /** Ordered most-raw first, each with the tables that live in it. */
+  layers: {
+    label: string;
+    schema: string;
+    role?: string;
+    tables: { name: string; kind: string; written: boolean }[];
+  }[];
+  stats: {
+    fileCount: number;
+    statementCount: number;
+    tableCount: number;
+    schemaCount: number;
+    edgeCount: number;
+    layerCount: number;
+  };
+  edges: { from: string; to: string }[];
+  /** Schemas the SQL uses that aren't part of the pipeline — a documented gap, not an omission. */
+  unassignedSchemas?: string[];
+  /** The narrative and concerns the user already approved in `reconcile run`, when there are any. */
+  priorNarrative?: string;
+  priorConcerns?: string[];
+}
+
+export function buildDocumentationMessages(input: DocumentationLlmInput): ChatMessage[] {
+  const layerBlock = input.layers.length
+    ? input.layers
+        .map((layer, i) => {
+          const tables = layer.tables.length
+            ? layer.tables
+                .map((t) => `      - ${t.name} [${t.kind}${t.written ? ", built here" : ", read only"}]`)
+                .join("\n")
+            : "      (no tables)";
+          return `  ${i + 1}. "${layer.label}" (schema ${layer.schema}${layer.role ? `, looks like a ${layer.role} layer` : ""}), ${layer.tables.length} table(s):\n${tables}`;
+        })
+        .join("\n")
+    : "  (no layers were detected — the project's SQL never qualifies its tables with a schema)";
+
+  const edgeBlock = input.edges.length
+    ? input.edges.map((e) => `  ${e.from} -> ${e.to}`).join("\n")
+    : "  (no lineage edges were extracted)";
+
+  const priorBlock = input.priorNarrative?.trim()
+    ? `\n\nThe engineer reviewed and approved this lineage, and it was described then as:\n"""\n${input.priorNarrative.trim()}\n"""`
+    : "";
+  const concernBlock = input.priorConcerns?.length
+    ? `\n\nOpen concerns already raised about the lineage:\n${input.priorConcerns.map((c) => `  - ${c}`).join("\n")}`
+    : "";
+  const unassignedBlock = input.unassignedSchemas?.length
+    ? `\n\nSchemas the SQL uses that are not part of the pipeline: ${input.unassignedSchemas.join(", ")}`
+    : "";
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior data engineer writing the reference documentation for a data pipeline, from " +
+        "an automated scan of the project's SQL. You are given the pipeline's layers with their tables, " +
+        "the table-to-table lineage extracted from the transformation code, and headline counts. " +
+        `${DOC_GROUNDING} ` +
+        'Respond with ONLY compact JSON: {"introduction": ["<paragraph>", ...], ' +
+        '"architecture": ["<paragraph>", ...], ' +
+        '"layers": [{"layer": "<the layer label, exactly as given>", "purpose": "<1-2 sentences on what this layer is for>", "contents": "<1-2 sentences on what actually sits in it, citing real tables>"}, ...], ' +
+        '"lineage": ["<paragraph>", ...], "risks": ["<something a reader should be sceptical about>", ...]}. ' +
+        "Two or three paragraphs each for introduction, architecture and lineage; one entry in `layers` " +
+        "for every layer you were given, in the same order. No text outside the JSON object."
+    },
+    {
+      role: "user",
+      content:
+        `Project: ${input.projectName}\n\n` +
+        `Scanned: ${input.stats.fileCount} file(s), ${input.stats.statementCount} SQL statement(s), ` +
+        `${input.stats.tableCount} table(s) across ${input.stats.schemaCount} schema(s), ` +
+        `${input.stats.edgeCount} lineage edge(s), ${input.stats.layerCount} pipeline layer(s).\n\n` +
+        `Pipeline layers, most-raw first:\n${layerBlock}\n\n` +
+        `Table lineage (source -> target):\n${edgeBlock}` +
+        unassignedBlock +
+        priorBlock +
+        concernBlock
+    }
+  ];
+}
+
+export function parseDocumentationResponse(raw: string): ProjectDocumentationProse {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  try {
+    const parsed = JSON.parse(cleaned) as Record<string, unknown>;
+    return {
+      introduction: textList(parsed.introduction, 6),
+      architecture: textList(parsed.architecture, 6),
+      layers: Array.isArray(parsed.layers)
+        ? parsed.layers.flatMap((item) => {
+            if (!item || typeof item !== "object") return [];
+            const rec = item as Record<string, unknown>;
+            const layer = typeof rec.layer === "string" ? rec.layer.trim() : "";
+            if (!layer) return [];
+            return [
+              {
+                layer,
+                purpose: typeof rec.purpose === "string" ? rec.purpose.trim() : "",
+                contents: typeof rec.contents === "string" ? rec.contents.trim() : ""
+              }
+            ];
+          })
+        : [],
+      lineage: textList(parsed.lineage, 6),
+      risks: textList(parsed.risks, 12)
+    };
+  } catch {
+    // An unparsable answer costs the prose, not the document — every other section is derived.
+    return { introduction: [], architecture: [], layers: [], lineage: [], risks: [] };
+  }
+}
+
+export async function writeProjectDocumentation(
+  input: DocumentationLlmInput,
+  options: LlmCallOptions = {}
+): Promise<ProjectDocumentationProse> {
+  const content = await callAzureOpenAi(buildDocumentationMessages(input), {
+    label: `documentation ${input.projectName}`,
+    ...options
+  });
+  return parseDocumentationResponse(content);
+}
+
+export interface HopContextLlmInput {
+  hopLabel: string;
+  /** Null when the project had no inferable layers and its whole lineage is one scope. */
+  fromLayer: string | null;
+  toLayer: string | null;
+  targets: {
+    target: string;
+    sources: string[];
+    keyColumns: string[];
+    /** `declared`, `inferred` or `none` — whether the join key came from DDL or from column naming. */
+    keyConfidence: string;
+    measureColumns: string[];
+    /** WHERE predicates the building statements apply. */
+    knownFilters: string[];
+    /** The transformation SQL itself, already capped by the caller. */
+    snippet: string;
+  }[];
+}
+
+export function buildHopContextMessages(input: HopContextLlmInput): ChatMessage[] {
+  const targetBlock = input.targets
+    .map((t) => {
+      const lines = [
+        `Table built: ${t.target}`,
+        `  built from: ${t.sources.join(", ") || "(nothing in this hop)"}`,
+        `  key columns: ${t.keyColumns.join(", ") || "(none identified)"} (${t.keyConfidence})`,
+        `  measures on both sides: ${t.measureColumns.join(", ") || "(none)"}`,
+        `  filters found in the transformation: ${t.knownFilters.length ? t.knownFilters.map((f) => `\`${f}\``).join("; ") : "(none)"}`,
+        `  transformation SQL:\n\`\`\`\n${t.snippet}\n\`\`\``
+      ];
+      return lines.join("\n");
+    })
+    .join("\n\n");
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior data engineer documenting one stage of a data pipeline for a reader who has " +
+        "to trust its numbers. For each table the stage builds you are given its source tables, the key " +
+        "columns a reconciliation would join on, the measures both sides share, the filters found in " +
+        "the transformation, and the transformation SQL itself. Explain what this stage does and what " +
+        "it means for the data: which records it keeps and drops, what grain the output is at, which " +
+        "rules are being applied. " +
+        `${DOC_GROUNDING} ` +
+        'Respond with ONLY compact JSON: {"context": ["<paragraph>", ...], ' +
+        '"rules": [{"rule": "<a rule this stage applies, in business terms>", "evidence": "<the predicate, join or column from the SQL above that shows it>"}, ...], ' +
+        '"expectedDifferences": ["<why the source and target row counts can legitimately differ here>", ...], ' +
+        '"watchOuts": ["<how this stage could go wrong without anyone noticing>", ...]}. ' +
+        "Two or three paragraphs in `context`. Every `evidence` must quote the SQL you were given. " +
+        "No text outside the JSON object."
+    },
+    {
+      role: "user",
+      content:
+        `Pipeline stage: ${input.hopLabel}\n` +
+        (input.fromLayer && input.toLayer
+          ? `Data moves from the ${input.fromLayer} layer to the ${input.toLayer} layer.\n`
+          : "This project has no distinct layers, so this is its whole lineage as one stage.\n") +
+        `\n${input.targets.length} table(s) are built here.\n\n${targetBlock}`
+    }
+  ];
+}
+
+export function parseHopContextResponse(raw: string): HopBusinessContext {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  try {
+    const parsed = JSON.parse(cleaned) as Record<string, unknown>;
+    return {
+      context: textList(parsed.context, 6),
+      rules: Array.isArray(parsed.rules)
+        ? parsed.rules.flatMap((item) => {
+            if (!item || typeof item !== "object") return [];
+            const rec = item as Record<string, unknown>;
+            const rule = typeof rec.rule === "string" ? rec.rule.trim() : "";
+            if (!rule) return [];
+            return [{ rule, evidence: typeof rec.evidence === "string" ? rec.evidence.trim() : "" }];
+          })
+        : [],
+      expectedDifferences: textList(parsed.expectedDifferences, 10),
+      watchOuts: textList(parsed.watchOuts, 10)
+    };
+  } catch {
+    return { context: [], rules: [], expectedDifferences: [], watchOuts: [] };
+  }
+}
+
+export async function describeHopContext(
+  input: HopContextLlmInput,
+  options: LlmCallOptions = {}
+): Promise<HopBusinessContext> {
+  const content = await callAzureOpenAi(buildHopContextMessages(input), {
+    label: `documentation hop ${input.hopLabel}`,
+    ...options
+  });
+  return parseHopContextResponse(content);
 }

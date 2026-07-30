@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
@@ -52,7 +52,29 @@ export interface VerifyResult {
 const EMPTY_REVIEW: LineageReview = { narrative: "", notes: {}, concerns: [], proposed: [] };
 
 /** Resolves to the line entered, or null once input has ended. */
-type Asker = (question: string) => Promise<string | null>;
+export type Asker = (question: string) => Promise<string | null>;
+
+/**
+ * One readline interface for a whole command, not one per question.
+ *
+ * `reconcile run` asks about the lineage and then, at the end, about the document. Closing the
+ * interface in between would end input for good (see `makeAsker` — closing tears `process.stdin`
+ * down), so the session is opened once by the command and handed to everything that asks.
+ */
+export interface PromptSession {
+  ask: Asker;
+  close(): void;
+}
+
+export function openPromptSession(): PromptSession {
+  const rl = createInterface({ input: process.stdin });
+  return { ask: makeAsker(rl), close: () => rl.close() };
+}
+
+/** True when there is a human to ask: a TTY, and no flag saying to answer for them. */
+export function canPrompt(autoApprove: boolean): boolean {
+  return process.stdin.isTTY === true && !autoApprove;
+}
 
 /**
  * Reads answers off one readline interface, queueing lines that arrive before they're asked for.
@@ -98,7 +120,7 @@ function makeAsker(rl: ReturnType<typeof createInterface>): Asker {
  * Yes/no/exit, re-asking until one of them is given. A bare Enter accepts the default ("yes"); input
  * ending mid-question is treated as "exit", never as approval.
  */
-async function askChoice(ask: Asker, question: string): Promise<"yes" | "no" | "exit"> {
+export async function askChoice(ask: Asker, question: string): Promise<"yes" | "no" | "exit"> {
   for (;;) {
     const raw = await ask(question);
     if (raw === null) {
@@ -287,10 +309,15 @@ function buildArtifacts(
   };
 }
 
+/**
+ * @param session an already-open prompt session to ask on. `reconcile run` passes the one it also
+ *   uses for the document question at the end; without it this opens and closes its own.
+ */
 export async function verifyLineage(
   initial: LocalProject,
   layers: LayerRef[],
-  options: VerifyOptions
+  options: VerifyOptions,
+  session?: PromptSession | null
 ): Promise<VerifyResult> {
   let project = initial;
   let review = await describe(project, layers, options.useAi);
@@ -300,7 +327,7 @@ export async function verifyLineage(
 
   // A non-interactive terminal can't be asked, so it is told instead — failing here would make the
   // command unusable in CI for no safety gain, since nothing is written outside --dir.
-  const interactive = process.stdin.isTTY === true && !options.autoApprove;
+  const interactive = canPrompt(options.autoApprove);
   if (!interactive) {
     printSummary(project, layers, review, htmlPath);
     console.log(
@@ -313,12 +340,13 @@ export async function verifyLineage(
 
   if (!options.noOpen) openInBrowser(pathToFileURL(htmlPath).href);
 
-  const rl = createInterface({ input: process.stdin });
-  const ask = makeAsker(rl);
+  // A session passed in belongs to the caller, which has more questions to ask on it later; only one
+  // opened here is closed here.
+  const owned = session ?? openPromptSession();
   try {
-    return await verifyLoop(project, layers, options, review, htmlPath, feedback, ask);
+    return await verifyLoop(project, layers, options, review, htmlPath, feedback, owned.ask);
   } finally {
-    rl.close();
+    if (!session) owned.close();
   }
 }
 
@@ -412,6 +440,36 @@ async function verifyLoop(
     review = await describe(project, layers, options.useAi);
     htmlPath = await writeDiagram(options, project, layers, review);
     if (!options.noOpen) console.log("Diagram updated — refresh the page in your browser.");
+  }
+}
+
+/**
+ * Reads back what a previous `reconcile run` approved, or null when this folder has never had one.
+ *
+ * Deliberately forgiving: a lineage file that is missing, unreadable or not the shape it should be is
+ * a reason to document the freshly extracted lineage instead, not a reason to fail. The caller says
+ * which of the two it got.
+ */
+export async function readLineageArtifacts(dir: string, lineageOut: string): Promise<LineageArtifacts | null> {
+  try {
+    const raw = await readFile(path.join(dir, lineageOut, "lineage.json"), "utf8");
+    const parsed = JSON.parse(raw) as Partial<LineageArtifacts>;
+    if (!Array.isArray(parsed.edges) || !Array.isArray(parsed.layers)) return null;
+    return {
+      generatedAt: typeof parsed.generatedAt === "string" ? parsed.generatedAt : "",
+      projectName: typeof parsed.projectName === "string" ? parsed.projectName : "",
+      approved: parsed.approved === true,
+      layers: parsed.layers,
+      edges: parsed.edges,
+      tables: Array.isArray(parsed.tables) ? parsed.tables : [],
+      narrative: typeof parsed.narrative === "string" ? parsed.narrative : "",
+      concerns: Array.isArray(parsed.concerns) ? parsed.concerns.filter((c): c is string => typeof c === "string") : [],
+      notes: parsed.notes && typeof parsed.notes === "object" ? parsed.notes : {},
+      feedback: Array.isArray(parsed.feedback) ? parsed.feedback : [],
+      stats: parsed.stats ?? { fileCount: 0, statementCount: 0, tableCount: 0, edgeCount: 0, layerCount: 0 }
+    };
+  } catch {
+    return null;
   }
 }
 

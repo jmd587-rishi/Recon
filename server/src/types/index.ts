@@ -664,6 +664,43 @@ export interface LineageFeedbackRound {
   discarded: LineageOverride[];
 }
 
+// ---- Generated documentation (`reconcile document`) ----
+//
+// CLI-only, like the lineage types above: nothing in the browser app reaches this flow.
+
+/**
+ * The written half of the generated document — what the SQL cannot state for itself.
+ *
+ * Everything else in the document is derived from the project (layers, tables, lineage, checks), so
+ * this is deliberately narrow: prose the reader needs, keyed so it can be dropped in beside the facts
+ * it describes. An empty value means the reviewer model wasn't reachable, and the document says so
+ * rather than going without a section.
+ */
+export interface ProjectDocumentationProse {
+  /** What this project is and what it produces, a paragraph per entry. */
+  introduction: string[];
+  /** How the pipeline is laid out, in terms of its own layers. */
+  architecture: string[];
+  /** Keyed by the layer's label, exactly as it was given to the model. */
+  layers: { layer: string; purpose: string; contents: string }[];
+  /** How data moves table to table. */
+  lineage: string[];
+  /** Things a reader should be sceptical about, in the pipeline or in this document. */
+  risks: string[];
+}
+
+/** One hop's business context: what the transformation means, and what it may legitimately change. */
+export interface HopBusinessContext {
+  /** What this stage of the pipeline does, in business terms, a paragraph per entry. */
+  context: string[];
+  /** A rule the code implements, paired with the SQL that shows it. */
+  rules: { rule: string; evidence: string }[];
+  /** Why the source and target row counts can differ without anything being wrong. */
+  expectedDifferences: string[];
+  /** Where this hop could go wrong unnoticed. */
+  watchOuts: string[];
+}
+
 /** What `lineage/lineage.json` holds after the user approves. */
 export interface LineageArtifacts {
   generatedAt: string;

@@ -4,13 +4,29 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { buildAiReconciliationSuite } from "../services/aiReconciliation.js";
+import { buildDocumentation } from "../services/documentation.js";
 import { detectLayers, unassignedSchemas } from "../services/layers.js";
 import { LlmConfigError } from "../services/llmClient.js";
 import type { LocalProject } from "../services/localProject.js";
 import { buildReconciliationSuite } from "../services/reconciliationScripts.js";
 import { buildLocalProject, collectSourceFiles } from "./collectSourceFiles.js";
-import { verifyLineage, writeLineageArtifacts, type VerifyOptions } from "./lineagePrompt.js";
-import type { LayerRef, LocalReconciliationSuite } from "../types/index.js";
+import {
+  applyApprovedLineage,
+  findTemplate,
+  listGovernanceFiles,
+  writeDocumentArtifacts
+} from "./documentArtifacts.js";
+import {
+  askChoice,
+  canPrompt,
+  openPromptSession,
+  readLineageArtifacts,
+  verifyLineage,
+  writeLineageArtifacts,
+  type PromptSession,
+  type VerifyOptions
+} from "./lineagePrompt.js";
+import type { LayerRef, LineageArtifacts, LocalReconciliationSuite } from "../types/index.js";
 
 /**
  * `reconcile scripts` — the L4 tab (`/local/reconciliation` in the running app) as a standalone
@@ -32,25 +48,37 @@ import type { LayerRef, LocalReconciliationSuite } from "../types/index.js";
  *
  * `reconcile layers` runs only the scan + layer-detection step, so a schema-naming convention the
  * heuristic doesn't recognise can be sorted out with `--layers` before spending an LLM call on it.
+ *
+ * `reconcile document` writes the whole thing up — the project, its layers, its lineage, what each hop
+ * means for the data, and the reconciliation behind it — into the branded Word template plus a
+ * Markdown copy. It reads whatever the other commands have already left in the folder (the approved
+ * lineage, the generated scripts) so the document describes the run rather than a fresh guess at it.
+ * `run` offers it as its last question, since by then everything it would read is in memory already —
+ * the template comes bundled with this package, so there is nothing to supply for that to work.
  */
 
 const USAGE = `
 reconcile <command> [options]
 
 Commands:
-  run         Build the lineage, confirm it, then write the reconciliation scripts
+  run         Layers, lineage, scripts and — if you say yes — the document, in one pass
   scripts     Write one reconciliation query per hop into a governance/ folder
+  document    Write the whole pipeline up as a Word document and a Markdown file
   layers      Detect and print the pipeline layers only — writes nothing
 
 Options:
   --dir <path>        Project folder to scan (default: current directory)
   --out <name>         Output folder name, created under --dir (default: governance)
   --lineage-out <name> Folder for the lineage diagram and data (default: lineage)
+  --doc-out <name>    document: folder for the document (default: documentation)
+  --template <path>   Word template to render into (default: the one bundled with Recon)
   --layers a,b,c      Schema names, most-raw first, overriding auto-detection
   --env-file <path>   .env file with AZURE_OPENAI_* settings (default: <dir>/.env, then ./.env)
   --no-ai             Skip the reviewer model — write only the schema-derived standard checks
   --no-notebooks      Read .sql files only, ignoring Databricks notebooks
   --auto-approve      run: accept the extracted lineage without prompting (for CI)
+  --document          run: write the document too, without asking
+  --no-document       run: stop after the scripts, without asking
   --no-open           run: don't try to open the diagram in a browser
   --split             Also write the per-table scripts, a folder per hop, beside each query
   --one-file          Fold every hop into a single reconciliation.sql instead of one file per hop
@@ -62,20 +90,26 @@ Examples:
   reconcile run
   reconcile layers
   reconcile scripts
+  reconcile document
   reconcile run --layers raw,staged,mart --out recon
+  reconcile run --auto-approve --document
   reconcile scripts --split
 `.trim();
 
 interface Args {
-  command: "run" | "scripts" | "layers" | "help";
+  command: "run" | "scripts" | "document" | "layers" | "help";
   dir: string;
   out: string;
   lineageOut: string;
+  docOut: string;
+  template: string | null;
   layers: string[] | null;
   envFile: string | null;
   useAi: boolean;
   includeNotebooks: boolean;
   autoApprove: boolean;
+  /** run: true/false force it either way, null asks once the scripts are written. */
+  document: boolean | null;
   noOpen: boolean;
   split: boolean;
   oneFile: boolean;
@@ -88,11 +122,14 @@ function parseArgs(argv: string[]): Args {
     dir: process.cwd(),
     out: "governance",
     lineageOut: "lineage",
+    docOut: "documentation",
+    template: null,
     layers: null,
     envFile: null,
     useAi: true,
     includeNotebooks: true,
     autoApprove: false,
+    document: null,
     noOpen: false,
     split: false,
     oneFile: false,
@@ -101,7 +138,7 @@ function parseArgs(argv: string[]): Args {
 
   const rest = [...argv];
   const first = rest[0];
-  if (first === "run" || first === "scripts" || first === "layers") {
+  if (first === "run" || first === "scripts" || first === "document" || first === "layers") {
     args.command = first;
     rest.shift();
   } else if (first === "-h" || first === "--help" || first === undefined) {
@@ -125,6 +162,12 @@ function parseArgs(argv: string[]): Args {
       case "--lineage-out":
         args.lineageOut = next();
         break;
+      case "--doc-out":
+        args.docOut = next();
+        break;
+      case "--template":
+        args.template = next();
+        break;
       case "--layers":
         args.layers = next()
           .split(",")
@@ -142,6 +185,12 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--auto-approve":
         args.autoApprove = true;
+        break;
+      case "--document":
+        args.document = true;
+        break;
+      case "--no-document":
+        args.document = false;
         break;
       case "--no-open":
         args.noOpen = true;
@@ -184,7 +233,7 @@ function loadEnv(dir: string, explicit: string | null): void {
 async function scanProject(args: Args): Promise<LocalProject> {
   const scan = await collectSourceFiles(args.dir, {
     maxFiles: args.maxFiles,
-    excludeDirs: [args.out, args.lineageOut],
+    excludeDirs: [args.out, args.lineageOut, args.docOut],
     includeNotebooks: args.includeNotebooks
   });
 
@@ -261,7 +310,9 @@ async function writeSuite(
   outName: string,
   suite: LocalReconciliationSuite,
   split: boolean,
-  oneFile: boolean
+  oneFile: boolean,
+  /** Off inside `run`, which asks about the document rather than telling you to go and run it. */
+  suggestDocument: boolean
 ): Promise<void> {
   const outRoot = path.join(dir, outName);
   await mkdir(outRoot, { recursive: true });
@@ -337,10 +388,16 @@ async function writeSuite(
   console.log(`Wrote ${outRoot}`);
   for (const line of written) console.log(`  ${line}`);
   if (suite.notice) console.log(`\nNote: ${suite.notice}`);
+  if (suggestDocument) console.log("\nWrite this up as a document with: reconcile document");
 }
 
 /** The governance half, shared by `scripts` and the tail of `run`. */
-async function generateAndWriteSuite(args: Args, project: LocalProject, layers: LayerRef[]): Promise<void> {
+async function generateAndWriteSuite(
+  args: Args,
+  project: LocalProject,
+  layers: LayerRef[],
+  suggestDocument = true
+): Promise<void> {
   console.log("\nWriting the standard checks and, where configured, asking the reviewer model for the rest...");
 
   let suite: LocalReconciliationSuite;
@@ -363,7 +420,7 @@ async function generateAndWriteSuite(args: Args, project: LocalProject, layers: 
     }
   }
 
-  await writeSuite(args.dir, args.out, suite, args.split, args.oneFile);
+  await writeSuite(args.dir, args.out, suite, args.split, args.oneFile, suggestDocument);
 }
 
 async function runScripts(args: Args): Promise<void> {
@@ -377,9 +434,19 @@ async function runScripts(args: Args): Promise<void> {
 /**
  * Lineage first, governance second, with the user's confirmation in between — and, crucially, the
  * *approved* project handed to the governance step rather than the originally extracted one.
+ *
+ * The document is offered last, as a question rather than another command to remember: everything it
+ * needs is already in hand at that point (the approved project, the layers, the lineage just written,
+ * the scripts just written), so answering yes costs a scan nobody has to repeat. `--document` and
+ * `--no-document` answer it in advance, which is also how a non-interactive run decides — with nothing
+ * to ask, the default is to stop after the scripts and say how to get the document.
  */
 async function runFull(args: Args): Promise<void> {
   loadEnv(args.dir, args.envFile);
+
+  // Resolved before the long work so a bad --template fails now rather than after the LLM calls.
+  const template = findTemplate(args.dir, args.template);
+
   const project = await scanProject(args);
   const layers = resolveLayers(project.scan.schemas, args.layers);
   printLayers(project.scan.schemas, layers);
@@ -392,22 +459,159 @@ async function runFull(args: Args): Promise<void> {
     noOpen: args.noOpen
   };
 
-  const result = await verifyLineage(project, layers, options);
-  const lineageDir = await writeLineageArtifacts(options, result.artifacts);
+  // One session for both questions — the lineage gate and the document offer. Opened here so it
+  // outlives `verifyLineage`, since closing readline ends stdin for everything after it.
+  const session: PromptSession | null = canPrompt(args.autoApprove) ? openPromptSession() : null;
 
-  if (!result.approved) {
-    console.log(`\nLineage so far is in ${lineageDir} — nothing was generated from it.`);
-    return;
+  try {
+    const result = await verifyLineage(project, layers, options, session);
+    const lineageDir = await writeLineageArtifacts(options, result.artifacts);
+
+    if (!result.approved) {
+      console.log(`\nLineage so far is in ${lineageDir} — nothing was generated from it.`);
+      return;
+    }
+
+    console.log(`\nLineage approved. Wrote ${lineageDir}`);
+    console.log("  lineage.html  (the diagram you just reviewed)");
+    console.log("  lineage.json  (the approved graph)");
+    if (result.artifacts.feedback.length > 0) {
+      console.log(`  lineage-feedback.json  (${result.artifacts.feedback.length} round(s) of corrections)`);
+    }
+
+    await generateAndWriteSuite(args, result.project, layers, args.document === false);
+
+    if (!(await wantsDocument(args, session))) return;
+
+    console.log("");
+    await writeDocument(args, {
+      project: result.project,
+      layers,
+      lineage: result.artifacts,
+      template
+    });
+  } finally {
+    session?.close();
+  }
+}
+
+/**
+ * Whether `run` should go on to write the document — the flags if either was given, otherwise the
+ * question, otherwise no.
+ */
+async function wantsDocument(args: Args, session: PromptSession | null): Promise<boolean> {
+  if (args.document !== null) return args.document;
+
+  if (!session) {
+    console.log("\nWrite this up as a document with: reconcile document  (or --document to include it here)");
+    return false;
   }
 
-  console.log(`\nLineage approved. Wrote ${lineageDir}`);
-  console.log("  lineage.html  (the diagram you just reviewed)");
-  console.log("  lineage.json  (the approved graph)");
-  if (result.artifacts.feedback.length > 0) {
-    console.log(`  lineage-feedback.json  (${result.artifacts.feedback.length} round(s) of corrections)`);
+  const answer = await askChoice(session.ask, "\nWrite this up as a document as well? [yes] / no: ");
+  if (answer === "yes") return true;
+  console.log("Skipped. Run `reconcile document` later if you change your mind — it reads what was just written.");
+  return false;
+}
+
+/**
+ * `reconcile document` — the run written up, rather than another artifact to interpret.
+ *
+ * It documents what is *there*: the lineage `reconcile run` approved if this folder has one (replayed
+ * onto the current SQL, so the document and the diagram agree), the scripts `reconcile scripts` wrote
+ * if they exist, and the layers, tables and checks derived either way. So it can be run at any point —
+ * before anything else, to understand a folder, or last, to hand over what was done.
+ */
+interface DocumentInputs {
+  /** The project as it should be described — corrections already applied. */
+  project: LocalProject;
+  layers: LayerRef[];
+  /** The approved lineage, when there is one to describe. */
+  lineage: LineageArtifacts | null;
+  template: string | null;
+}
+
+/**
+ * The writing half, shared by `document` and the tail of `run`.
+ *
+ * Takes the project rather than a folder, so `run` can hand over the one the user just approved
+ * in memory instead of it being scanned and corrected a second time off disk.
+ */
+async function writeDocument(args: Args, inputs: DocumentInputs): Promise<void> {
+  const governanceFiles = await listGovernanceFiles(args.dir, args.out);
+  const generatedAt = new Date();
+
+  const result = await buildDocumentation(inputs.project, inputs.layers, {
+    scanRoot: path.resolve(args.dir),
+    useAi: args.useAi,
+    lineage: inputs.lineage,
+    governanceFiles,
+    generatedAt,
+    onProgress: (message) => console.log(`  ${message}...`)
+  });
+
+  const written = await writeDocumentArtifacts(args.dir, args.docOut, result.doc, inputs.template, generatedAt);
+
+  console.log("");
+  console.log(`Wrote ${written.dir}`);
+  for (const file of written.files) console.log(`  ${file}`);
+  console.log("");
+  console.log(
+    `${result.doc.blocks.filter((b) => b.kind === "heading").length} sections covering ` +
+      `${result.facts.stats.layerCount} layer(s), ${result.facts.stats.edgeCount} lineage edge(s), ` +
+      `${result.facts.hops.length} hop(s) and ${result.facts.stats.checkCount} derived check(s).`
+  );
+
+  if (written.templateMissing) {
+    console.log("");
+    console.log("No Word template was found, so only the Markdown was written. This package ships one,");
+    console.log("so it has been removed or stripped from the install — pass --template <path/to.docx>");
+    console.log("to render the branded document.");
+  } else {
+    console.log("The .docx opens with an empty table of contents until Word refreshes its fields — it does");
+    console.log("that on open, or press Ctrl+A then F9.");
   }
 
-  await generateAndWriteSuite(args, result.project, layers);
+  for (const notice of result.notices) {
+    console.log("");
+    console.log(`Note: ${notice}`);
+  }
+}
+
+async function runDocument(args: Args): Promise<void> {
+  loadEnv(args.dir, args.envFile);
+
+  const template = findTemplate(args.dir, args.template);
+  const scanned = await scanProject(args);
+
+  const lineage = await readLineageArtifacts(args.dir, args.lineageOut);
+  const corrected = applyApprovedLineage(scanned, lineage);
+  const project = corrected.project;
+
+  if (lineage) {
+    console.log(
+      `Found ${args.lineageOut}/lineage.json — ${lineage.approved ? "approved" : "not approved"} lineage from ${lineage.generatedAt.slice(0, 10) || "an earlier run"}.`
+    );
+    if (corrected.applied > 0) {
+      console.log(`  Replayed ${corrected.applied} recorded correction(s) onto this scan.`);
+    }
+    if (corrected.stale > 0) {
+      console.log(`  ${corrected.stale} recorded correction(s) no longer match the SQL and were left out.`);
+    }
+  } else {
+    console.log(`No ${args.lineageOut}/lineage.json here, so the document describes the lineage as extracted.`);
+  }
+
+  // Layers approved in an earlier run beat re-detection, since the document is meant to describe the
+  // same pipeline the scripts were built for. An explicit --layers still wins over both.
+  const layers = args.layers
+    ? resolveLayers(project.scan.schemas, args.layers)
+    : lineage?.layers.length
+      ? lineage.layers
+      : resolveLayers(project.scan.schemas, null);
+  printLayers(project.scan.schemas, layers);
+
+  console.log("");
+  await writeDocument(args, { project, layers, lineage, template });
 }
 
 async function runLayers(args: Args): Promise<void> {
@@ -430,6 +634,7 @@ async function main(): Promise<void> {
   try {
     if (args.command === "run") await runFull(args);
     else if (args.command === "scripts") await runScripts(args);
+    else if (args.command === "document") await runDocument(args);
     else await runLayers(args);
   } catch (err) {
     console.error(`\nError: ${err instanceof Error ? err.message : String(err)}`);
