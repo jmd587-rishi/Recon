@@ -27,7 +27,15 @@ export const COLLAPSE_ABOVE = 250;
 
 export const NODE_W = 190;
 export const NODE_H = 38;
-export const COL_GAP = 110;
+/**
+ * Horizontal gap between columns — and therefore how much room an edge has to curve.
+ *
+ * Widened from 110 once the edges became curves in both outputs. `edgeCurve` sets its control points at
+ * half the span, so a wider gap means a longer, gentler S rather than a tight one; and in the deck it
+ * gives the per-edge inflection lanes room to separate without pushing any of them far from mid-span,
+ * which is where `curvedConnector3` stops looking smooth. Costs a little scale on a wide pipeline.
+ */
+export const COL_GAP = 140;
 export const ROW_GAP = 16;
 export const PAD = 32;
 export const LABEL_MAX = 24;

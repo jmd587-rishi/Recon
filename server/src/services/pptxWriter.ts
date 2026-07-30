@@ -1,6 +1,5 @@
 import { strToU8, zipSync } from "fflate";
 import {
-  COL_GAP,
   LABEL_COLOUR,
   NODE_H,
   NODE_W,
@@ -51,8 +50,13 @@ const AVAIL_H = SLIDE_H - GRAPH_TOP - MARGIN - LEGEND_H;
 
 /** Point sizes before scaling. OOXML wants hundredths of a point, so these are ×100 on the way out. */
 const PT = { title: 20, subtitle: 11, node: 9.5, schema: 8, legend: 9, note: 12 };
-/** Below this a shrunken label is illegible anyway, so the diagram is left to overflow instead. */
-const MIN_PT = 7;
+/**
+ * Below this a shrunken label is illegible anyway, so the diagram is left to overflow instead.
+ *
+ * 6 rather than 7 so the schema sub-label can still sit a step below the table name on a wide pipeline.
+ * At a 7pt floor both clamped to the same size and the box lost its hierarchy.
+ */
+const MIN_PT = 6;
 
 const FONT = "Calibri";
 const MONO_FONT = "Consolas";
@@ -152,68 +156,21 @@ function nodeShape(id: number, node: DagNode, box: Placed, palette: string[], sc
   );
 }
 
-function edgeId(from: string, to: string): string {
-  return `${from}->${to}`;
-}
-
-/**
- * Where each arrow turns — the `adj1` of its connector, as a fraction of its own span.
- *
- * A connector inflects at the midpoint of its span unless its adjust list says otherwise, and an empty
- * `<a:avLst/>` means every arrow crossing the same gutter turns at *exactly* the same X. With the
- * orthogonal preset that drew six arrows as one line on a four-layer pipeline, twice over. Curves are far
- * more forgiving — two curves with different endpoints cross rather than coincide — but lanes still earn
- * their keep: they stop the curves into one column from stacking into a single thick sweep, and they cost
- * nothing, since `curvedConnector3` reads the same `adj1`.
- *
- * Each arrow gets its own lane in the gutter it crosses. Lanes are ordered by target row and then source
- * row, which means the arrows feeding one table take adjacent lanes and read as a bundle converging on
- * it, rather than as unrelated lines that happen to end up nearby.
- *
- * The gutter chosen is the one immediately before the target's column: the single strip of empty space
- * every arrow into that column must cross, whether it comes from the column next door or from three
- * columns back.
- */
-export function bendLanes(component: DiagramComponent): Map<string, number> {
-  const byId = new Map(component.layout.nodes.map((node) => [node.id, node]));
-  const crossingsByColumn = new Map<number, { key: string; from: DagNode; to: DagNode }[]>();
-
-  for (const edge of component.layout.edges) {
-    const from = byId.get(edge.from);
-    const to = byId.get(edge.to);
-    // A backward edge bows around instead of bending, so it crosses no gutter and takes no lane.
-    if (!from || !to || to.x <= from.x) continue;
-    const list = crossingsByColumn.get(to.col) ?? [];
-    list.push({ key: edgeId(edge.from, edge.to), from, to });
-    crossingsByColumn.set(to.col, list);
-  }
-
-  const adjustments = new Map<string, number>();
-  for (const crossings of crossingsByColumn.values()) {
-    crossings.sort((a, b) => a.to.row - b.to.row || a.from.row - b.from.row);
-    crossings.forEach((crossing, i) => {
-      const startX = crossing.from.x + NODE_W;
-      const endX = crossing.to.x;
-      const laneX = crossing.to.x - COL_GAP + ((i + 1) / (crossings.length + 1)) * COL_GAP;
-      // Kept off both endpoints: an adj of 0 or 100% degenerates the bend into an L, which reads as a
-      // different shape from its neighbours in the same bundle.
-      const bounded = Math.min(Math.max(laneX, startX + 2), endX - 2);
-      adjustments.set(crossing.key, Math.round(((bounded - startX) / (endX - startX)) * 100000));
-    });
-  }
-  return adjustments;
-}
-
 /**
  * One edge as a connector bound to both shapes.
  *
- * `curvedConnector3` for every edge, not `bentConnector3`. The review page draws each edge as a cubic
- * bezier with horizontal tangents at both ends (`dagLayout.edgeCurve`), and this is the preset that
- * matches that shape: a smooth S leaving the source's right edge and arriving at the target's left.
- * Orthogonal connectors were perfectly legible once they had lanes, but the deck is supposed to be the
- * diagram that was approved, and right-angled arrows are a different picture. It also happens to be the
- * right choice for a backward edge — a table rebuilt from something later in the pipeline — which bows
- * clear of the boxes between rather than cutting back through them.
+ * `straightConnector1` for every edge — a direct line between the two attach points, with no adjust
+ * handles at all. Curved presets (`curvedConnector3`, `bentConnector3`) each need some per-edge control
+ * (an inflection point, a routed midpoint) to keep same-gutter arrows apart, and every attempt to drive
+ * that control from the layout either bunched several arrows into one visual line or, when spread out
+ * to avoid that, distorted the curve into an uneven swoop. A straight line has no such handle to fight:
+ * its shape is just its two endpoints, so there is nothing left to distort.
+ *
+ * Two edges only run exactly on top of each other if they share the same source *and* the same target,
+ * which never happens in a DAG — every other pair differs in row on at least one end, so it has a
+ * different slope and stays visually distinct. Edges do still cross where flows genuinely cross (the
+ * same crossings the HTML page's curves show, just drawn with straight segments), which is the "split
+ * of flow" reading a lineage diagram is supposed to give.
  *
  * `idx="3"` is the right-hand connection site of `roundRect` and `idx="1"` the left-hand one, which is
  * what gives the curve its horizontal tangents and keeps every arrow flowing left to right.
@@ -234,8 +191,7 @@ function connector(
   from: DagNode,
   to: DagNode,
   place: Placer,
-  palette: string[],
-  adj: number | undefined
+  palette: string[]
 ): string {
   const c = edgeCurve(from, to);
   const start = place.point(c.x1, c.y1);
@@ -249,17 +205,11 @@ function connector(
     cy: Math.abs(end.y - start.y)
   };
 
-  // A backward edge takes no lane (it crosses no gutter), so its adjust list is left at the default.
-  const geometry =
-    `<a:prstGeom prst="curvedConnector3"><a:avLst>${
-      adj === undefined ? "" : `<a:gd name="adj1" fmla="val ${adj}"/>`
-    }</a:avLst></a:prstGeom>`;
-
   return (
     `<p:cxnSp><p:nvCxnSpPr><p:cNvPr id="${id}" name="${clean(`${from.qualified} to ${to.qualified}`)}"/>` +
     `<p:cNvCxnSpPr><a:stCxn id="${fromId}" idx="3"/><a:endCxn id="${toId}" idx="1"/></p:cNvCxnSpPr>` +
     `<p:nvPr/></p:nvCxnSpPr>` +
-    `<p:spPr>${xfrm(box, flip)}${geometry}` +
+    `<p:spPr>${xfrm(box, flip)}<a:prstGeom prst="straightConnector1"><a:avLst/></a:prstGeom>` +
     `<a:ln w="12700"><a:solidFill><a:srgbClr val="${hex(schemaColour(palette, from.schema).stroke)}"/></a:solidFill>` +
     `<a:tailEnd type="triangle" w="med" len="med"/></a:ln></p:spPr></p:cxnSp>`
   );
@@ -349,16 +299,13 @@ function slideXml(component: DiagramComponent): string {
     }
 
     const byId = new Map(component.layout.nodes.map((node) => [node.id, node]));
-    const lanes = bendLanes(component);
     for (const edge of component.layout.edges) {
       const from = byId.get(edge.from);
       const to = byId.get(edge.to);
       const fromId = shapeIds.get(edge.from);
       const toId = shapeIds.get(edge.to);
       if (!from || !to || fromId === undefined || toId === undefined) continue;
-      shapes.push(
-        connector(id++, fromId, toId, from, to, place, component.palette, lanes.get(edgeId(edge.from, edge.to)))
-      );
+      shapes.push(connector(id++, fromId, toId, from, to, place, component.palette));
     }
   }
 
