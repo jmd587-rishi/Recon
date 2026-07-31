@@ -41,7 +41,9 @@ export type DocBlock =
   | { kind: "code"; text: string }
   /** A Word TOC field, with `entries` as its static result for readers who never refresh it. */
   | { kind: "toc"; entries: DocTocEntry[] }
-  | { kind: "pageBreak" };
+  | { kind: "pageBreak" }
+  /** A raster picture — `png` is the already-rendered bytes, sized in device pixels. */
+  | { kind: "image"; png: Uint8Array; widthPx: number; heightPx: number; altText: string };
 
 export interface DocDocument {
   /** Cover-page title, and `dc:title` in the .docx. */
@@ -141,6 +143,10 @@ export function renderMarkdown(doc: DocDocument): string {
       case "pageBreak":
         separate();
         lines.push("---", "");
+        break;
+      case "image":
+        separate();
+        lines.push(`![${escapePipes(block.altText)}](data:image/png;base64,${Buffer.from(block.png).toString("base64")})`, "");
         break;
       default: {
         // A block kind added without a case here would otherwise vanish from the Markdown while still

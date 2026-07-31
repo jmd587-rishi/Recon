@@ -32,6 +32,14 @@ const STYLE = {
 /** Usable text width in twips: A4 (11906) less the template's 994-twip side margins. */
 const CONTENT_WIDTH_TWIPS = 9918;
 
+/** EMU (English Metric Units) is what `<wp:extent>` measures in; 1 px at 96dpi is 9525 of them. */
+const EMU_PER_PX = 9525;
+/** 1 twip is 635 EMU, so the page's usable width caps how wide an inline picture can render. */
+const MAX_IMAGE_WIDTH_EMU = CONTENT_WIDTH_TWIPS * 635;
+
+/** Where an image block's relationship lands once assigned, so `renderBlock` doesn't invent one. */
+type ImageRelId = { rId: string; docPrId: number };
+
 /** Placeholder text on the template's cover page, replaced with the real title. */
 const TITLE_PLACEHOLDER = "Document Title";
 const SUBTITLE_PLACEHOLDER = "Document Subtitle";
@@ -159,7 +167,34 @@ function renderToc(entries: DocTocEntry[]): string {
     .join("");
 }
 
-function renderBlock(block: DocBlock): string {
+/**
+ * An inline picture, centred in its own paragraph, scaled down to the page's content width when the
+ * rendered diagram is wider than that — Word does not do this itself, it just overflows the margin.
+ */
+function imageParagraph(rel: ImageRelId, widthPx: number, heightPx: number, altText: string): string {
+  let wEmu = widthPx * EMU_PER_PX;
+  let hEmu = heightPx * EMU_PER_PX;
+  if (wEmu > MAX_IMAGE_WIDTH_EMU) {
+    const scale = MAX_IMAGE_WIDTH_EMU / wEmu;
+    wEmu = Math.round(wEmu * scale);
+    hEmu = Math.round(hEmu * scale);
+  }
+  const alt = escapeXml(sanitize(altText));
+  const drawing =
+    '<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">' +
+    `<wp:extent cx="${wEmu}" cy="${hEmu}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>` +
+    `<wp:docPr id="${rel.docPrId}" name="Picture ${rel.docPrId}" descr="${alt}"/>` +
+    '<wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>' +
+    '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    `<pic:nvPicPr><pic:cNvPr id="${rel.docPrId}" name="Picture ${rel.docPrId}" descr="${alt}"/><pic:cNvPicPr/></pic:nvPicPr>` +
+    `<pic:blipFill><a:blip r:embed="${rel.rId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+    `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${wEmu}" cy="${hEmu}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
+    "</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>";
+  return `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r>${drawing}</w:r></w:p>`;
+}
+
+function renderBlock(block: DocBlock, imageRels: Map<DocBlock, ImageRelId>): string {
   switch (block.kind) {
     case "heading":
       return paragraph(
@@ -185,12 +220,64 @@ function renderBlock(block: DocBlock): string {
       return renderToc(block.entries);
     case "pageBreak":
       return '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+    case "image": {
+      const rel = imageRels.get(block);
+      return rel ? imageParagraph(rel, block.widthPx, block.heightPx, block.altText) : "";
+    }
   }
 }
 
 /** The generated `<w:body>` content — everything between the template's cover page and its `sectPr`. */
-export function renderDocumentBody(blocks: DocBlock[]): string {
-  return blocks.map(renderBlock).join("");
+export function renderDocumentBody(blocks: DocBlock[], imageRels: Map<DocBlock, ImageRelId> = new Map()): string {
+  return blocks.map((block) => renderBlock(block, imageRels)).join("");
+}
+
+/** The highest numeric `rId` already used in a relationships part, so new ones don't collide. */
+function highestRelId(relsXml: string): number {
+  let max = 0;
+  const pattern = /Id="rId(\d+)"/g;
+  for (let match = pattern.exec(relsXml); match !== null; match = pattern.exec(relsXml)) {
+    max = Math.max(max, Number(match[1]));
+  }
+  return max;
+}
+
+/** Appends image relationships to `word/_rels/document.xml.rels`, keeping every existing one intact. */
+function addImageRelationships(relsXml: string, images: { rId: string; target: string }[]): string {
+  const entries = images
+    .map(
+      (img) =>
+        `<Relationship Id="${img.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${img.target}"/>`
+    )
+    .join("");
+  return relsXml.replace("</Relationships>", `${entries}</Relationships>`);
+}
+
+/**
+ * Assigns each `image` block its own relationship id and media part, so `renderDocumentBody` can
+ * reference a real `r:embed` instead of inventing one mid-render.
+ */
+function prepareImageRelationships(
+  blocks: DocBlock[],
+  existingRelsXml: string
+): { imageRels: Map<DocBlock, ImageRelId>; relsAdditions: { rId: string; target: string }[]; media: Record<string, Uint8Array> } {
+  const imageRels = new Map<DocBlock, ImageRelId>();
+  const relsAdditions: { rId: string; target: string }[] = [];
+  const media: Record<string, Uint8Array> = {};
+
+  let nextId = highestRelId(existingRelsXml) + 1;
+  let index = 0;
+  for (const block of blocks) {
+    if (block.kind !== "image") continue;
+    index += 1;
+    const rId = `rId${nextId++}`;
+    const target = `media/recon-diagram-${index}.png`;
+    imageRels.set(block, { rId, docPrId: index });
+    relsAdditions.push({ rId, target });
+    media[`word/${target}`] = block.png;
+  }
+
+  return { imageRels, relsAdditions, media };
 }
 
 /** Where the template's own content ends and generated content begins. */
@@ -349,8 +436,21 @@ export function buildDocx(templateBytes: Uint8Array, doc: DocDocument, generated
     throw new Error("The template is not a Word document — it has no word/document.xml.");
   }
 
+  const relsPart = parts["word/_rels/document.xml.rels"];
+  const { imageRels, relsAdditions, media } = prepareImageRelationships(
+    doc.blocks,
+    relsPart ? strFromU8(relsPart) : "<Relationships></Relationships>"
+  );
+  if (relsAdditions.length > 0) {
+    if (!relsPart) {
+      throw new Error("The template has no word/_rels/document.xml.rels to add the diagram's relationship to.");
+    }
+    parts["word/_rels/document.xml.rels"] = strToU8(addImageRelationships(strFromU8(relsPart), relsAdditions));
+    for (const [path, bytes] of Object.entries(media)) parts[path] = new Uint8Array(bytes);
+  }
+
   const shell = splitTemplate(strFromU8(documentPart));
-  const body = `${fillCover(shell.cover, doc)}${renderDocumentBody(doc.blocks)}${shell.sectPr}`;
+  const body = `${fillCover(shell.cover, doc)}${renderDocumentBody(doc.blocks, imageRels)}${shell.sectPr}`;
   parts["word/document.xml"] = strToU8(`${shell.head}${body}</w:body></w:document>`);
 
   const core = parts["docProps/core.xml"];

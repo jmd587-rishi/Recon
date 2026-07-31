@@ -8,7 +8,9 @@ import type {
   ProjectDocumentationProse,
   TableKind
 } from "../types/index.js";
+import { Resvg } from "@resvg/resvg-js";
 import { mapWithConcurrency } from "./concurrency.js";
+import { buildDiagramComponents, type DiagramGraph } from "./diagramComponents.js";
 import { withTableOfContents, type DocBlock, type DocDocument } from "./docModel.js";
 import { unassignedSchemas } from "./layers.js";
 import {
@@ -19,6 +21,7 @@ import {
   type HopContextLlmInput
 } from "./llmClient.js";
 import type { LocalProject } from "./localProject.js";
+import { renderOfficeSvg } from "./officeSvg.js";
 import { classifyTable } from "./projectSummary.js";
 import {
   gatherReconciliationFacts,
@@ -119,6 +122,28 @@ export interface DocFacts {
   };
   /** The approved lineage from `reconcile run`, when the folder has one. */
   lineage: LineageArtifacts | null;
+  /** The pipeline overview diagram, rasterized for embedding — `null` when there was nothing to draw. */
+  diagramImage: { png: Uint8Array; widthPx: number; heightPx: number } | null;
+}
+
+/**
+ * The same overview `reconcile diagrams` writes to disk, rasterized here so it can sit inside the
+ * document itself rather than only beside it as a separate file — same graph, same renderer
+ * (`officeSvg.ts`), so the picture in the document and the one in `diagrams/` never disagree.
+ */
+function buildOverviewDiagramImage(project: LocalProject, layers: LayerRef[]): DocFacts["diagramImage"] {
+  const graph: DiagramGraph = {
+    projectName: project.folderName,
+    edges: project.scan.lineage,
+    layers,
+    tables: project.scan.tables
+  };
+  const [overview] = buildDiagramComponents(graph);
+  if (!overview || overview.emptyReason) return null;
+
+  const svg = renderOfficeSvg(overview);
+  const rendered = new Resvg(svg).render();
+  return { png: rendered.asPng(), widthPx: rendered.width, heightPx: rendered.height };
 }
 
 function tableFacts(project: LocalProject, layers: LayerRef[]): DocTableFacts[] {
@@ -198,7 +223,8 @@ export function gatherDocumentationFacts(
         t.columnSources.some((c) => c.table === t.target && c.columnCount === 0)
       ).length
     },
-    lineage
+    lineage,
+    diagramImage: buildOverviewDiagramImage(project, layers)
   };
 }
 
@@ -669,6 +695,16 @@ function lineageSection(facts: DocFacts, prose: DocProse): DocBlock[] {
         `${plural(facts.stats.edgeCount, "lineage edge")} ${agree(facts.stats.edgeCount, "was", "were")} ` +
         "extracted from the project's SQL, each one a statement that reads one table and writes another. " +
         "The table below is that graph: read it as “this source feeds this target, in this file”."
+    });
+  }
+
+  if (facts.diagramImage) {
+    blocks.push({
+      kind: "image",
+      png: facts.diagramImage.png,
+      widthPx: facts.diagramImage.widthPx,
+      heightPx: facts.diagramImage.heightPx,
+      altText: `${facts.projectName} pipeline lineage diagram`
     });
   }
 
