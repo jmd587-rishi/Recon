@@ -58,6 +58,7 @@ function ScriptCard({ script, folder }: { script: ReconScript; folder: string })
 
       <div className="pl-card-sub">
         Totals: {script.measureColumns.length > 0 ? script.measureColumns.join(", ") : "no shared measure column"} ·
+        label values: {script.categoryColumns.length > 0 ? script.categoryColumns.join(", ") : "no shared label column"} ·
         columns read from{" "}
         {script.columnSources.map((c) => `${c.table} (${c.origin}, ${c.columnCount})`).join(", ")}
       </div>

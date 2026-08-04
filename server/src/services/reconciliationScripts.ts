@@ -16,11 +16,12 @@ import { extractWherePredicate } from "./whereClauseAnalyzer.js";
 /**
  * Writes the reconciliation SQL a data engineer would hand-write for each pipeline hop.
  *
- * The checks are the standard ones — row counts, measure totals, keys that vanished, keys that
- * appeared from nowhere, duplicates and null keys — but the tables, columns and filters in them come
- * from this project's own SQL: lineage says which source feeds which target (`tableLineage.ts`),
- * `sqlColumns.ts` says what columns each side has, and `whereClauseAnalyzer.ts` says which filter the
- * transformation applies, which is the difference a count check is *expected* to show.
+ * The checks are the standard ones — row counts, measure totals, category values that appeared or
+ * vanished, keys that vanished, keys that appeared from nowhere, duplicates and null keys — but the
+ * tables, columns and filters in them come from this project's own SQL: lineage says which source
+ * feeds which target (`tableLineage.ts`), `sqlColumns.ts` says what columns each side has, and
+ * `whereClauseAnalyzer.ts` says which filter the transformation applies, which is the difference a
+ * count check is *expected* to show.
  *
  * Nothing here calls an LLM. A reconciliation script that references a column the table doesn't have
  * is worse than no script, and the column list is already known exactly; guessing adds nothing but
@@ -38,20 +39,60 @@ import { extractWherePredicate } from "./whereClauseAnalyzer.js";
 
 /** Cap per script, so a wide fact table doesn't produce an unreadable measure block. */
 const MAX_MEASURES = 6;
+/** Cap per script on the labels compared as value sets — a wide table is mostly labels. */
+const MAX_CATEGORIES = 3;
 /** Cap on an inferred composite key — past this it's guessing at the grain, not identifying a row. */
 const MAX_KEY_COLUMNS = 4;
 /** Longest filter text quoted in a script header before it's cut. */
 const MAX_FILTER_CHARS = 240;
+/** Declared text length that reads as a code rather than as free text. */
+const MAX_CATEGORY_TEXT_CHARS = 24;
 
-/** Column-name segments that read as a measure when no DDL declared a type. */
+/**
+ * What a column is *for*, which is what decides the only check on it that can mean anything.
+ *
+ * Summing a label is the mistake this exists to prevent. `SUM(status)` errors or coerces, and
+ * `SUM(fiscal_year)` succeeds and returns a number that reconciles to nothing — worse, because it
+ * looks like a check. Labels are compared as *sets of values* instead, which is the reconciliation
+ * question actually being asked of them: does the target still carry the same categories?
+ */
+export type ColumnRole = "key" | "measure" | "categorical" | "temporal" | "other";
+
+/** Head words for something whose total means something. */
 const MEASURE_WORDS = new Set([
   "amount", "amt", "revenue", "arr", "mrr", "acv", "tcv", "qty", "quantity", "count", "total",
   "sum", "price", "cost", "value", "balance", "sales", "spend", "fee", "fees", "tax", "discount",
-  "margin", "profit", "net", "gross", "volume", "units", "hours", "weight", "delta", "grr", "nrr"
+  "margin", "profit", "net", "gross", "volume", "units", "hours", "days", "weight", "delta",
+  "grr", "nrr"
 ]);
 
-/** Suffixes that mark a column as an identifier, a timestamp or a flag rather than a measure. */
-const NON_MEASURE_SUFFIX = /_(?:key|id|code|flag|type|status|name|date|at|ts|month|year|day|time)$/;
+/**
+ * Head words for a label: few distinct values, a set to compare rather than a column to total.
+ * Date *parts* belong here rather than with the timestamps — `SUM(fiscal_year)` is the bug, while
+ * "does the target still cover every month the source has" is a real check.
+ */
+const CATEGORY_WORDS = new Set([
+  "type", "status", "state", "category", "class", "classification", "group", "grouping", "segment",
+  "tier", "band", "bucket", "level", "grade", "priority", "region", "country", "market", "territory",
+  "channel", "source", "system", "method", "mode", "reason", "currency", "flag", "indicator", "ind",
+  "code", "center", "centre", "department", "division", "brand", "product", "line", "lob", "owner",
+  "frequency", "period", "year", "quarter", "month", "week", "day", "version", "stage", "step"
+]);
+
+/** Head words for a point in time: nothing to total, and far too many values to enumerate. */
+const TEMPORAL_WORDS = new Set([
+  "date", "datetime", "time", "timestamp", "ts", "at", "dt", "dttm", "created", "updated", "modified"
+]);
+
+/** Head words for free text: as many distinct values as there are rows, so neither check applies. */
+const LABEL_WORDS = new Set([
+  "name", "names", "desc", "description", "comment", "comments", "note", "notes", "text", "address",
+  "email", "phone", "url", "guid", "uuid", "hash", "path", "file", "filename", "message", "json", "xml"
+]);
+
+/** Head words for an identifier — checked by the key checks, never totalled. */
+const KEY_WORDS = new Set(["key", "id", "sk", "pk", "identifier"]);
+
 const KEY_SUFFIX = /_(?:key|id)$/;
 /** Prefixes SSDT/warehouse projects put on table names, dropped when guessing the key column. */
 const TABLE_PREFIX = /^(?:fact|dim|rpt|stg|trn|tbl|vw|agg|src)_/;
@@ -157,32 +198,126 @@ function joinKey(key: KeyChoice, target: TableColumns | undefined, source: Table
     : { columns: [], confidence: "none", reason: "source and target share no key column" };
 }
 
-// ---- picking the columns a total is taken over ----
+// ---- deciding what a column can be checked with ----
 
-function isMeasure(column: ColumnInfo): boolean {
-  if (NON_MEASURE_SUFFIX.test(column.name) || /^(?:is|has)_/.test(column.name) || column.name.startsWith("__")) {
-    return false;
-  }
-  if (column.kind === "numeric") return true;
-  // A column the DDL typed as text or a date is not a measure whatever it's called; a column no DDL
-  // described at all (built by `SELECT ... INTO`, so its type is whatever the expression returned)
-  // is judged on its name, which is all there is.
-  if (column.kind !== "other") return false;
-  return column.name.split("_").some((segment) => MEASURE_WORDS.has(segment));
+/** `fiscal_year` -> `year`: the head noun, which is what the column *is*. */
+function headWord(name: string): string {
+  const segments = name.split("_").filter(Boolean);
+  return segments[segments.length - 1] ?? name;
 }
 
-/** Measures worth totalling on both sides: present in both, and not typed as something unsummable. */
-function sharedMeasures(target: TableColumns | undefined, source: TableColumns | undefined): string[] {
-  if (!target || !source) return [];
+/** A declared length short enough that the column holds a code rather than a sentence. */
+function isShortText(column: ColumnInfo): boolean {
+  const length = /\(\s*(\d+)\s*\)\s*$/.exec(column.dataType ?? "");
+  return length !== null && Number(length[1]) <= MAX_CATEGORY_TEXT_CHARS;
+}
+
+/**
+ * What kind of column this is, and so which check on it could mean anything.
+ *
+ * The head noun decides — `sales_region` is a region, `region_sales` is sales — and only when the
+ * head says nothing does any other segment get a vote, categories ahead of measures. That asymmetry
+ * is deliberate: not totalling a measure costs one check, while totalling a label produces a number
+ * that can never tie out and teaches the reader to ignore the whole script.
+ *
+ * The declared type is the tie-breaker rather than the first word. `[fiscal_year] [int]` is numeric
+ * and is still not a measure; `[status] [varchar](20)` is text and is still not free text.
+ */
+export function columnRole(column: ColumnInfo): ColumnRole {
+  const name = column.name;
+  // Bookkeeping columns a load added (`__loaded_at`) belong to neither side of a comparison.
+  if (name.startsWith("__")) return "other";
+  if (column.isDeclaredKey) return "key";
+
+  const head = headWord(name);
+  const segments = name.split("_").filter(Boolean);
+  // A column no DDL described was built by an expression, so its type is whatever that returned;
+  // only a type that is declared and unsummable can veto a measure.
+  const summable = column.kind === "numeric" || column.kind === "other";
+
+  if (name === "id" || KEY_WORDS.has(head)) return "key";
+  if (column.kind === "boolean" || /^(?:is|has)_/.test(name)) return "categorical";
+  if (column.kind === "date" || TEMPORAL_WORDS.has(head)) return "temporal";
+  if (CATEGORY_WORDS.has(head)) return "categorical";
+  if (MEASURE_WORDS.has(head)) return summable ? "measure" : "other";
+  if (LABEL_WORDS.has(head)) return "other";
+  if (segments.some((segment) => CATEGORY_WORDS.has(segment))) return "categorical";
+  if (segments.some((segment) => MEASURE_WORDS.has(segment))) return summable ? "measure" : "other";
+  if (column.kind === "numeric") return "measure";
+  if (column.kind === "text") return isShortText(column) ? "categorical" : "other";
+  return "other";
+}
+
+/**
+ * The role of a column both sides carry. The names are equal by construction, so the two readings
+ * can only disagree about the declared type — one side `decimal` and the other `varchar` is a column
+ * nobody should sum, so the reading that checks less wins.
+ */
+function sharedRole(target: ColumnInfo, source: ColumnInfo): ColumnRole {
+  const inTarget = columnRole(target);
+  const inSource = columnRole(source);
+  if (inTarget === inSource) return inTarget;
+  return inTarget === "categorical" || inSource === "categorical" ? "categorical" : "other";
+}
+
+/** Whether the column's *name* says label, as opposed to a short declared length implying it. */
+function isNamedLabel(column: ColumnInfo): boolean {
+  return (
+    column.kind === "boolean" ||
+    /^(?:is|has)_/.test(column.name) ||
+    column.name.split("_").some((segment) => CATEGORY_WORDS.has(segment))
+  );
+}
+
+/**
+ * Ranks the labels so the cap keeps the ones worth the space.
+ *
+ * A label the transformation filters on comes first: its value set is precisely what the filter was
+ * supposed to change, so the check reads as a confirmation of the stated intent rather than as an
+ * unexplained difference. After that a name that says label outright beats one that is only short
+ * enough to look like a code. Ties keep the order the table declares them in.
+ */
+function rankedCategories(candidates: ColumnInfo[], filters: string[]): string[] {
+  const filterText = filters.join(" ").toLowerCase().replace(/[`[\]"]/g, "");
+  const mentioned = (name: string) => new RegExp(`\\b${name.replace(/[^\w]/g, "\\$&")}\\b`).test(filterText);
+  const rank = (column: ColumnInfo) => (mentioned(column.name) ? 0 : isNamedLabel(column) ? 1 : 2);
+
+  return candidates
+    .map((column, i) => ({ column, i }))
+    .sort((a, b) => rank(a.column) - rank(b.column) || a.i - b.i)
+    .map((entry) => entry.column.name);
+}
+
+interface SharedColumns {
+  /** Totalled on both sides. */
+  measures: string[];
+  /** Compared as sets of values on both sides, most worth checking first. */
+  categories: string[];
+}
+
+/**
+ * The columns both sides carry, split by what comparing them could mean. Everything else — keys,
+ * timestamps, free text — is left to the row-count and key checks, which already cover it.
+ */
+function sharedColumns(
+  target: TableColumns | undefined,
+  source: TableColumns | undefined,
+  filters: string[]
+): SharedColumns {
+  if (!target || !source) return { measures: [], categories: [] };
   const sourceByName = new Map(source.columns.map((c) => [c.name, c]));
-  return target.columns
-    .filter((column) => {
-      const counterpart = sourceByName.get(column.name);
-      if (!counterpart || !isMeasure(column)) return false;
-      return counterpart.kind === "numeric" || counterpart.kind === "other";
-    })
-    .map((c) => c.name)
-    .slice(0, MAX_MEASURES);
+
+  const measures: string[] = [];
+  const categories: ColumnInfo[] = [];
+  for (const column of target.columns) {
+    const counterpart = sourceByName.get(column.name);
+    if (!counterpart) continue;
+    const role = sharedRole(column, counterpart);
+    if (role === "measure") measures.push(column.name);
+    else if (role === "categorical") categories.push(column);
+  }
+
+  return { measures, categories: rankedCategories(categories, filters) };
 }
 
 // ---- SQL fragments ----
@@ -233,7 +368,8 @@ function measureCheck(target: string, perSource: { source: string; measures: str
         `       ${quoted(source)} AS source_table,\n` +
         `       ${sumOf(source, measure)} AS source_total,\n` +
         `       ${sumOf(target, measure)} AS target_total,\n` +
-        `       ${sumOf(target, measure)} - ${sumOf(source, measure)} AS total_diff`
+        // An empty table sums to NULL, and `NULL - NULL` would read as "no difference" at a glance.
+        `       COALESCE(${sumOf(target, measure)}, 0) - COALESCE(${sumOf(source, measure)}, 0) AS total_diff`
     )
   );
   if (blocks.length === 0) return null;
@@ -243,9 +379,48 @@ function measureCheck(target: string, perSource: { source: string; measures: str
     source: "recon",
     title: "Measure totals",
     description:
-      "The money/quantity columns both sides carry, summed. Equal row counts with unequal totals is " +
-      "the classic silent break: a join fanned out and then a filter put the count back.",
+      "The money/quantity columns both sides carry, summed. Only these — a label like a status or a " +
+      "period is compared by its values further down, because its total means nothing. Equal row " +
+      "counts with unequal totals is the classic silent break: a join fanned out and then a filter " +
+      "put the count back.",
     sql: `${blocks.join("\nUNION ALL\n")};`
+  };
+}
+
+/**
+ * The check a label gets instead of a total: are the two sides carrying the same set of values?
+ *
+ * A `FULL OUTER JOIN` on an equi-key, with NULLs excluded on both sides beforehand, is the one shape
+ * that runs on SQL Server and Databricks SQL alike — Spark refuses a full outer join whose condition
+ * isn't an equality, which rules out the usual `OR (a IS NULL AND b IS NULL)` null-matching. Nothing
+ * is lost by it: a category going wholly NULL in the target shows up as its values disappearing.
+ */
+function categoryValuesCheck(target: string, source: string, column: string): ReconCheck {
+  return {
+    kind: "category_values",
+    source: "recon",
+    title: `Values of ${column} against ${source}`,
+    description:
+      `${column} is a label rather than a quantity, so the two sides are compared as sets of values ` +
+      "instead of being summed. A value the source has and the target hasn't was filtered or remapped " +
+      "away; a value the target has and the source hasn't was invented somewhere in the " +
+      "transformation. Returns nothing when both sides carry the same values — drop the WHERE clause " +
+      "to see every value with its row count on each side.",
+    sql:
+      `SELECT COALESCE(t.${column}, s.${column}) AS ${column},\n` +
+      `       s.source_rows,\n` +
+      `       t.target_rows\n` +
+      `FROM (SELECT ${column}, COUNT(*) AS target_rows\n` +
+      `      FROM ${target}\n` +
+      `      WHERE ${column} IS NOT NULL\n` +
+      `      GROUP BY ${column}) t\n` +
+      `FULL OUTER JOIN (SELECT ${column}, COUNT(*) AS source_rows\n` +
+      `                 FROM ${source}\n` +
+      `                 WHERE ${column} IS NOT NULL\n` +
+      `                 GROUP BY ${column}) s\n` +
+      `       ON t.${column} = s.${column}\n` +
+      `WHERE t.${column} IS NULL\n` +
+      `   OR s.${column} IS NULL;`
   };
 }
 
@@ -374,7 +549,18 @@ function scriptText(params: {
   const key = script.keyColumns.length > 0 ? `${script.keyColumns.join(", ")} (${script.keyReason})` : "none found";
   lines.push(...wrapNote(`Key: ${key}`, "   "));
   lines.push(
-    ...wrapNote(`Measures: ${script.measureColumns.length > 0 ? script.measureColumns.join(", ") : "none found"}`, "   ")
+    ...wrapNote(
+      `Measures (totalled): ${script.measureColumns.length > 0 ? script.measureColumns.join(", ") : "none found"}`,
+      "   "
+    )
+  );
+  lines.push(
+    ...wrapNote(
+      `Labels (values compared, not totalled): ${
+        script.categoryColumns.length > 0 ? script.categoryColumns.join(", ") : "none found"
+      }`,
+      "   "
+    )
   );
 
   if (script.knownFilters.length > 0) {
@@ -419,8 +605,10 @@ export interface ReconTargetFacts {
   sources: string[];
   facts: LineageFact[];
   key: KeyChoice;
-  perSource: { source: string; join: KeyChoice; measures: string[] }[];
+  perSource: { source: string; join: KeyChoice; measures: string[]; categories: string[] }[];
   measureColumns: string[];
+  /** Labels compared as value sets rather than totalled — see `columnRole`. */
+  categoryColumns: string[];
   knownFilters: string[];
   columnSources: ReconColumnSource[];
   /** Gaps in the grounding worth saying out loud — no columns, no key, lookup-shaped sources. */
@@ -477,18 +665,50 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
   const key = targetKey(group.target, targetColumns);
   const notes: string[] = [];
 
+  // Read before the columns are split: a label the transformation filters on is the one whose values
+  // are worth comparing first, so the caps keep it.
+  const knownFilters = unique(
+    group.facts.flatMap((fact) => {
+      const predicate = extractWherePredicate(fact.rawSql);
+      const tidy = predicate ? tidyFilter(predicate) : "";
+      return tidy ? [tidy] : [];
+    })
+  );
+
+  const overflow: string[] = [];
   const perSource = group.sources.map((source) => {
     const sourceColumns = columns.get(source);
+    const shared = sharedColumns(targetColumns, sourceColumns, knownFilters);
+    overflow.push(...shared.measures.slice(MAX_MEASURES), ...shared.categories.slice(MAX_CATEGORIES));
     return {
       source,
       join: joinKey(key, targetColumns, sourceColumns),
-      measures: sharedMeasures(targetColumns, sourceColumns)
+      measures: shared.measures.slice(0, MAX_MEASURES),
+      categories: shared.categories.slice(0, MAX_CATEGORIES)
     };
   });
 
   const measureColumns = unique(perSource.flatMap((p) => p.measures));
+  const categoryColumns = unique(perSource.flatMap((p) => p.categories));
   if (measureColumns.length === 0) {
     notes.push("No measure column is present on both sides, so there are no totals to compare.");
+  }
+  if (categoryColumns.length === 0) {
+    notes.push(
+      "No label column — a status, type, code or period — is present on both sides, so there are no " +
+        "value sets to compare."
+    );
+  }
+
+  // A column capped out against one source may still be checked against another, and only the ones
+  // checked against none of them are missing from the script.
+  const left = unique(overflow).filter((name) => !measureColumns.includes(name) && !categoryColumns.includes(name));
+  if (left.length > 0) {
+    notes.push(
+      `${left.join(", ")} ${left.length === 1 ? "is" : "are"} left out to keep the script readable — at most ` +
+        `${MAX_MEASURES} measures and ${MAX_CATEGORIES} labels are checked per source, the ones the ` +
+        "transformation filters on first. Copy a check and change the column name to add one back."
+    );
   }
 
   for (const { source, join } of perSource) {
@@ -530,13 +750,8 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
     key,
     perSource,
     measureColumns,
-    knownFilters: unique(
-      group.facts.flatMap((fact) => {
-        const predicate = extractWherePredicate(fact.rawSql);
-        const tidy = predicate ? tidyFilter(predicate) : "";
-        return tidy ? [tidy] : [];
-      })
-    ),
+    categoryColumns,
+    knownFilters,
     columnSources: [group.target, ...group.sources].map((table) => {
       const entry = columns.get(table);
       const known = entry && entry.columns.length > 0;
@@ -566,6 +781,10 @@ export function templateChecks(facts: ReconTargetFacts): ReconCheck[] {
     facts.perSource.map(({ source, measures: shared }) => ({ source, measures: shared }))
   );
   if (measures) checks.push(measures);
+
+  for (const { source, categories } of facts.perSource) {
+    for (const column of categories) checks.push(categoryValuesCheck(facts.target, source, column));
+  }
 
   for (const { source, join } of facts.perSource) {
     if (join.columns.length === 0) continue;
@@ -600,6 +819,7 @@ export function assembleScript(params: {
     keyConfidence: facts.key.confidence,
     keyReason: facts.key.reason,
     measureColumns: facts.measureColumns,
+    categoryColumns: facts.categoryColumns,
     knownFilters: facts.knownFilters,
     builtBy: facts.facts.map((fact) => ({ path: fact.notebookPath, statementIndex: fact.cellIndex })),
     columnSources: facts.columnSources,

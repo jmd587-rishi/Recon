@@ -1,4 +1,4 @@
-import type { ReconCheck, ReconScript } from "../types/index.js";
+import type { ReconCheck, ReconCheckKind, ReconScript } from "../types/index.js";
 import type { ReconHopFacts, ReconTargetFacts } from "./reconciliationScripts.js";
 import { stripSqlComments } from "./tableLineage.js";
 
@@ -12,9 +12,9 @@ import { stripSqlComments } from "./tableLineage.js";
  * `CREATE TABLE … AS`, or schedule.
  *
  * The folding is what makes it one query. Each table and each pair contributes a one-row aggregate CTE
- * (`COUNT(*)`, `SUM(measure)`, an anti-join count), and the final SELECT cross-joins those single rows
- * into comparisons. Nothing is scanned twice for two different checks, unlike the per-table scripts,
- * where every `(SELECT COUNT(*) FROM t)` is its own scan.
+ * (`COUNT(*)`, `SUM(measure)`, `COUNT(DISTINCT label)`, an anti-join count), and the final SELECT
+ * cross-joins those single rows into comparisons. Nothing is scanned twice for two different checks,
+ * unlike the per-table scripts, where every `(SELECT COUNT(*) FROM t)` is its own scan.
  *
  * Two things do not survive the fold, and both are kept rather than dropped:
  *   - A check that lists rows (*which* keys went missing) cannot be a row of a status table, so it
@@ -48,6 +48,11 @@ function sumAlias(column: string): string {
   return `sum_${column.replace(/[^A-Za-z0-9_]/g, "_")}`;
 }
 
+/** `status` -> `distinct_status`, the same way. */
+function distinctAlias(column: string): string {
+  return `distinct_${column.replace(/[^A-Za-z0-9_]/g, "_")}`;
+}
+
 function padded(index: number): string {
   return String(index).padStart(2, "0");
 }
@@ -78,6 +83,9 @@ interface BundleRow {
   /** The FROM clause tying the row to its CTEs. */
   from: string;
 }
+
+/** Derived checks that list rows: the fold turns each into a count, so its query goes to the appendix. */
+const LISTING_KINDS = new Set<ReconCheckKind>(["missing_keys", "orphan_keys", "duplicate_keys", "category_values"]);
 
 /** A query that could not become a status row, kept in the appendix so the detail is still to hand. */
 interface Appendix {
@@ -225,13 +233,16 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
     ...(keyColumns.length > 0
       ? [`SUM(CASE WHEN ${keyColumns.map((c) => `${c} IS NULL`).join(" OR ")} THEN 1 ELSE 0 END) AS null_key_rows`]
       : []),
-    ...facts.measureColumns.map((measure) => `SUM(${measure}) AS ${sumAlias(measure)}`)
+    ...facts.measureColumns.map((measure) => `SUM(${measure}) AS ${sumAlias(measure)}`),
+    // A label is counted, never summed: how many distinct values it holds is the comparable number.
+    ...facts.categoryColumns.map((column) => `COUNT(DISTINCT ${column}) AS ${distinctAlias(column)}`)
   ];
 
   const header = [
     `${facts.target}  <-  ${facts.sources.join(", ")}`,
     `  key: ${keyColumns.length > 0 ? `${keyColumns.join(", ")} (${facts.key.reason})` : "none found"}`,
-    `  measures: ${facts.measureColumns.length > 0 ? facts.measureColumns.join(", ") : "none on both sides"}`,
+    `  measures (totalled): ${facts.measureColumns.length > 0 ? facts.measureColumns.join(", ") : "none on both sides"}`,
+    `  labels (values compared): ${facts.categoryColumns.length > 0 ? facts.categoryColumns.join(", ") : "none on both sides"}`,
     ...facts.knownFilters.map((filter) => `  filter the transformation applies: ${tidyFilter(filter)}`)
   ];
 
@@ -239,14 +250,32 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
     statsCte(prefix, facts.target, targetExpressions, `-- ${padded(index)}. ${facts.target}  <-  ${facts.sources.join(", ")}`)
   );
 
-  facts.perSource.forEach(({ source, measures }, i) => {
+  facts.perSource.forEach(({ source, measures, categories }, i) => {
     const name = `${prefix}_s${i + 1}`;
     ctes.push(
       statsCte(name, source, [
         "COUNT(*) AS row_count",
-        ...measures.map((measure) => `SUM(${measure}) AS ${sumAlias(measure)}`)
+        ...measures.map((measure) => `SUM(${measure}) AS ${sumAlias(measure)}`),
+        ...categories.map((column) => `COUNT(DISTINCT ${column}) AS ${distinctAlias(column)}`)
       ])
     );
+  });
+
+  // One row per pair per label: how many values each side is missing that the other has. Equi-join
+  // with the NULLs already excluded, because Spark rejects a full outer join on anything else — so
+  // `IS NULL` below can only mean "no match", never "the value itself was null".
+  facts.perSource.forEach(({ source, categories }, i) => {
+    categories.forEach((column, j) => {
+      ctes.push({
+        name: `${prefix}_s${i + 1}_v${j + 1}`,
+        body:
+          `    SELECT COALESCE(SUM(CASE WHEN s.${column} IS NULL THEN 1 ELSE 0 END), 0) AS values_added,\n` +
+          `           COALESCE(SUM(CASE WHEN t.${column} IS NULL THEN 1 ELSE 0 END), 0) AS values_dropped\n` +
+          `    FROM (SELECT DISTINCT ${column} FROM ${facts.target} WHERE ${column} IS NOT NULL) t\n` +
+          `    FULL OUTER JOIN (SELECT DISTINCT ${column} FROM ${source} WHERE ${column} IS NOT NULL) s\n` +
+          `      ON t.${column} = s.${column}`
+      });
+    });
   });
 
   if (keyColumns.length > 0) {
@@ -316,6 +345,39 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
         from: `FROM ${prefix} t CROSS JOIN ${s} s`
       });
     }
+  });
+
+  facts.perSource.forEach(({ source, categories }, i) => {
+    categories.forEach((column, j) => {
+      const alias = distinctAlias(column);
+      rows.push({
+        checkName: "Label values",
+        target: facts.target,
+        source,
+        metric: `COUNT(DISTINCT ${column})`,
+        sourceValue: cast(`s.${alias}`),
+        targetValue: cast(`t.${alias}`),
+        difference: cast(`COALESCE(t.${alias}, 0) - COALESCE(s.${alias}, 0)`),
+        status: `CASE WHEN COALESCE(t.${alias}, 0) = COALESCE(s.${alias}, 0) THEN 'PASS' ELSE 'REVIEW' END`,
+        from: `FROM ${prefix} t CROSS JOIN ${prefix}_s${i + 1} s`
+      });
+
+      rows.push({
+        checkName: "Label values on one side only",
+        target: facts.target,
+        source,
+        metric: `unmatched values of ${column}`,
+        // Equal distinct counts still hide a value swapped for another, which is what this row is
+        // for. Never FAIL, whichever direction it goes: a value dropped may be the filter doing its
+        // job, and a value added may be the transformation remapping codes on purpose. The two
+        // numbers sit side by side so the reader can tell which of the two happened.
+        sourceValue: cast("v.values_dropped"),
+        targetValue: cast("v.values_added"),
+        difference: cast("v.values_added + v.values_dropped"),
+        status: "CASE WHEN v.values_added + v.values_dropped = 0 THEN 'PASS' ELSE 'REVIEW' END",
+        from: `FROM ${prefix}_s${i + 1}_v${j + 1} v`
+      });
+    });
   });
 
   facts.perSource.forEach(({ source, join }, i) => {
@@ -418,8 +480,7 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
   // ---- the row-level detail the fold turned into counts ----
 
   for (const check of script?.checks ?? []) {
-    if (check.source !== "recon") continue;
-    if (check.kind !== "missing_keys" && check.kind !== "orphan_keys" && check.kind !== "duplicate_keys") continue;
+    if (check.source !== "recon" || !LISTING_KINDS.has(check.kind)) continue;
     appendix.push({ title: check.title, description: check.description, sql: check.sql });
   }
 

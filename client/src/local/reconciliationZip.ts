@@ -53,12 +53,16 @@ function buildReadme(suite: LocalReconciliationSuite): string {
     }
 
     lines.push(`Folder: \`${hop.folder}/\``, "");
-    lines.push("| File | Target table | Sources | Key | Measures | Checks |", "| --- | --- | --- | --- | --- | --- |");
+    lines.push(
+      "| File | Target table | Sources | Key | Measures totalled | Labels compared | Checks |",
+      "| --- | --- | --- | --- | --- | --- | --- |"
+    );
     for (const script of hop.scripts) {
       lines.push(
         `| \`${script.filename}\` | \`${script.targetTable}\` | ${script.sourceTables.length} | ` +
           `${script.keyColumns.join(", ") || "—"}${script.keyConfidence === "inferred" ? " *(inferred)*" : ""} | ` +
-          `${script.measureColumns.join(", ") || "—"} | ${script.checks.length} |`
+          `${script.measureColumns.join(", ") || "—"} | ${script.categoryColumns.join(", ") || "—"} | ` +
+          `${script.checks.length} |`
       );
     }
     lines.push("");

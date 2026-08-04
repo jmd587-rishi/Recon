@@ -801,6 +801,8 @@ export interface ReconTargetPrompt {
   /** Per-source join columns, when the two sides share any. */
   joinHints: { source: string; columns: string[] }[];
   measureHint: string;
+  /** Label columns — compared by their values, never summed. Stated so the model doesn't sum them. */
+  categoryHint: string;
   filterHint: string[];
   /** Titles of the checks Recon has already written for this table — not to be repeated. */
   existingChecks: string[];
@@ -825,6 +827,7 @@ export interface ReconLlmScript {
 const RECON_KINDS: readonly ReconCheckKind[] = [
   "row_count",
   "measure_totals",
+  "category_values",
   "missing_keys",
   "orphan_keys",
   "duplicate_keys",
@@ -844,7 +847,8 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         ...t.columns.map((c) => `columns of ${c.table}${c.note ? ` [${c.note}]` : ""}: ${c.columns}`),
         `key columns found: ${t.keyHint}`,
         ...t.joinHints.map((j) => `shares with ${j.source}: ${j.columns.join(", ")}`),
-        `measure columns found: ${t.measureHint}`,
+        `measure columns found (safe to total): ${t.measureHint}`,
+        `label columns found (compare their values, never total them): ${t.categoryHint}`,
         ...t.filterHint.map((f) => `filter the transformation applies: ${f}`),
         `checks ALREADY WRITTEN for this table (do not repeat these): ${
           t.existingChecks.length > 0 ? t.existingChecks.join("; ") : "(none — the schema grounded none of them)"
@@ -866,9 +870,9 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         "columns a static analysis found, the filters the transformation applies, and the transformation " +
         "SQL itself. " +
         "The standard reconciliation checks — row counts against each source, totals for the shared " +
-        "money/quantity columns, source keys missing from the target, target keys with no source row, " +
-        "duplicate keys, null keys — HAVE ALREADY BEEN WRITTEN and are listed under `checks ALREADY " +
-        "WRITTEN` for each table. Do not write them again. " +
+        "money/quantity columns, the value sets of the shared label columns, source keys missing from " +
+        "the target, target keys with no source row, duplicate keys, null keys — HAVE ALREADY BEEN " +
+        "WRITTEN and are listed under `checks ALREADY WRITTEN` for each table. Do not write them again. " +
         "Your job is only the checks those standard ones miss, which you can know only by reading this " +
         "transformation's SQL. Look specifically for: an aggregation that changes grain (so a row count " +
         "is expected to differ and something else must tie out), dedup or DISTINCT that can silently " +
@@ -891,9 +895,12 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         "(5) `description` states in one or two sentences what a non-empty result means for this " +
         "pipeline, and names the part of the transformation that motivated the check — not what the SQL " +
         "syntactically does. " +
+        "(6) Never SUM, AVG or otherwise total a label column — a status, type, code, flag, region or " +
+        "period. Only the columns listed as measures are safe to total; compare a label by its distinct " +
+        "values, its row count per value, or a rule its values must obey. " +
         'Respond with ONLY compact JSON: {"scripts": [{"targetTable": "<exact name from the input>", ' +
         '"summary": "<1-2 sentences: what this transformation does to the data and what to watch>", ' +
-        '"checks": [{"kind": "measure_totals|missing_keys|orphan_keys|duplicate_keys|null_keys|custom", ' +
+        '"checks": [{"kind": "measure_totals|category_values|missing_keys|orphan_keys|duplicate_keys|null_keys|custom", ' +
         '"title": "<short label>", "description": "<what a non-empty result means>", "sql": "<the statement>"}], ' +
         '"notes": ["<a check you could not write, and why>"]}]}, one entry per target table. ' +
         "No markdown, no text outside the JSON object."

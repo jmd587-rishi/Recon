@@ -430,6 +430,8 @@ export interface LocalFixReport {
 export type ReconCheckKind =
   | "row_count"
   | "measure_totals"
+  /** The value sets of a label column compared, which is what a label gets instead of a total. */
+  | "category_values"
   | "missing_keys"
   | "orphan_keys"
   | "duplicate_keys"
@@ -473,7 +475,10 @@ export interface ReconScript {
   keyColumns: string[];
   keyConfidence: ReconKeyConfidence;
   keyReason: string;
+  /** Columns totalled on both sides. */
   measureColumns: string[];
+  /** Label columns compared as sets of values instead — a status or a period has no meaningful sum. */
+  categoryColumns: string[];
   /** WHERE predicates the building statements apply — the expected, explainable row loss. */
   knownFilters: string[];
   builtBy: { path: string; statementIndex: number }[];

@@ -105,6 +105,7 @@ function promptFor(facts: ReconTargetFacts, columns: ColumnIndex, baseChecks: Re
       .filter((p) => p.join.columns.length > 0)
       .map((p) => ({ source: p.source, columns: p.join.columns })),
     measureHint: facts.measureColumns.length > 0 ? facts.measureColumns.join(", ") : "none found on both sides",
+    categoryHint: facts.categoryColumns.length > 0 ? facts.categoryColumns.join(", ") : "none found on both sides",
     filterHint: facts.knownFilters,
     existingChecks: baseChecks.map((c) => c.title),
     transformationSql
