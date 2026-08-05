@@ -321,20 +321,34 @@ function isNamedLabel(column: ColumnInfo): boolean {
  * unexplained difference. After that a name that says label outright beats one that is only short
  * enough to look like a code. Ties keep the order the table declares them in.
  */
-function rankedCategories(candidates: ColumnInfo[], filters: string[]): string[] {
+function rankedCategories(candidates: { column: ColumnInfo; source: string }[], filters: string[]): ColumnPair[] {
   const filterText = filters.join(" ").toLowerCase().replace(/[`[\]"]/g, "");
   const mentioned = (name: string) => new RegExp(`\\b${name.replace(/[^\w]/g, "\\$&")}\\b`).test(filterText);
   const rank = (column: ColumnInfo) => (mentioned(column.name) ? 0 : isNamedLabel(column) ? 1 : 2);
 
   return candidates
-    .map((column, i) => ({ column, i }))
-    .sort((a, b) => rank(a.column) - rank(b.column) || a.i - b.i)
-    .map((entry) => entry.column.name);
+    .map((entry, i) => ({ entry, i }))
+    .sort((a, b) => rank(a.entry.column) - rank(b.entry.column) || a.i - b.i)
+    .map(({ entry }) => ({ target: entry.column.name, source: entry.source }));
+}
+
+/**
+ * A column of the target paired with the column of the source it corresponds to.
+ *
+ * Usually the same name, and not always: a transformation that writes
+ * `prm.jman_product_family AS product_family` produces a target column whose name belongs to a
+ * *different* source column. Comparing the two `product_family`s then compares things that were never
+ * meant to match, and the difference it reports is an artefact of the naming. `kindRef` already
+ * records where each column came from, so the pairing follows that when it can.
+ */
+export interface ColumnPair {
+  target: string;
+  source: string;
 }
 
 interface SharedColumns {
   /** Totalled on both sides. */
-  measures: string[];
+  measures: ColumnPair[];
   /**
    * Measures no DDL declares a numeric type for on either side — their `SUM` is wrapped, see
    * `measureExpr`. A column called `net_change` in a table built by `SELECT ... INTO` has no declared
@@ -343,7 +357,9 @@ interface SharedColumns {
    */
   untyped: string[];
   /** Compared as sets of values on both sides, most worth checking first. */
-  categories: string[];
+  categories: ColumnPair[];
+  /** Target columns paired with a differently-named source column, worth saying out loud. */
+  renamed: string[];
 }
 
 /**
@@ -355,27 +371,35 @@ function sharedColumns(
   source: TableColumns | undefined,
   filters: string[]
 ): SharedColumns {
-  if (!target || !source) return { measures: [], untyped: [], categories: [] };
+  if (!target || !source) return { measures: [], untyped: [], categories: [], renamed: [] };
   const sourceByName = new Map(source.columns.map((c) => [c.name, c]));
 
-  const measures: string[] = [];
+  const measures: ColumnPair[] = [];
   const untyped: string[] = [];
-  const categories: ColumnInfo[] = [];
+  const categories: { column: ColumnInfo; source: string }[] = [];
+  const renamed: string[] = [];
+
   for (const column of target.columns) {
-    const counterpart = sourceByName.get(column.name);
+    // Where the transformation says this column came from, ahead of whatever shares its name: a
+    // target `product_family` built from `jman_product_family` corresponds to *that*, and the
+    // source's own `product_family` is a different column that happens to be spelled the same.
+    const origin = column.kindRef && column.kindRef !== column.name ? sourceByName.get(column.kindRef) : undefined;
+    const counterpart = origin ?? sourceByName.get(column.name);
     if (!counterpart) continue;
-    // Same name, provably different types — comparing them is a conversion error, not a check.
+    if (origin) renamed.push(`${column.name} <- ${origin.name}`);
+
+    // Provably different types — comparing them is a conversion error, not a check.
     if (kindsConflict(column.kind, counterpart.kind)) continue;
     const role = sharedRole(column, counterpart);
     if (role === "measure") {
-      measures.push(column.name);
+      measures.push({ target: column.name, source: counterpart.name });
       // Both sides have to declare it numeric for the total to be safe. One side declaring it says
       // nothing about the column being summed on the other.
       if (column.kind !== "numeric" || counterpart.kind !== "numeric") untyped.push(column.name);
-    } else if (role === "categorical") categories.push(column);
+    } else if (role === "categorical") categories.push({ column, source: counterpart.name });
   }
 
-  return { measures, untyped, categories: rankedCategories(categories, filters) };
+  return { measures, untyped, categories: rankedCategories(categories, filters), renamed: unique(renamed) };
 }
 
 // ---- SQL fragments ----
@@ -495,20 +519,21 @@ function rowCountCheck(target: string, perSource: ReconSource[]): ReconCheck | n
 
 function measureCheck(
   target: string,
-  perSource: { source: string; measures: string[] }[],
+  perSource: { source: string; measures: ColumnPair[] }[],
   untyped: Set<string>
 ): ReconCheck | null {
   const blocks = perSource.flatMap(({ source, measures }) =>
     measures.map((measure) => {
-      const typed = !untyped.has(measure);
+      const typed = !untyped.has(measure.target);
+      const label = measure.target === measure.source ? measure.target : `${measure.target} <- ${measure.source}`;
       return (
-        `SELECT ${quoted(measure)} AS measure,\n` +
+        `SELECT ${quoted(label)} AS measure,\n` +
         `       ${quoted(source)} AS source_table,\n` +
-        `       ${sumOf(source, measure, typed)} AS source_total,\n` +
-        `       ${sumOf(target, measure, typed)} AS target_total,\n` +
+        `       ${sumOf(source, measure.source, typed)} AS source_total,\n` +
+        `       ${sumOf(target, measure.target, typed)} AS target_total,\n` +
         // An empty table sums to NULL, and `NULL - NULL` would read as "no difference" at a glance.
-        `       COALESCE(${sumOf(target, measure, typed)}, 0) - ` +
-        `COALESCE(${sumOf(source, measure, typed)}, 0) AS total_diff`
+        `       COALESCE(${sumOf(target, measure.target, typed)}, 0) - ` +
+        `COALESCE(${sumOf(source, measure.source, typed)}, 0) AS total_diff`
       );
     })
   );
@@ -535,11 +560,16 @@ function measureCheck(
  * isn't an equality, which rules out the usual `OR (a IS NULL AND b IS NULL)` null-matching. Nothing
  * is lost by it: a category going wholly NULL in the target shows up as its values disappearing.
  */
-function categoryValuesCheck(target: string, source: string, column: string): ReconCheck {
+function categoryValuesCheck(target: string, source: string, pair: ColumnPair): ReconCheck {
+  const column = pair.target;
+  const sourceColumn = pair.source;
   return {
     kind: "category_values",
     source: "recon",
-    title: `Values of ${column} against ${source}`,
+    title:
+      column === sourceColumn
+        ? `Values of ${column} against ${source}`
+        : `Values of ${column} against ${source}.${sourceColumn}, which it is built from`,
     description:
       `${column} is a label rather than a quantity, so the two sides are compared as sets of values ` +
       "instead of being summed. A value the source has and the target hasn't was filtered or remapped " +
@@ -744,8 +774,8 @@ interface TargetGroup {
 export interface ReconSource {
   source: string;
   join: KeyChoice;
-  measures: string[];
-  categories: string[];
+  measures: ColumnPair[];
+  categories: ColumnPair[];
   /** `driver` supplies the target's rows; `lookup` is joined in for its columns. */
   role: SourceRole;
   /** The transformation collapses rows between here and the target, so counts must differ. */
@@ -917,11 +947,17 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
   const untyped = new Set<string>();
   /** Columns the two sides share by name but not by type — see `comparable`. */
   const mismatched = new Set<string>();
+  /** Target columns compared against a differently-named source column they are built from. */
+  const renamedColumns = new Set<string>();
   const perSource: ReconSource[] = reconciled.map((source) => {
     const sourceColumns = emittableColumns(columns.get(source), unwritable);
     const shared = sharedColumns(targetColumns, sourceColumns, knownFilters);
-    overflow.push(...shared.measures.slice(MAX_MEASURES), ...shared.categories.slice(MAX_CATEGORIES));
+    overflow.push(
+      ...shared.measures.slice(MAX_MEASURES).map((p) => p.target),
+      ...shared.categories.slice(MAX_CATEGORIES).map((p) => p.target)
+    );
     for (const measure of shared.untyped) untyped.add(measure);
+    for (const pair of shared.renamed) renamedColumns.add(pair);
 
     const how = usageOf(source);
     // A grain column has to be a column this source really has, or the check won't run.
@@ -944,9 +980,29 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
     };
   });
 
-  const measureColumns = unique(perSource.flatMap((p) => p.measures));
+  const measureColumns = unique(perSource.flatMap((p) => p.measures.map((m) => m.target)));
   const untypedMeasures = measureColumns.filter((measure) => untyped.has(measure));
-  const categoryColumns = unique(perSource.flatMap((p) => p.categories));
+  const categoryColumns = unique(perSource.flatMap((p) => p.categories.map((c) => c.target)));
+
+  // Columns the code hardcodes: every row carries the same literal, which is a finding on its own.
+  const hardcoded = (targetColumns?.columns ?? [])
+    .filter((column) => column.constant)
+    .map((column) => `${column.name} = ${column.constant}`);
+  if (hardcoded.length > 0) {
+    notes.push(
+      `${hardcoded.join(", ")} — ${hardcoded.length === 1 ? "this column is" : "these columns are"} set to a ` +
+        `constant by the transformation, so every row of ${group.target} carries the same value. That is ` +
+        "either deliberate or a placeholder nobody came back to fill in; no check can tell you which, " +
+        "and no check will ever flag it, so it is reported here."
+    );
+  }
+  if (renamedColumns.size > 0) {
+    notes.push(
+      `${Array.from(renamedColumns).sort().join(", ")} — the target column is built from a source column ` +
+        "of a different name, so it is compared with that one rather than with whatever shares its own " +
+        "name in the source."
+    );
+  }
   if (measureColumns.length === 0) {
     notes.push("No measure column is present on both sides, so there are no totals to compare.");
   }

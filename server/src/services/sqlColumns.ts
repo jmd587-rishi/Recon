@@ -42,8 +42,17 @@ export interface ColumnInfo {
    * The column this one is a plain copy of, when its own expression says nothing about its type
    * (`month_date AS date_key`). Resolved against the tables the statement reads in a later pass, which
    * is how a column three CTEs from its origin still gets a type.
+   *
+   * It is also what the column *corresponds to* upstream, which is how a renamed column is compared
+   * with the column it actually came from rather than with whatever shares its name.
    */
   kindRef?: string;
+  /**
+   * The literal every row of this column is set to, when the code hardcodes it (`'TBC' AS
+   * customer_region`). A placeholder nobody filled in is worth reporting on its own, and a check
+   * written against such a column can only ever confirm the placeholder.
+   */
+  constant?: string;
 }
 
 /** Which of the three extraction paths produced a table's columns. */
@@ -688,6 +697,31 @@ function unique(values: string[]): string[] {
  * one. No DDL stated these types, so `dataType` stays null — what is known is the *kind*, which is
  * what decides whether two same-named columns are the same thing.
  */
+/**
+ * The literal a column is hardcoded to, following the same CTE chain a type follows.
+ *
+ * `'TBC' AS customer_region` in the final select is a placeholder that will be the value of every row
+ * in the table. Recognising it is what lets Recon report it as a finding in its own right, rather
+ * than leaving it to be discovered by a check whose passing means the placeholder is intact.
+ */
+function constantThroughCtes(expression: string, cteColumns: Map<string, string[]>, depth = 0): string | null {
+  const text = expression.replace(/\s+/g, " ").trim();
+  if (!text || depth >= MAX_STAR_DEPTH) return null;
+
+  if (/^'(?:''|[^'])*'$/.test(text) || /^[-+]?\d+(?:\.\d+)?$/.test(text)) return text;
+
+  // A plain copy of a column that is itself constant is constant too.
+  if (PLAIN_REF_RE.test(text) && !NILADIC_KINDS[text.split(".").pop()!.toLowerCase()]) {
+    const bare = text.split(".").pop()!.toLowerCase();
+    for (const candidate of cteColumns.get(bare) ?? []) {
+      if (candidate.replace(/\s+/g, " ").trim().toLowerCase() === bare) continue;
+      const deeper = constantThroughCtes(candidate, cteColumns, depth + 1);
+      if (deeper) return deeper;
+    }
+  }
+  return null;
+}
+
 function named(
   names: string[],
   expressions?: Map<string, string>,
@@ -698,12 +732,14 @@ function named(
     const inferred = expression
       ? kindThroughCtes(expression, cteColumns)
       : { kind: "other" as const, ref: null };
+    const constant = expression ? constantThroughCtes(expression, cteColumns) : null;
     return {
       name,
       dataType: null,
       kind: inferred.kind,
       isDeclaredKey: false,
-      ...(inferred.ref ? { kindRef: inferred.ref } : {})
+      ...(inferred.ref ? { kindRef: inferred.ref } : {}),
+      ...(constant ? { constant } : {})
     };
   });
 }

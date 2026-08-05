@@ -286,8 +286,11 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
         ...(countable && entry.grainColumns.length > 0
           ? [`${distinctGrainCount(source, entry.grainColumns)} AS grain_count`]
           : []),
-        ...measures.map((measure) => `${total(measure)} AS ${sumAlias(measure)}`),
-        ...categories.map((column) => `COUNT(DISTINCT ${column}) AS ${distinctAlias(column)}`)
+        // The column read is the source's own; the alias is keyed on the *target's* name so the row
+        // below can compare `t.<alias>` with `s.<alias>` even where the two columns are named
+        // differently — which they are whenever the transformation renames one.
+        ...measures.map((measure) => `${total(measure.source)} AS ${sumAlias(measure.target)}`),
+        ...categories.map((column) => `COUNT(DISTINCT ${column.source}) AS ${distinctAlias(column.target)}`)
       ])
     );
   });
@@ -299,12 +302,16 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
     categories.forEach((column, j) => {
       ctes.push({
         name: `${prefix}_s${i + 1}_v${j + 1}`,
+        // Each side reads its own column name and both are projected as `value`, so the join is
+        // written once whether or not the transformation renamed the column.
         body:
-          `    SELECT COALESCE(SUM(CASE WHEN s.${column} IS NULL THEN 1 ELSE 0 END), 0) AS values_added,\n` +
-          `           COALESCE(SUM(CASE WHEN t.${column} IS NULL THEN 1 ELSE 0 END), 0) AS values_dropped\n` +
-          `    FROM (SELECT DISTINCT ${column} FROM ${facts.target} WHERE ${column} IS NOT NULL) t\n` +
-          `    FULL OUTER JOIN (SELECT DISTINCT ${column} FROM ${source} WHERE ${column} IS NOT NULL) s\n` +
-          `      ON t.${column} = s.${column}`
+          `    SELECT COALESCE(SUM(CASE WHEN s.value IS NULL THEN 1 ELSE 0 END), 0) AS values_added,\n` +
+          `           COALESCE(SUM(CASE WHEN t.value IS NULL THEN 1 ELSE 0 END), 0) AS values_dropped\n` +
+          `    FROM (SELECT DISTINCT ${column.target} AS value FROM ${facts.target}\n` +
+          `          WHERE ${column.target} IS NOT NULL) t\n` +
+          `    FULL OUTER JOIN (SELECT DISTINCT ${column.source} AS value FROM ${source}\n` +
+          `                     WHERE ${column.source} IS NOT NULL) s\n` +
+          `      ON t.value = s.value`
       });
     });
   });
@@ -373,12 +380,15 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
   facts.perSource.forEach(({ source, measures }, i) => {
     const s = `${prefix}_s${i + 1}`;
     for (const measure of measures) {
-      const column = sumAlias(measure);
+      const column = sumAlias(measure.target);
       rows.push({
         checkName: "Measure total",
         target: facts.target,
         source,
-        metric: `SUM(${measure})`,
+        metric:
+          measure.target === measure.source
+            ? `SUM(${measure.target})`
+            : `SUM(${measure.target}) against SUM(${measure.source})`,
         sourceValue: cast(`s.${column}`),
         targetValue: cast(`t.${column}`),
         difference: cast(`COALESCE(t.${column}, 0) - COALESCE(s.${column}, 0)`),
@@ -390,12 +400,14 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
 
   facts.perSource.forEach(({ source, categories }, i) => {
     categories.forEach((column, j) => {
-      const alias = distinctAlias(column);
+      const alias = distinctAlias(column.target);
+      const label =
+        column.target === column.source ? column.target : `${column.target} against ${column.source}`;
       rows.push({
         checkName: "Label values",
         target: facts.target,
         source,
-        metric: `COUNT(DISTINCT ${column})`,
+        metric: `COUNT(DISTINCT ${label})`,
         sourceValue: cast(`s.${alias}`),
         targetValue: cast(`t.${alias}`),
         difference: cast(`COALESCE(t.${alias}, 0) - COALESCE(s.${alias}, 0)`),
@@ -407,7 +419,7 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
         checkName: "Label values on one side only",
         target: facts.target,
         source,
-        metric: `unmatched values of ${column}`,
+        metric: `unmatched values of ${label}`,
         // Equal distinct counts still hide a value swapped for another, which is what this row is
         // for. Never FAIL, whichever direction it goes: a value dropped may be the filter doing its
         // job, and a value added may be the transformation remapping codes on purpose. The two

@@ -277,7 +277,9 @@ export type CheckProblemKind =
   | "misplaced_function"
   | "predicate_as_value"
   | "unbalanced_sql"
-  | "type_clash";
+  | "type_clash"
+  | "returns_a_count"
+  | "vacuous_check";
 
 export interface CheckProblem {
   kind: CheckProblemKind;
@@ -512,6 +514,39 @@ function predicateOperands(sql: string): CheckProblem[] {
   return problems;
 }
 
+/**
+ * A check whose outermost select list is nothing but aggregates, with no `GROUP BY`.
+ *
+ * Such a statement returns exactly one row holding a number, and the bundle counts the rows a check
+ * returns — so it reports `1`, meaning "this situation exists", in the same column where every other
+ * check reports how many rows are affected. Two different meanings in one column is worse than a
+ * missing check: `1` reads as one bad row. Counting is Recon's job; a check returns the rows.
+ */
+function returnsACount(sql: string, depths: number[]): boolean {
+  const select = /\bselect\b/i.exec(sql);
+  if (!select) return false;
+  const from = /\bfrom\b/i.exec(sql);
+  if (!from || from.index < select.index) return false;
+
+  // Only the outer list and the outer GROUP BY: a subquery's own aggregates and grouping sit deeper
+  // and say nothing about the shape of what this statement returns.
+  const base = depths[select.index] ?? 0;
+  const groupBy = /\bgroup\s+by\b/gi;
+  let group: RegExpExecArray | null;
+  while ((group = groupBy.exec(sql))) {
+    if ((depths[group.index] ?? base) === base) return false;
+  }
+
+  const list = sql.slice(select.index + select[0].length, from.index);
+  const outer = [...list]
+    .map((ch, i) => ((depths[select.index + select[0].length + i] ?? base) === base ? ch : " "))
+    .join("");
+
+  const items = outer.split(",").map((item) => item.trim()).filter(Boolean);
+  if (items.length === 0) return false;
+  return items.every((item) => /^(?:sum|count|count_big|avg|min|max)\s*\(/i.test(item.replace(/^distinct\s+/i, "")));
+}
+
 /** Words that end an operand, so a comparison's right-hand side stops where the expression does. */
 const OPERAND_BOUNDARY = new Set([
   "and", "or", "then", "when", "else", "end", "group", "order", "having", "union", "except",
@@ -620,6 +655,41 @@ function typeClashes(
   return problems;
 }
 
+/**
+ * Checks that test a column against the very constant the code assigns it.
+ *
+ * `WHERE t.customer_region <> 'TBC'` against a transformation whose select list reads
+ * `'TBC' AS customer_region` can only ever return nothing. It passes, and its passing is read as
+ * health — when what it has actually confirmed is that a placeholder is universally applied. A check
+ * that cannot fail is worse than no check, because it is counted among the ones that did.
+ *
+ * The hardcoding itself is worth reporting, and `targetFacts` reports it as a note, deterministically
+ * and without needing anyone to think of writing a check for it.
+ */
+function vacuousOnConstant(
+  sql: string,
+  facts: ColumnFacts,
+  bound: { alias: string | null; table: string }[]
+): CheckProblem[] {
+  const problems: CheckProblem[] = [];
+
+  for (const entry of bound) {
+    for (const column of facts.index.get(entry.table)?.columns ?? []) {
+      if (!column.constant) continue;
+      const name = entry.alias ?? entry.table.split(".").pop()!;
+      const literal = column.constant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const test = new RegExp(`\\b${name}\\s*\\.\\s*${column.name}\\s*(?:=|<>|!=)\\s*${literal}`, "i");
+      if (!test.test(sql)) continue;
+      problems.push({
+        kind: "vacuous_check",
+        detail: `${entry.table}.${column.name} is set to ${column.constant} by the code, so testing it against ${column.constant} can never fail`
+      });
+    }
+  }
+
+  return problems;
+}
+
 /** A total taken over one plain column — the only shape whose operand type can be checked. */
 const TOTAL_RE = /\b(?:sum|avg)\s*\(\s*(?:distinct\s+)?([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*)\s*\)/gi;
 
@@ -707,6 +777,9 @@ export function checkProblems(sql: string, facts: ColumnFacts, tables: string[])
   // Independent of what the tables are: these are about the shape of the statement itself.
   for (const problem of misplacedFunctions(scan, depths)) report(problem.kind, problem.detail);
   for (const problem of predicateOperands(scan)) report(problem.kind, problem.detail);
+  if (returnsACount(scan, depths)) {
+    report("returns_a_count", "its select list is only aggregates, so it returns one row holding a number");
+  }
 
   const bindings = tableBindings(scan);
   const bound = bindings.flatMap((binding) => {
@@ -751,8 +824,11 @@ export function checkProblems(sql: string, facts: ColumnFacts, tables: string[])
     }
   }
 
-  // Needs the resolved tables, so it runs here rather than with the shape checks above.
+  // Need the resolved tables, so they run here rather than with the shape checks above. The constant
+  // test reads the statement with its literals intact, which `scan` has blanked out.
   for (const problem of typeClashes(scan, facts, bound)) report(problem.kind, problem.detail);
+  const withLiterals = stripSqlComments(sql).replace(/[`[\]"]/g, "");
+  for (const problem of vacuousOnConstant(withLiterals, facts, bound)) report(problem.kind, problem.detail);
 
   const defined = definedNames(scan, bindings);
   const bare = bareColumnRefs(scan, defined, depths);
@@ -817,7 +893,9 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
     misplaced: [] as string[],
     predicates: [] as string[],
     unbalanced: [] as string[],
-    clashes: [] as string[]
+    clashes: [] as string[],
+    counts: 0,
+    vacuous: [] as string[]
   };
 
   for (const check of written.checks) {
@@ -840,6 +918,8 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
         else if (problem.kind === "predicate_as_value") dropped.predicates.push(problem.detail);
         else if (problem.kind === "unbalanced_sql") dropped.unbalanced.push(problem.detail);
         else if (problem.kind === "type_clash") dropped.clashes.push(problem.detail);
+        else if (problem.kind === "returns_a_count") dropped.counts++;
+        else if (problem.kind === "vacuous_check") dropped.vacuous.push(problem.detail);
         else dropped.ambiguous.push(problem.detail);
       }
       continue;
@@ -884,6 +964,20 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
       `A suggested check did not parse — it left ${unique(dropped.unbalanced).join(", ")} — and was ` +
         "dropped. One stray quote does not break a single check, it breaks every statement after it in " +
         "the file, so nothing that fails to lex is written out."
+    );
+  }
+  if (dropped.vacuous.length > 0) {
+    notes.push(
+      `A suggested check could never fail — ${unique(dropped.vacuous).join("; ")} — and was dropped. A ` +
+        "check that always passes is worse than no check, because it is counted among the ones that " +
+        "did. The hardcoded column is reported above in its own right."
+    );
+  }
+  if (dropped.counts > 0) {
+    notes.push(
+      `${dropped.counts} suggested check${dropped.counts === 1 ? "" : "s"} returned a count rather than ` +
+        "the offending rows, which would have read as that many bad rows in the result. Recon counts " +
+        "what a check returns, so a check must return the rows themselves."
     );
   }
   if (dropped.clashes.length > 0) {

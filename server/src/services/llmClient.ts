@@ -935,9 +935,17 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         "To compare totals, aggregate in a subquery or a CTE and compare the results; to compare " +
         "against a maximum, put it in a scalar subquery. `WHERE SUM(a) <> SUM(b)` and " +
         "`WHERE d >= MAX(d) OVER ()` are both errors that stop the whole file. " +
-        "(4) A check must return NO rows when the data is correct, except count/total comparisons, which " +
-        "return one row per pair being compared. " +
-        "(5) `description` states in one or two sentences what a non-empty result means for this " +
+        "(4) A check must return NO rows when the data is correct, and one row PER OFFENDING ROW OR " +
+        "GROUP otherwise. Never `SELECT COUNT(*)` as the whole check: the tool counts the rows your " +
+        "check returns, so a count comes back as though that many rows were wrong. Return the rows. " +
+        "(4a) Never write a check that passes when something suspicious is true. If a column is " +
+        "hardcoded to a literal, `WHERE col <> 'literal'` returns nothing and reads as healthy — the " +
+        "tool already reports hardcoded columns by itself, so do not write that check. Every check you " +
+        "write must be one that CAN fail on this pipeline; if you cannot construct a failing case for " +
+        "it, it is not a check, and it belongs in `notes` instead. " +
+        "(5) `title` states the condition the SQL actually tests, so a reader scanning a result table " +
+        "knows what a non-zero row means without opening the query — not the mechanism that motivated " +
+        "it. `description` then states in one or two sentences what a non-empty result means for this " +
         "pipeline, and names the part of the transformation that motivated the check — not what the SQL " +
         "syntactically does. " +
         "(6) Never SUM, AVG or otherwise total a label column — a status, type, code, flag, region or " +
