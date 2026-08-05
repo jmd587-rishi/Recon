@@ -215,7 +215,8 @@ function parseNotebooks(notebooks: NotebookInput[], skipped: LocalSkippedFile[])
       skipped.push({ path: notebook.path, reason: "no table reads or writes found" });
       continue;
     }
-    files.push({ path: notebook.path, content: notebook.source, statements: [], facts });
+    // No byte spans, so a correction cannot be written back into the notebook — see `codeFiles.ts`.
+    files.push({ path: notebook.path, content: notebook.source, statements: [], facts, spliceable: false });
   }
 
   return files;

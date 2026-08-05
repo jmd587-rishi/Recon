@@ -797,6 +797,61 @@ export interface ReconGrounding {
   columnFacts: ColumnFacts;
 }
 
+export interface LineageStatement {
+  fact: LineageFact;
+  /** 0 builds the target itself, 1 builds one of its sources, and so on outward. */
+  distance: number;
+  /** The table this statement builds, so the reader knows where in the chain it sits. */
+  builds: string;
+}
+
+/**
+ * The statements that build a table, then the ones that build what *it* reads, outward to `maxHops`.
+ *
+ * This is what "read the code for this table" has to mean in a warehouse, because a table is only
+ * half-described by the statement that writes it. `datamart.fact_arr` selects `month_date AS
+ * date_key`; whether that is a date, and what it was filtered by, is written in `trn_revenue`'s
+ * script one hop up. Following the lineage brings that in and — just as importantly — brings in
+ * nothing else: the other eleven tables of the same layer are not context, they are noise competing
+ * for the same budget.
+ */
+export function lineageStatements(all: LineageFact[], target: string, maxHops: number): LineageStatement[] {
+  const writers = new Map<string, LineageFact[]>();
+  for (const fact of all) {
+    if (!fact.targetTable || isTempTable(fact.targetTable)) continue;
+    const key = fact.targetTable.toLowerCase();
+    writers.set(key, [...(writers.get(key) ?? []), fact]);
+  }
+
+  const out: LineageStatement[] = [];
+  const seenTables = new Set<string>();
+  const seenFacts = new Set<LineageFact>();
+  let frontier = [target.toLowerCase()];
+
+  for (let distance = 0; distance <= maxHops && frontier.length > 0; distance++) {
+    const next: string[] = [];
+
+    for (const table of frontier) {
+      if (seenTables.has(table)) continue;
+      seenTables.add(table);
+
+      for (const fact of writers.get(table) ?? []) {
+        if (seenFacts.has(fact)) continue;
+        seenFacts.add(fact);
+        out.push({ fact, distance, builds: fact.targetTable! });
+        for (const source of fact.sourceTables) {
+          const key = source.toLowerCase();
+          if (!isTempTable(source) && !seenTables.has(key)) next.push(key);
+        }
+      }
+    }
+
+    frontier = next;
+  }
+
+  return out;
+}
+
 /** Groups the statements of a hop by the table they build, keeping only sources inside the hop. */
 function groupByTarget(facts: LineageFact[], fromSchema: string | null, toSchema: string | null): TargetGroup[] {
   const groups = new Map<string, TargetGroup>();

@@ -382,6 +382,20 @@ const FUNCTION_KINDS: Record<string, ColumnKind> = {
   ntile: "numeric", checksum: "numeric", binary_checksum: "numeric"
 };
 
+/**
+ * Functions callable with no parentheses, so a bare word can genuinely be one of them. Everything
+ * else in `FUNCTION_KINDS` needs an argument list, which makes a bare occurrence a column name.
+ */
+const NILADIC_KINDS: Record<string, ColumnKind> = {
+  current_timestamp: "date",
+  current_date: "date",
+  current_time: "date",
+  sysdatetime: "date",
+  current_user: "text",
+  session_user: "text",
+  system_user: "text"
+};
+
 /** Functions whose type is their argument's, so the answer is one level down. */
 const PASSTHROUGH: Record<string, number> = {
   isnull: 0, coalesce: 0, nullif: 0, min: 0, max: 0, iif: 1, ifnull: 0, nvl: 0, first_value: 0,
@@ -417,8 +431,10 @@ export function inferExpressionKind(expression: string, depth = 0): ExpressionKi
 
   if (PLAIN_REF_RE.test(text)) {
     const bare = text.split(".").pop()!.toLowerCase();
-    // `CURRENT_TIMESTAMP` and friends are values written like columns.
-    const known = FUNCTION_KINDS[bare];
+    // Only the niladic functions are values written like columns. Everything else spelled without
+    // parentheses is a column, and a calendar table's `month` column is exactly that — reading it as
+    // the `MONTH()` function types the column as a number and then compares a date against one.
+    const known = NILADIC_KINDS[bare];
     return known ? { kind: known, ref: null } : { kind: "other", ref: bare };
   }
 

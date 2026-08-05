@@ -9,13 +9,8 @@ import type {
   NotebookCorrection,
   Table
 } from "../types/index.js";
-import {
-  applySqlCorrections,
-  correctedSqlFilename,
-  isSqlFile,
-  splitSqlStatements,
-  type SqlStatement
-} from "./sqlFileParser.js";
+import { codeFileKind, readCodeFile } from "./codeFiles.js";
+import { applySqlCorrections, correctedSqlFilename, type SqlStatement } from "./sqlFileParser.js";
 import {
   buildLineageGraph,
   isTempTable,
@@ -42,6 +37,11 @@ export interface ParsedLocalFile {
   statements: SqlStatement[];
   /** One fact per statement, `cellIndex` being the statement's ordinal in the file. */
   facts: LineageFact[];
+  /**
+   * Whether a corrected statement can be written back into this file. Only a `.sql` file carries the
+   * byte spans that makes the splice exact; a notebook's fixes are shown but not applied to the file.
+   */
+  spliceable: boolean;
 }
 
 export interface LocalProject {
@@ -108,21 +108,38 @@ export function parseLocalProject(folderName: string, inputs: LocalSqlFileInput[
   const skipped: LocalSkippedFile[] = [];
 
   for (const input of inputs) {
-    if (!isSqlFile(input.path)) {
-      skipped.push({ path: input.path, reason: "not a .sql file" });
+    const kind = codeFileKind(input.path);
+    if (!kind) {
+      skipped.push({ path: input.path, reason: "not a code file Recon can read" });
       continue;
     }
-    const statements = splitSqlStatements(input.content);
-    if (statements.length === 0) {
-      skipped.push({ path: input.path, reason: "no SQL statements found" });
+
+    const read = readCodeFile(input.path, input.content);
+    if (!read) {
+      skipped.push({ path: input.path, reason: kind === "sql" ? "no SQL statements found" : "no code cells found" });
       continue;
     }
-    const facts: LineageFact[] = statements.map((stmt) => {
-      const { sourceTables, targetTable } = splitSqlTablesByOp(stmt.sql);
-      return { notebookPath: input.path, cellIndex: stmt.index, sourceTables, targetTable, rawSql: stmt.sql };
+
+    // A notebook's lineage is already resolved cell by cell by `extractLineageFacts`, which knows
+    // `spark.sql()`, the DataFrame API and `%sql` cells. A SQL file's unit is the statement, so its
+    // tables are split here.
+    const facts: LineageFact[] =
+      kind === "sql"
+        ? resolveTempTableSources(
+            read.statements.map((stmt) => {
+              const { sourceTables, targetTable } = splitSqlTablesByOp(stmt.sql);
+              return { notebookPath: input.path, cellIndex: stmt.index, sourceTables, targetTable, rawSql: stmt.sql };
+            })
+          )
+        : read.facts;
+
+    files.push({
+      path: input.path,
+      content: input.content,
+      statements: read.statements,
+      facts,
+      spliceable: read.spliceable
     });
-    // Temp tables are scoped to the script that creates them, so each file resolves on its own.
-    files.push({ path: input.path, content: input.content, statements, facts: resolveTempTableSources(facts) });
   }
 
   // Which schemas the project uses has to be settled before any folder-implied schema can be
@@ -283,7 +300,9 @@ export function rebuildCorrectedFiles(
   correctionsByFile: Map<string, Map<number, string>>
 ): NotebookCorrection[] {
   return project.files
-    .filter((file) => (correctionsByFile.get(file.path)?.size ?? 0) > 0)
+    // A notebook has no byte spans, so there is nothing to splice into: its fixes are reported but
+    // the file is not rebuilt, rather than rebuilt wrongly.
+    .filter((file) => file.spliceable && (correctionsByFile.get(file.path)?.size ?? 0) > 0)
     .map((file) => {
       const perStatement = correctionsByFile.get(file.path)!;
       return {

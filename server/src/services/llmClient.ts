@@ -49,9 +49,18 @@ const LLM_TIMEOUT_MS = envInt("AZURE_OPENAI_TIMEOUT_MS", 120_000, 5_000, 600_000
 const REASONING_EFFORT = process.env.AZURE_OPENAI_REASONING_EFFORT?.trim().toLowerCase();
 
 /** Reads a positive integer from the environment, clamped, falling back on anything unparsable. */
+/**
+ * A tuning value from the environment, clamped to its allowed range.
+ *
+ * Only an unset or unparsable variable takes the fallback. Zero is a real setting wherever `min` is
+ * zero — no retry backoff, no upstream context — and treating it as "unset" would silently ignore
+ * the one value a user setting it to 0 is explicitly asking for.
+ */
 export function envInt(name: string, fallback: number, min: number, max: number): number {
-  const raw = Number(process.env[name]);
-  if (!Number.isFinite(raw) || raw <= 0) return fallback;
+  const value = process.env[name];
+  if (value === undefined || value.trim() === "") return fallback;
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(raw)));
 }
 
@@ -812,8 +821,12 @@ export interface ReconTargetPrompt {
   filterHint: string[];
   /** Titles of the checks Recon has already written for this table — not to be repeated. */
   existingChecks: string[];
-  /** The transformation SQL itself, trimmed — what lets the model see the actual grain and joins. */
-  transformationSql: { path: string; statementIndex: number; sql: string }[];
+  /**
+   * The code itself, trimmed: the statements that build this table, followed by the ones that build
+   * what it reads. Following the lineage is what lets a column be traced to where it was actually
+   * derived, and what keeps the rest of the layer — which is not context, only noise — out.
+   */
+  transformationSql: { path: string; statementIndex: number; builds: string; upstream: boolean; sql: string }[];
 }
 
 export interface ReconLlmCheck {
@@ -842,7 +855,7 @@ const RECON_KINDS: readonly ReconCheckKind[] = [
 ];
 
 /** Upper bound on the pipeline-specific checks asked for per table, named in the prompt. */
-export const MAX_CUSTOM_CHECKS_PER_TARGET = 4;
+export const MAX_CUSTOM_CHECKS_PER_TARGET = envInt("RECON_CHECKS_PER_TARGET", 6, 1, 20);
 
 export function buildReconciliationMessages(hopLabel: string, targets: ReconTargetPrompt[]): ChatMessage[] {
   const block = targets
@@ -862,7 +875,15 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         }`
       ];
       for (const stmt of t.transformationSql) {
-        lines.push(`transformation SQL — ${stmt.path} (statement ${stmt.statementIndex}):`, "```sql", stmt.sql, "```");
+        lines.push(
+          stmt.upstream
+            ? `upstream context — how ${stmt.builds} was built, in ${stmt.path} (statement ${stmt.statementIndex}). ` +
+                "Read it to understand where this table's columns came from; do not write checks about it:"
+            : `transformation code that builds ${stmt.builds} — ${stmt.path} (statement ${stmt.statementIndex}):`,
+          "```sql",
+          stmt.sql,
+          "```"
+        );
       }
       return lines.join("\n");
     })
@@ -904,6 +925,10 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         "column name and the check will not run. " +
         "(2) Portable SQL only: no TOP, no LIMIT, no temp tables, no vendor-specific functions, nothing " +
         "that runs on only one engine. It must run unchanged on SQL Server and on Databricks SQL. " +
+        "(2a) SQL Server has no boolean type, so a condition may never be an operand: " +
+        "`(a IS NULL) <> (b IS NULL)` and `(x = y) = (p = q)` do not parse there however well they read. " +
+        "Wrap each side instead — `CASE WHEN a IS NULL THEN 1 ELSE 0 END <> CASE WHEN b IS NULL THEN 1 " +
+        "ELSE 0 END` — or write the condition out with AND/OR. " +
         "(3) Every check is ONE self-contained statement ending in a semicolon. " +
         "(3a) An aggregate (SUM, COUNT, MIN, MAX, AVG) may not appear in a WHERE or a JOIN ON clause, " +
         "and a window function (anything with OVER) may appear only in a SELECT list or an ORDER BY. " +

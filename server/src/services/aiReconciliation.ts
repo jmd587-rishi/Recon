@@ -14,6 +14,7 @@ import {
   assembleHop,
   assembleScript,
   gatherReconciliationFacts,
+  lineageStatements,
   type ReconHopFacts,
   type ReconTargetFacts,
   summarizeSuite,
@@ -22,15 +23,18 @@ import {
 import {
   collectCteBodies,
   type ColumnFacts,
+  type ColumnKind,
+  columnKindOf,
   columnKnowledge,
   declaredKind,
+  inferExpressionKind,
   isEmittableIdentifier,
   parenDepths,
   resolveTableRef,
   stripStringLiterals,
   tableBindings
 } from "./sqlColumns.js";
-import { stripSqlComments } from "./tableLineage.js";
+import { type LineageFact, stripSqlComments } from "./tableLineage.js";
 
 /**
  * Adds the checks only a reader of the transformation could write, on top of the ones Recon derives.
@@ -49,20 +53,49 @@ import { stripSqlComments } from "./tableLineage.js";
  * script itself is already written and runnable before the model is consulted.
  */
 
-/** Target tables per call. Small enough that one answer is short, so it comes back quickly. */
-const MAX_TARGETS_PER_CALL = envInt("RECON_TARGETS_PER_CALL", 2, 1, 6);
+/**
+ * Target tables per call. One by default: a prompt then holds exactly one table's lineage
+ * neighbourhood, and two unrelated tables never share the context — or the budget — merely because
+ * they were adjacent in a list. The calls still run concurrently, so this costs little wall-clock.
+ */
+const MAX_TARGETS_PER_CALL = envInt("RECON_TARGETS_PER_CALL", 1, 1, 6);
 /** Calls in flight at once. The whole suite should cost roughly one call's wall-clock, not N. */
 const RECON_CONCURRENCY = envInt("RECON_CONCURRENCY", 4, 1, 8);
-/** Per-call ceiling. Deliberately well under the client's patience: a stall degrades, not hangs. */
-const RECON_TIMEOUT_MS = envInt("RECON_LLM_TIMEOUT_MS", 75_000, 10_000, 300_000);
-/** Output budget per target. Four short checks and a summary fit easily; a runaway answer doesn't. */
-const MAX_OUTPUT_TOKENS_PER_TARGET = envInt("RECON_MAX_OUTPUT_TOKENS", 1600, 400, 8000);
-/** Per-statement cap on the transformation SQL quoted into the prompt. */
-const MAX_SQL_CHARS = 4500;
-/** Per-target SQL budget, so a batch of stored procedures can't blow the context window. */
-const MAX_SQL_CHARS_PER_TARGET = 6000;
-/** Columns listed per table before the list is cut — a 200-column report table helps nobody. */
-const MAX_COLUMNS_LISTED = 80;
+/** Per-call ceiling. Generous, because the prompts are large and a retry costs another one of these. */
+const RECON_TIMEOUT_MS = envInt("RECON_LLM_TIMEOUT_MS", 240_000, 10_000, 900_000);
+/** Output budget per target. Enough for several checks written out in full rather than cut short. */
+const MAX_OUTPUT_TOKENS_PER_TARGET = envInt("RECON_MAX_OUTPUT_TOKENS", 6000, 400, 32_000);
+/**
+ * How much code the model is shown. The defaults are set so that a real warehouse's largest
+ * transformation goes in *whole* — a check written against the first half of a procedure is a guess
+ * about the half it could not see, and a wrong check costs far more than a slow one. Measured against
+ * a production SSDT project: largest single statement 13 KB, largest target 25 KB of its own code
+ * with 37 KB of upstream chain behind it. Everything here is env-tunable; raise it further rather
+ * than let a transformation be truncated.
+ */
+const MAX_SQL_CHARS = envInt("RECON_SQL_CHARS_PER_STATEMENT", 20_000, 1000, 200_000);
+/** Budget for the statements that build the target itself — the code the checks are about. */
+const MAX_SQL_CHARS_PER_TARGET = envInt("RECON_SQL_CHARS_PER_TARGET", 40_000, 1000, 400_000);
+/**
+ * Separate budget for the upstream chain, so context can never crowd out the target's own code —
+ * which it would, given one procedure upstream can be longer than everything downstream of it.
+ */
+const MAX_UPSTREAM_CHARS = envInt("RECON_UPSTREAM_CHARS", 50_000, 0, 400_000);
+/** How far up the lineage the context reaches. Three spans raw -> stage -> transformation -> mart. */
+const UPSTREAM_HOPS = envInt("RECON_UPSTREAM_HOPS", 3, 0, 8);
+/**
+ * Attempts after the first for a call that fails. A timeout, a rate limit or a truncated answer is a
+ * transient condition, and letting it silently cost a table its checks is the difference between a
+ * suite you can trust and one you have to spot-check.
+ */
+const RECON_RETRIES = envInt("RECON_RETRIES", 3, 0, 10);
+/** Backoff before the first retry, doubling each time. */
+const RETRY_BACKOFF_MS = envInt("RECON_RETRY_BACKOFF_MS", 2000, 0, 60_000);
+/**
+ * Columns listed per table before the list is cut. High enough that a real report table goes in
+ * whole: a truncated list is what makes the model reach for a name it was never shown.
+ */
+const MAX_COLUMNS_LISTED = envInt("RECON_MAX_COLUMNS_LISTED", 400, 20, 2000);
 
 /**
  * One table's columns as the prompt states them, from everything the folder says about it.
@@ -116,14 +149,35 @@ function columnList(facts: ColumnFacts, table: string): { table: string; columns
  * `baseChecks` are the checks already written for this table, listed by title so the model doesn't
  * spend its answer — and the caller's wall-clock — reproducing them.
  */
-function promptFor(facts: ReconTargetFacts, columns: ColumnFacts, baseChecks: ReconCheck[]): ReconTargetPrompt {
+function promptFor(
+  facts: ReconTargetFacts,
+  columns: ColumnFacts,
+  baseChecks: ReconCheck[],
+  allFacts: LineageFact[]
+): ReconTargetPrompt {
+  // The target's own code first and on its own budget, then the chain it was built from — nearest
+  // first, so what runs out is the most distant context rather than the code under review.
   const transformationSql: ReconTargetPrompt["transformationSql"] = [];
-  let budget = MAX_SQL_CHARS_PER_TARGET;
-  for (const fact of facts.facts) {
-    if (budget <= 0) break;
+  const chain = lineageStatements(allFacts, facts.target, UPSTREAM_HOPS);
+  let ownBudget = MAX_SQL_CHARS_PER_TARGET;
+  let upstreamBudget = MAX_UPSTREAM_CHARS;
+
+  for (const { fact, distance, builds } of chain) {
+    const own = distance === 0;
+    const budget = own ? ownBudget : upstreamBudget;
+    if (budget <= 0) continue;
+
     const sql = fact.rawSql.slice(0, Math.min(MAX_SQL_CHARS, budget));
-    budget -= sql.length;
-    transformationSql.push({ path: fact.notebookPath, statementIndex: fact.cellIndex, sql });
+    if (own) ownBudget -= sql.length;
+    else upstreamBudget -= sql.length;
+
+    transformationSql.push({
+      path: fact.notebookPath,
+      statementIndex: fact.cellIndex,
+      builds,
+      upstream: !own,
+      sql
+    });
   }
 
   return {
@@ -220,7 +274,10 @@ export type CheckProblemKind =
   | "unverifiable_column"
   | "ambiguous_column"
   | "non_numeric_total"
-  | "misplaced_function";
+  | "misplaced_function"
+  | "predicate_as_value"
+  | "unbalanced_sql"
+  | "type_clash";
 
 export interface CheckProblem {
   kind: CheckProblemKind;
@@ -298,6 +355,271 @@ function misplacedFunctions(sql: string, depths: number[]): CheckProblem[] {
   return problems;
 }
 
+/**
+ * What is left open at the end of a statement — a quote, a bracket, a comment, a parenthesis.
+ *
+ * This is the cheapest and most important guard of the lot, because a single stray `'` does not
+ * break one check, it breaks *everything after it in the file*: the lexer flips, every later string
+ * literal is read as code and every keyword as a string, and the errors surface hundreds of lines
+ * away with no relation to the cause. One character can cost a 2,500-line script. Nothing that does
+ * not lex may be written out, whatever else is right about it.
+ */
+export function unbalancedSql(sql: string): string | null {
+  let parens = 0;
+  let comment = 0;
+  let i = 0;
+
+  while (i < sql.length) {
+    const ch = sql[i];
+
+    if (comment > 0) {
+      // T-SQL nests block comments, so the depth has to be counted rather than the first `*/` taken.
+      if (ch === "/" && sql[i + 1] === "*") comment++;
+      else if (ch === "*" && sql[i + 1] === "/") comment--;
+      else {
+        i++;
+        continue;
+      }
+      i += 2;
+      continue;
+    }
+
+    if (ch === "-" && sql[i + 1] === "-") {
+      const nl = sql.indexOf("\n", i);
+      if (nl < 0) break;
+      i = nl + 1;
+      continue;
+    }
+    if (ch === "/" && sql[i + 1] === "*") {
+      comment = 1;
+      i += 2;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      let j = i + 1;
+      let closed = false;
+      while (j < sql.length) {
+        if (sql[j] === ch) {
+          // A doubled quote escapes itself: `'it''s'` is one literal.
+          if (sql[j + 1] === ch) {
+            j += 2;
+            continue;
+          }
+          closed = true;
+          j++;
+          break;
+        }
+        j++;
+      }
+      if (!closed) return ch === "'" ? "an unclosed string literal" : "an unclosed quoted identifier";
+      i = j;
+      continue;
+    }
+
+    if (ch === "[") {
+      const close = sql.indexOf("]", i + 1);
+      if (close < 0) return "an unclosed [ identifier";
+      i = close + 1;
+      continue;
+    }
+
+    if (ch === "(") parens++;
+    else if (ch === ")" && --parens < 0) return "a closing parenthesis with nothing to close";
+    i++;
+  }
+
+  if (comment > 0) return "an unclosed /* comment";
+  if (parens > 0) return `${parens} unclosed parenthes${parens === 1 ? "is" : "es"}`;
+  return null;
+}
+
+/** Matching parenthesis offsets, both ways round. */
+function parenPairs(sql: string): { open: Map<number, number>; close: Map<number, number> } {
+  const stack: number[] = [];
+  const open = new Map<number, number>();
+  const close = new Map<number, number>();
+
+  for (let i = 0; i < sql.length; i++) {
+    if (sql[i] === "(") stack.push(i);
+    else if (sql[i] === ")") {
+      const at = stack.pop();
+      if (at !== undefined) {
+        open.set(i, at);
+        close.set(at, i);
+      }
+    }
+  }
+
+  return { open, close };
+}
+
+/**
+ * Whether a parenthesised group holds a condition rather than a value.
+ *
+ * A scalar subquery and a `CASE` both *are* values however they are written inside, so they are
+ * excluded; what is left is a bare condition, which only an engine with a boolean type can use as an
+ * operand.
+ */
+function looksLikePredicate(text: string): boolean {
+  const inner = text.trim();
+  if (/^(?:select|case)\b/i.test(inner)) return false;
+  return /\bis\s+(?:not\s+)?null\b/i.test(inner) || /(?:<=|>=|<>|!=|=|<|>)/.test(inner);
+}
+
+const COMPARISON_RE = /<=|>=|<>|!=|=|<|>/g;
+
+/**
+ * Comparisons whose operand is a condition — `(a IS NULL) <> (b IS NULL)`.
+ *
+ * Natural to write, and a neat way to say "these two disagree", but SQL Server has no boolean data
+ * type: a predicate cannot be an operand, and this is `Incorrect syntax near '<'` before a single row
+ * is read. Spark SQL accepts it, which is exactly why it needs catching here — the scripts have to run
+ * on both. The portable form is `CASE WHEN a IS NULL THEN 1 ELSE 0 END <> CASE WHEN b IS NULL THEN 1
+ * ELSE 0 END`.
+ */
+function predicateOperands(sql: string): CheckProblem[] {
+  const { open, close } = parenPairs(sql);
+  const problems: CheckProblem[] = [];
+  const seen = new Set<string>();
+
+  COMPARISON_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = COMPARISON_RE.exec(sql))) {
+    for (const side of ["left", "right"] as const) {
+      let group: string | null = null;
+
+      if (side === "left") {
+        let i = match.index - 1;
+        while (i >= 0 && /\s/.test(sql[i])) i--;
+        const at = sql[i] === ")" ? open.get(i) : undefined;
+        if (at !== undefined) group = sql.slice(at + 1, i);
+      } else {
+        let j = match.index + match[0].length;
+        while (j < sql.length && /\s/.test(sql[j])) j++;
+        const at = sql[j] === "(" ? close.get(j) : undefined;
+        if (at !== undefined) group = sql.slice(j + 1, at);
+      }
+
+      if (group === null || !looksLikePredicate(group)) continue;
+      const detail = `(${group.trim().slice(0, 60)}) used as a value in a comparison`;
+      if (seen.has(detail)) continue;
+      seen.add(detail);
+      problems.push({ kind: "predicate_as_value", detail });
+    }
+  }
+
+  return problems;
+}
+
+/** Words that end an operand, so a comparison's right-hand side stops where the expression does. */
+const OPERAND_BOUNDARY = new Set([
+  "and", "or", "then", "when", "else", "end", "group", "order", "having", "union", "except",
+  "intersect", "from", "where", "on", "as", "is", "not", "in", "like", "between", "qualify"
+]);
+
+/** The expression to the right of a comparison, up to the next boundary at its own depth. */
+function rightOperand(sql: string, from: number): string {
+  let depth = 0;
+  let word = "";
+  let out = "";
+
+  for (let i = from; i < sql.length; i++) {
+    const ch = sql[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") {
+      if (depth === 0) break;
+      depth--;
+    } else if (depth === 0 && (ch === "," || ch === ";")) break;
+
+    if (depth === 0 && /[A-Za-z_]/.test(ch)) word += ch;
+    else if (word.length > 0) {
+      if (OPERAND_BOUNDARY.has(word.toLowerCase())) return out.slice(0, out.length - word.length).trim();
+      word = "";
+    }
+    out += ch;
+  }
+
+  return OPERAND_BOUNDARY.has(word.toLowerCase()) ? out.slice(0, out.length - word.length).trim() : out.trim();
+}
+
+/** The expression to the left of a comparison: a column, or a call with its name. */
+function leftOperand(sql: string, to: number): string {
+  let i = to - 1;
+  while (i >= 0 && /\s/.test(sql[i])) i--;
+
+  if (sql[i] === ")") {
+    let depth = 0;
+    let j = i;
+    for (; j >= 0; j--) {
+      if (sql[j] === ")") depth++;
+      else if (sql[j] === "(" && --depth === 0) break;
+    }
+    let k = j - 1;
+    while (k >= 0 && /\s/.test(sql[k])) k--;
+    while (k >= 0 && /[\w$#]/.test(sql[k])) k--;
+    return sql.slice(k + 1, i + 1);
+  }
+
+  const end = i + 1;
+  while (i >= 0 && /[\w.$#]/.test(sql[i])) i--;
+  return sql.slice(i + 1, end);
+}
+
+/**
+ * Comparisons between a date and a number.
+ *
+ * `WHERE d.month <> YEAR(s.month) * 100 + MONTH(s.month)` is the shape: written by someone assuming
+ * `month` holds `202401`, against a table where it holds a date. SQL Server refuses outright —
+ * *"Operand type clash: date is incompatible with int"* — and the column types Recon inferred from the
+ * code are exactly what says so in advance.
+ *
+ * Only this pair is judged, and deliberately: SQL Server converts a string to a date implicitly, so
+ * `d.month = '2024-01-01'` is legal and must not be dropped. Date against number is the comparison it
+ * will not make.
+ */
+function typeClashes(
+  sql: string,
+  facts: ColumnFacts,
+  bound: { alias: string | null; table: string }[]
+): CheckProblem[] {
+  const problems: CheckProblem[] = [];
+  const seen = new Set<string>();
+
+  const kindOfOperand = (text: string): ColumnKind => {
+    const trimmed = text.trim();
+    const qualified = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(trimmed);
+    if (qualified) {
+      const name = qualified[1].toLowerCase();
+      const owner = bound.find((b) => (b.alias ?? b.table) === name || b.table.endsWith(`.${name}`));
+      return owner ? columnKindOf(facts.index, owner.table, qualified[2].toLowerCase()) : "other";
+    }
+    if (/^[A-Za-z_]\w*$/.test(trimmed) && bound.length === 1) {
+      return columnKindOf(facts.index, bound[0].table, trimmed.toLowerCase());
+    }
+    return inferExpressionKind(trimmed).kind;
+  };
+
+  COMPARISON_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = COMPARISON_RE.exec(sql))) {
+    const left = kindOfOperand(leftOperand(sql, match.index));
+    const right = kindOfOperand(rightOperand(sql, match.index + match[0].length));
+
+    const clash =
+      (left === "date" && (right === "numeric" || right === "boolean")) ||
+      (right === "date" && (left === "numeric" || left === "boolean"));
+    if (!clash) continue;
+
+    const detail = `a ${left} compared with a ${right}: ${sql.slice(Math.max(0, match.index - 30), match.index + 40).trim()}`;
+    if (seen.has(detail)) continue;
+    seen.add(detail);
+    problems.push({ kind: "type_clash", detail });
+  }
+
+  return problems;
+}
+
 /** A total taken over one plain column — the only shape whose operand type can be checked. */
 const TOTAL_RE = /\b(?:sum|avg)\s*\(\s*(?:distinct\s+)?([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*)\s*\)/gi;
 
@@ -368,6 +690,11 @@ function bareColumnRefs(sql: string, defined: Set<string>, depths: number[]): st
  * tables demonstrably having the same column to make an unqualified use of it ambiguous.
  */
 export function checkProblems(sql: string, facts: ColumnFacts, tables: string[]): CheckProblem[] {
+  // First and on the raw text: stripping literals and comments from SQL that does not lex would hide
+  // the very thing being looked for, and nothing else below means anything if the quotes are wrong.
+  const unbalanced = unbalancedSql(sql);
+  if (unbalanced) return [{ kind: "unbalanced_sql", detail: unbalanced }];
+
   const cleaned = stripStringLiterals(stripSqlComments(sql));
   // Quoting characters carry no meaning to the scanner, and dropping them keeps `t.[month]` a
   // qualified reference rather than a bare word preceded by a bracket.
@@ -377,8 +704,9 @@ export function checkProblems(sql: string, facts: ColumnFacts, tables: string[])
   const problems = new Map<string, CheckProblem>();
   const report = (kind: CheckProblemKind, detail: string) => problems.set(`${kind}:${detail}`, { kind, detail });
 
-  // Independent of what the tables are: this is about where the functions sit in the statement.
+  // Independent of what the tables are: these are about the shape of the statement itself.
   for (const problem of misplacedFunctions(scan, depths)) report(problem.kind, problem.detail);
+  for (const problem of predicateOperands(scan)) report(problem.kind, problem.detail);
 
   const bindings = tableBindings(scan);
   const bound = bindings.flatMap((binding) => {
@@ -422,6 +750,9 @@ export function checkProblems(sql: string, facts: ColumnFacts, tables: string[])
       report("non_numeric_total", `${owner.table}.${column.toLowerCase()} (${kind})`);
     }
   }
+
+  // Needs the resolved tables, so it runs here rather than with the shape checks above.
+  for (const problem of typeClashes(scan, facts, bound)) report(problem.kind, problem.detail);
 
   const defined = definedNames(scan, bindings);
   const bare = bareColumnRefs(scan, defined, depths);
@@ -483,7 +814,10 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
     unverifiable: [] as string[],
     ambiguous: [] as string[],
     nonNumeric: [] as string[],
-    misplaced: [] as string[]
+    misplaced: [] as string[],
+    predicates: [] as string[],
+    unbalanced: [] as string[],
+    clashes: [] as string[]
   };
 
   for (const check of written.checks) {
@@ -503,6 +837,9 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
         else if (problem.kind === "unverifiable_column") dropped.unverifiable.push(problem.detail);
         else if (problem.kind === "non_numeric_total") dropped.nonNumeric.push(problem.detail);
         else if (problem.kind === "misplaced_function") dropped.misplaced.push(problem.detail);
+        else if (problem.kind === "predicate_as_value") dropped.predicates.push(problem.detail);
+        else if (problem.kind === "unbalanced_sql") dropped.unbalanced.push(problem.detail);
+        else if (problem.kind === "type_clash") dropped.clashes.push(problem.detail);
         else dropped.ambiguous.push(problem.detail);
       }
       continue;
@@ -542,6 +879,27 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
         "dropped. The comparison it was reaching for belongs in a HAVING clause or a subquery."
     );
   }
+  if (dropped.unbalanced.length > 0) {
+    notes.push(
+      `A suggested check did not parse — it left ${unique(dropped.unbalanced).join(", ")} — and was ` +
+        "dropped. One stray quote does not break a single check, it breaks every statement after it in " +
+        "the file, so nothing that fails to lex is written out."
+    );
+  }
+  if (dropped.clashes.length > 0) {
+    notes.push(
+      `A suggested check compared incompatible types — ${unique(dropped.clashes).join("; ")} — and was ` +
+        "dropped. It reads as though that column held a number like 202401, where this project's code " +
+        "builds it as a date."
+    );
+  }
+  if (dropped.predicates.length > 0) {
+    notes.push(
+      `A suggested check compared conditions as if they were values — ${unique(dropped.predicates).join("; ")} — ` +
+        "and was dropped. SQL Server has no boolean type, so that does not parse there even though it " +
+        "runs on Databricks; the portable form wraps each side in CASE WHEN … THEN 1 ELSE 0 END."
+    );
+  }
   if (dropped.nonNumeric.length > 0) {
     notes.push(
       `A suggested check totalled ${unique(dropped.nonNumeric).join(", ")} — a column this project ` +
@@ -579,37 +937,56 @@ interface BatchResult {
   failure: string | null;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * One call, with one narrowing retry.
+ * One call, retried until it comes back or the attempts run out.
  *
- * A batch that times out is retried as single-target calls rather than abandoned: a two-table call
- * is usually slow because one of the two has a large transformation, and splitting it lets the other
- * one through. The split runs in parallel, so the retry costs one more call's latency, not two.
- * `LlmConfigError` is rethrown untouched — retrying an unconfigured endpoint is pointless, and the
- * route turns it into the fully template-written suite.
+ * A timeout, a rate limit and a truncated answer are all transient — the same call a minute later
+ * usually succeeds — and the cost of giving up is invisible: that table quietly ships with the
+ * derived checks alone and nothing says the model was ever meant to add to them. Retrying with
+ * backoff is what makes a run repeatable rather than a coin toss on how busy the endpoint was.
+ *
+ * A batch of more than one target additionally splits on timeout, which both narrows the prompt and
+ * lets the other targets through. `LlmConfigError` is rethrown untouched — retrying an unconfigured
+ * endpoint is pointless, and the route turns it into the fully template-written suite.
  */
 async function runBatch(batch: ReconBatch, canSplit: boolean): Promise<BatchResult> {
-  try {
-    const scripts = await writeReconciliationScripts(batch.hopLabel, batch.prompts, {
-      timeoutMs: RECON_TIMEOUT_MS,
-      maxOutputTokens: MAX_OUTPUT_TOKENS_PER_TARGET * batch.prompts.length
-    });
-    return { scripts, failure: null };
-  } catch (err) {
-    if (err instanceof LlmConfigError) throw err;
+  let lastFailure = "";
 
-    if (canSplit && err instanceof LlmTimeoutError && batch.prompts.length > 1) {
-      const halves = await Promise.all(
-        batch.prompts.map((prompt) => runBatch({ ...batch, prompts: [prompt] }, false))
-      );
-      return {
-        scripts: halves.flatMap((h) => h.scripts),
-        failure: halves.every((h) => h.failure) ? (halves[0].failure ?? null) : null
-      };
+  for (let attempt = 0; attempt <= RECON_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const wait = RETRY_BACKOFF_MS * 2 ** (attempt - 1);
+      console.warn(`[recon] retrying ${batch.hopLabel} attempt ${attempt + 1}/${RECON_RETRIES + 1} in ${wait}ms`);
+      await sleep(wait);
     }
 
-    return { scripts: [], failure: err instanceof Error ? err.message : String(err) };
+    try {
+      const scripts = await writeReconciliationScripts(batch.hopLabel, batch.prompts, {
+        timeoutMs: RECON_TIMEOUT_MS,
+        maxOutputTokens: MAX_OUTPUT_TOKENS_PER_TARGET * batch.prompts.length
+      });
+      return { scripts, failure: null };
+    } catch (err) {
+      if (err instanceof LlmConfigError) throw err;
+      lastFailure = err instanceof Error ? err.message : String(err);
+
+      // Splitting is tried once, on the first timeout: it narrows the prompt as well as retrying it.
+      if (canSplit && err instanceof LlmTimeoutError && batch.prompts.length > 1) {
+        const halves = await Promise.all(
+          batch.prompts.map((prompt) => runBatch({ ...batch, prompts: [prompt] }, false))
+        );
+        return {
+          scripts: halves.flatMap((h) => h.scripts),
+          failure: halves.every((h) => h.failure) ? (halves[0].failure ?? null) : null
+        };
+      }
+    }
   }
+
+  return { scripts: [], failure: lastFailure };
 }
 
 /**
@@ -639,7 +1016,7 @@ export async function buildAiReconciliationSuite(
         hopLabel: hop.label,
         prompts: hop.targets
           .slice(i, i + MAX_TARGETS_PER_CALL)
-          .map((facts) => promptFor(facts, columnFacts, baseChecks.get(facts)!))
+          .map((facts) => promptFor(facts, columnFacts, baseChecks.get(facts)!, project.facts))
       });
     }
   });
@@ -703,8 +1080,10 @@ function buildNotice(aiTables: number, plainTables: number, failures: string[], 
   if (failures.length > 0) {
     const distinct = Array.from(new Set(failures));
     parts.push(
-      `${failures.length} of the reviewer model's calls did not come back (${distinct[0]}), so the tables ` +
-        "they covered carry Recon's derived checks only. Regenerate to retry just those."
+      `${failures.length} of the reviewer model's calls did not come back after ${RECON_RETRIES + 1} ` +
+        `attempts (${distinct[0]}), so the tables they covered carry Recon's derived checks only — those ` +
+        "are complete and runnable, they simply have no transformation-specific extras. Regenerate to " +
+        "try those tables again, or raise RECON_LLM_TIMEOUT_MS / RECON_RETRIES if it keeps happening."
     );
   } else if (plainTables > 0 && aiTables > 0) {
     parts.push(
