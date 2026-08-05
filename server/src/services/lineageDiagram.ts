@@ -27,9 +27,20 @@ import type { LineageEdge, LineageEdgeNotes } from "../types/index.js";
  * once, quickly, before a prompt is answered. Everything here is inline, so the file works offline,
  * forever, and can be mailed to someone as a single artifact.
  *
- * The interactivity is what makes a 22-edge graph legible: clicking a table dims everything that is
- * not upstream or downstream of it, which turns "what feeds this?" from a tracing exercise into one
- * click.
+ * The interactivity is what makes a 22-edge graph legible: clicking a table lights its flow and dims
+ * everything not on it, which turns "what feeds this?" from a tracing exercise into one click.
+ * Upstream and downstream are lit in *different* colours rather than one, because the reader is
+ * asking two questions and a single highlight makes them separate the answers by eye; the lit edges
+ * animate along the direction of flow, and the selected table glows so it stays findable in a graph
+ * too big to scan. All of that is page-only — `officeSvg.ts` renders a static picture and shares none
+ * of it — so filters, animation and custom properties are all fair game here.
+ *
+ * There is deliberately **no find-a-table box**. It dimmed non-matching nodes by writing
+ * `style.opacity` straight onto them, and an inline style outranks a stylesheet — so after one
+ * keystroke the focus mode's own opacity rules were dead, and clicking a table appeared to highlight
+ * nothing but the table itself. Selection is one interaction, driven by clicking, and the two ways of
+ * dimming the same nodes cannot both own that. If searching is ever wanted back, it must mark nodes
+ * with a *class* the focus rules can outrank, never with an inline style.
  *
  * **What the copy buttons can and cannot do.** They copy a DOM *table* selection, which Word and
  * PowerPoint paste as a native, editable table — that part is genuinely useful and needs no files. They
@@ -104,6 +115,17 @@ function renderSvg(layout: DagLayout, schemas: string[]): string {
   return `<svg id="dag" viewBox="0 0 ${layout.width} ${layout.height}" width="${layout.width}" height="${layout.height}">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+    <!--
+      One marker per highlight state. A marker cannot inherit its parent path's stroke portably
+      (context-stroke is not everywhere yet), so the arrowhead colour is switched by pointing
+      marker-end at a different marker from CSS — a presentation attribute a CSS rule outranks.
+    -->
+    <marker id="arrow-up" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+    <marker id="arrow-down" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z"/>
     </marker>
   </defs>
@@ -216,10 +238,14 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
 <style>
   :root { color-scheme: light dark;
     --bg:#fff; --fg:#1a1a1a; --dim:#6b6b6b; --line:#e2e2e2; --card:#fafafa; --warn:#8a6d1f;
-    --edge:${EDGE_COLOUR}; --edge-hl:#3b7dd8; --node-bg:#fff; --sel:#3b7dd8; --ok:#2f7d4f; }
+    --edge:${EDGE_COLOUR}; --edge-hl:#3b7dd8; --node-bg:#fff; --sel:#3b7dd8; --ok:#2f7d4f;
+    /* Upstream and downstream get their own colour: "what feeds this" and "what this feeds" are
+       different questions, and one highlight colour makes the reader work out which is which. */
+    --up:#b8701c; --down:#127f7f; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#16181c; --fg:#e6e6e6; --dim:#9a9a9a; --line:#2e3238; --card:#1d2025; --warn:#d9b45b;
-      --edge:#4a5058; --edge-hl:#6aa9ff; --node-bg:#22262c; --sel:#6aa9ff; --ok:#6cc48d; }
+      --edge:#4a5058; --edge-hl:#6aa9ff; --node-bg:#22262c; --sel:#6aa9ff; --ok:#6cc48d;
+      --up:#e8a95a; --down:#57cfcf; }
   }
   * { box-sizing:border-box; }
   body { margin:0; padding:1.5rem 1.25rem 4rem; background:var(--bg); color:var(--fg);
@@ -237,8 +263,6 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
   .concerns ul { margin:.3rem 0 0; padding-left:1.15rem; }
 
   .toolbar { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; margin-bottom:.6rem; }
-  .toolbar input { flex:1 1 220px; min-width:180px; padding:.4rem .6rem; border-radius:6px;
-                   border:1px solid var(--line); background:var(--bg); color:var(--fg); font:inherit; font-size:13.5px; }
   button { padding:.4rem .7rem; border-radius:6px; border:1px solid var(--line);
            background:var(--card); color:var(--fg); font:inherit; font-size:13px; cursor:pointer; }
   button:hover { border-color:var(--sel); }
@@ -260,12 +284,55 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
   ${layerCss}
   .node rect { fill:color-mix(in srgb, var(--nc) 10%, var(--node-bg)); }
 
-  /* Focus mode: everything not on the selected table's path recedes. */
-  svg.focusing .edge { opacity:.07; }
-  svg.focusing .node { opacity:.16; }
-  svg.focusing .edge.on { opacity:1; stroke:var(--edge-hl); stroke-width:2.4; }
-  svg.focusing .node.on { opacity:1; }
-  .node.root rect { stroke:var(--sel); stroke-width:3; }
+  /* ---- Focus mode -------------------------------------------------------
+     Clicking a table asks two questions at once — what feeds it, and what it feeds — so the two
+     directions carry their own colour instead of sharing one highlight, and the lit edges animate
+     along the direction of flow. Everything off the path recedes far enough to read as background
+     without dissolving the shape of the graph. */
+  svg.focusing .edge { opacity:.06; }
+  svg.focusing .node { opacity:.13; }
+  svg.focusing .node.up, svg.focusing .node.down, svg.focusing .node.root { opacity:1; }
+
+  svg.focusing .edge.up, svg.focusing .edge.down {
+    opacity:1; stroke-width:2.6; filter:drop-shadow(0 0 3px);
+    stroke-dasharray:10 4; animation:flow .85s linear infinite;
+  }
+  svg.focusing .edge.up   { stroke:var(--up);   color:var(--up);   marker-end:url(#arrow-up); }
+  svg.focusing .edge.down { stroke:var(--down); color:var(--down); marker-end:url(#arrow-down); }
+  #arrow-up path { fill:var(--up); }
+  #arrow-down path { fill:var(--down); }
+  @keyframes flow { to { stroke-dashoffset:-28; } }
+
+  /* The glow itself. A drop-shadow in the box's own highlight colour reads as light coming off it,
+     which is what makes the selected table findable in a graph too big to scan. */
+  svg.focusing .node.up rect   { stroke:var(--up);   stroke-width:2.4; filter:drop-shadow(0 0 5px var(--up)); }
+  svg.focusing .node.down rect { stroke:var(--down); stroke-width:2.4; filter:drop-shadow(0 0 5px var(--down)); }
+  svg.focusing .node.root rect {
+    stroke:var(--sel); stroke-width:3.5;
+    filter:drop-shadow(0 0 7px var(--sel)) drop-shadow(0 0 15px var(--sel));
+    animation:pulse 2.1s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    50% { filter:drop-shadow(0 0 11px var(--sel)) drop-shadow(0 0 22px var(--sel)); }
+  }
+  svg.focusing .node.root .nlabel { fill:var(--sel); }
+
+  /* Before anything is selected, hovering still says "this is clickable". */
+  svg:not(.focusing) .node:hover rect { stroke-width:2.6; filter:drop-shadow(0 0 6px var(--nc)); }
+
+  @media (prefers-reduced-motion: reduce) {
+    svg.focusing .edge.up, svg.focusing .edge.down { animation:none; stroke-dasharray:none; }
+    svg.focusing .node.root rect { animation:none; }
+  }
+
+  /* Reads as the key to the colours above, and only exists while something is selected. */
+  #focuskey { display:none; gap:1rem; flex-wrap:wrap; align-items:center; margin:.55rem 0 0; font-size:12.5px; }
+  #focuskey.on { display:flex; }
+  #focuskey .fk { display:inline-flex; align-items:center; gap:.35rem; color:var(--dim); }
+  #focuskey .fk i { width:16px; height:3px; border-radius:2px; }
+  #focuskey .fk.u i { background:var(--up); }
+  #focuskey .fk.d i { background:var(--down); }
+  #focuskey .fk.r i { background:var(--sel); height:11px; width:11px; border-radius:3px; }
 
   .panel { margin-top:.7rem; }
   .panel .empty { color:var(--dim); font-style:italic; }
@@ -273,6 +340,8 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
   .cols { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:.9rem; }
   .cols ul { margin:.2rem 0 0; padding-left:1.1rem; }
   .cols li { font:12.5px ui-monospace,Menlo,Consolas,monospace; }
+  .cols a.jump { color:inherit; text-decoration:none; border-bottom:1px dotted var(--dim); }
+  .cols a.jump:hover { color:var(--sel); border-bottom-color:var(--sel); }
 
   .legend { display:flex; flex-wrap:wrap; gap:.9rem; margin:.6rem 0 0; font-size:12.5px; color:var(--dim); }
   .key { display:inline-flex; align-items:center; gap:.35rem; }
@@ -296,6 +365,12 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
   th, td { text-align:left; padding:.4rem .55rem; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--dim); font-weight:600; }
   tr.match { background:color-mix(in srgb, var(--sel) 12%, transparent); }
+  /* The edge table carries the same two colours as the diagram, so a row and its arrow agree. */
+  tr.up { background:color-mix(in srgb, var(--up) 14%, transparent); }
+  tr.down { background:color-mix(in srgb, var(--down) 14%, transparent); }
+  .chip { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:.4rem; vertical-align:baseline; }
+  .chip.u { background:var(--up); }
+  .chip.d { background:var(--down); }
   code { font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
   .src { color:var(--dim); font-size:12.5px; }
   .dim { color:var(--dim); }
@@ -327,17 +402,24 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
 
   <h2>Pipeline${collapsed ? " (grouped by schema — too many tables to draw individually)" : ""}</h2>
   <div class="toolbar">
-    <input id="search" type="search" placeholder="Find a table…" autocomplete="off">
     <button id="fit">Fit</button>
     <button id="zin">+</button>
     <button id="zout">−</button>
     <button id="clear">Clear selection</button>
   </div>
-  <p class="hint">Click a table to see only what feeds it and what it feeds. Drag to pan, scroll to zoom, Esc to clear.</p>
+  <p class="hint"><strong>Click any box</strong> to light up its whole flow — every table upstream of it
+  in one colour, everything downstream in another, and all the arrows between them — with the rest of the
+  graph dimmed. Table names in the panel below are clickable too, so you can walk the chain a hop at a
+  time. Drag to pan, scroll to zoom, Esc to clear.</p>
   <div class="stage" id="stage">
 ${renderSvg(layout, schemas)}
   </div>
   <div class="legend">${legend}</div>
+  <div id="focuskey">
+    <span class="fk r"><i></i>selected</span>
+    <span class="fk u"><i></i>feeds it (upstream)</span>
+    <span class="fk d"><i></i>it feeds (downstream)</span>
+  </div>
 
   <div class="panel card" id="panel"><span class="empty">No table selected — click one in the diagram.</span></div>
 
@@ -429,19 +511,52 @@ ${components.map((component, i) => componentBlock(component, i, input.notes)).jo
   svg.removeAttribute("height");
   window.addEventListener("resize", fit);
 
-  var dragging = false, moved = false, sx = 0, sy = 0;
+  // Selection is driven from the pointer sequence, not from a "click" listener on the boxes.
+  //
+  // Dragging to pan needs setPointerCapture so the gesture survives leaving the stage, but capture
+  // retargets pointerup to the capturing element — and the click event is then dispatched to the
+  // common ancestor of pointerdown and pointerup, which is the stage. A click listener on a node
+  // therefore never fires at all, while the stage's own listener does. So the box under the press is
+  // recorded at pointerdown and acted on at pointerup, which capture cannot move.
+  var dragging = false, moved = false, sx = 0, sy = 0, downX = 0, downY = 0, pressed = null;
+
   stage.addEventListener("pointerdown", function (e) {
-    dragging = true; moved = false; sx = e.clientX - view.x; sy = e.clientY - view.y;
-    stage.classList.add("grabbing"); stage.setPointerCapture(e.pointerId);
+    dragging = true;
+    moved = false;
+    sx = e.clientX - view.x;
+    sy = e.clientY - view.y;
+    downX = e.clientX;
+    downY = e.clientY;
+    pressed = e.target && e.target.closest ? e.target.closest(".node") : null;
+    stage.classList.add("grabbing");
+    // Guarded: if capture is unavailable the gesture should degrade to not surviving the stage
+    // edge, not throw out of the handler and take selection down with it.
+    try { stage.setPointerCapture(e.pointerId); } catch (err) {}
   });
+
   stage.addEventListener("pointermove", function (e) {
     if (!dragging) return;
-    if (Math.abs(e.clientX - view.x - sx) > 3 || Math.abs(e.clientY - view.y - sy) > 3) moved = true;
-    view.x = e.clientX - sx; view.y = e.clientY - sy; apply();
+    // Measured from where the press started, not from the last frame: comparing against the running
+    // view offset only sees each frame's increment, so a slow drag never crosses the threshold and
+    // is mistaken for a tap.
+    if (Math.abs(e.clientX - downX) > 4 || Math.abs(e.clientY - downY) > 4) moved = true;
+    view.x = e.clientX - sx;
+    view.y = e.clientY - sy;
+    apply();
   });
+
   stage.addEventListener("pointerup", function (e) {
-    dragging = false; stage.classList.remove("grabbing");
+    dragging = false;
+    stage.classList.remove("grabbing");
     try { stage.releasePointerCapture(e.pointerId); } catch (err) {}
+    if (!moved) tap(pressed);
+    pressed = null;
+  });
+
+  stage.addEventListener("pointercancel", function () {
+    dragging = false;
+    stage.classList.remove("grabbing");
+    pressed = null;
   });
   stage.addEventListener("wheel", function (e) {
     e.preventDefault();
@@ -468,12 +583,15 @@ ${components.map((component, i) => componentBlock(component, i, input.notes)).jo
 
   var selected = null;
 
+  var focusKey = document.getElementById("focuskey");
+
   function clearFocus() {
     selected = null;
     svg.classList.remove("focusing");
-    nodes.forEach(function (n) { n.classList.remove("on", "root"); });
-    edges.forEach(function (e) { e.classList.remove("on"); });
-    rows.forEach(function (r) { r.classList.remove("match"); });
+    focusKey.classList.remove("on");
+    nodes.forEach(function (n) { n.classList.remove("up", "down", "root"); });
+    edges.forEach(function (e) { e.classList.remove("up", "down"); });
+    rows.forEach(function (r) { r.classList.remove("match", "up", "down"); });
     panel.innerHTML = '<span class="empty">No table selected — click one in the diagram.</span>';
   }
 
@@ -481,53 +599,94 @@ ${components.map((component, i) => componentBlock(component, i, input.notes)).jo
     if (!ADJ[id]) return;
     selected = id;
     var up = reach(id, "up"), down = reach(id, "down");
-    var live = {}; live[id] = true;
-    Object.keys(up).forEach(function (k) { live[k] = true; });
-    Object.keys(down).forEach(function (k) { live[k] = true; });
+
+    // An edge lights up only when *both* its ends sit on the same side of the selection, the root
+    // counting for either. Testing the two ends against the merged set instead would light a
+    // shortcut running from something upstream straight to something downstream — an edge that
+    // never passes through the table whose flow is being traced.
+    function side(node) {
+      if (node === id) return "root";
+      if (up[node]) return "up";
+      if (down[node]) return "down";
+      return null;
+    }
+    function edgeSide(f, t) {
+      var a = side(f), b = side(t);
+      if (!a || !b) return null;
+      if (a === "up" || b === "up") return a !== "down" && b !== "down" ? "up" : null;
+      if (a === "down" || b === "down") return "down";
+      return null;
+    }
 
     svg.classList.add("focusing");
+    focusKey.classList.add("on");
     nodes.forEach(function (n) {
-      var nid = n.getAttribute("data-id");
-      n.classList.toggle("on", !!live[nid]);
-      n.classList.toggle("root", nid === id);
+      var s = side(n.getAttribute("data-id"));
+      n.classList.toggle("root", s === "root");
+      n.classList.toggle("up", s === "up");
+      n.classList.toggle("down", s === "down");
     });
     edges.forEach(function (e) {
-      var f = e.getAttribute("data-from"), t = e.getAttribute("data-to");
-      e.classList.toggle("on", !!live[f] && !!live[t]);
+      var s = edgeSide(e.getAttribute("data-from"), e.getAttribute("data-to"));
+      e.classList.toggle("up", s === "up");
+      e.classList.toggle("down", s === "down");
     });
     rows.forEach(function (r) {
-      var f = r.getAttribute("data-from"), t = r.getAttribute("data-to");
-      r.classList.toggle("match", !!live[f] && !!live[t]);
+      var s = edgeSide(r.getAttribute("data-from"), r.getAttribute("data-to"));
+      r.classList.toggle("up", s === "up");
+      r.classList.toggle("down", s === "down");
+      r.classList.toggle("match", !!s);
     });
 
     var d = DETAIL[id] || { schema: "", files: [] };
     var ups = (ADJ[id].up || []).slice().sort();
     var downs = (ADJ[id].down || []).slice().sort();
-    function list(items, empty) {
-      return items.length ? "<ul>" + items.map(function (x) { return "<li>" + x + "</li>"; }).join("") + "</ul>"
-                          : '<span class="empty">' + empty + "</span>";
+
+    function esc(s) {
+      return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     }
+    // Table names are links back into the diagram, so tracing a chain is a click per hop rather
+    // than a hunt for the next box.
+    function list(items, empty, chip) {
+      if (!items.length) return '<span class="empty">' + esc(empty) + "</span>";
+      return "<ul>" + items.map(function (x) {
+        return '<li><span class="chip ' + chip + '"></span><a href="#" class="jump" data-id="' +
+          esc(x) + '">' + esc(x) + "</a></li>";
+      }).join("") + "</ul>";
+    }
+    function plain(items, empty) {
+      if (!items.length) return '<span class="empty">' + esc(empty) + "</span>";
+      return "<ul>" + items.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("") + "</ul>";
+    }
+
     panel.innerHTML =
-      "<h3>" + id + "</h3>" +
+      "<h3>" + esc(id) + "</h3>" +
       '<div class="cols">' +
-        "<div><strong>Feeds from (" + ups.length + ")</strong>" + list(ups, "nothing — this is a source") + "</div>" +
-        "<div><strong>Feeds into (" + downs.length + ")</strong>" + list(downs, "nothing — this is an endpoint") + "</div>" +
+        '<div><strong><span class="chip u"></span>Feeds from (' + ups.length + ")</strong>" +
+          list(ups, "nothing — this is a source", "u") + "</div>" +
+        '<div><strong><span class="chip d"></span>Feeds into (' + downs.length + ")</strong>" +
+          list(downs, "nothing — this is an endpoint", "d") + "</div>" +
         "<div><strong>All upstream</strong> " + Object.keys(up).length +
           "<br><strong>All downstream</strong> " + Object.keys(down).length +
-          "<br><strong>Schema</strong> " + d.schema + "</div>" +
-        "<div><strong>Built in</strong>" + list(d.files, "no writing statement found") + "</div>" +
+          "<br><strong>Schema</strong> " + esc(d.schema) + "</div>" +
+        "<div><strong>Built in</strong>" + plain(d.files, "no writing statement found") + "</div>" +
       "</div>";
   }
 
-  nodes.forEach(function (n) {
-    n.addEventListener("click", function (e) {
-      e.stopPropagation();
-      if (moved) return;
-      var id = n.getAttribute("data-id");
-      if (id === selected) clearFocus(); else focus(id);
-    });
+  panel.addEventListener("click", function (e) {
+    var link = e.target.closest ? e.target.closest("a.jump") : null;
+    if (!link) return;
+    e.preventDefault();
+    focus(link.getAttribute("data-id"));
   });
-  stage.addEventListener("click", function () { if (!moved) clearFocus(); });
+
+  /** A press that didn't turn into a drag: a box selects it, empty stage clears. */
+  function tap(node) {
+    if (!node) { clearFocus(); return; }
+    var id = node.getAttribute("data-id");
+    if (id === selected) clearFocus(); else focus(id);
+  }
+
   document.getElementById("clear").onclick = clearFocus;
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") clearFocus(); });
 
@@ -587,20 +746,6 @@ ${components.map((component, i) => componentBlock(component, i, input.notes)).jo
         }
       });
     });
-  });
-
-  // ---- search -----------------------------------------------------------
-  document.getElementById("search").addEventListener("input", function (e) {
-    var q = e.target.value.trim().toLowerCase();
-    if (!q) { nodes.forEach(function (n) { n.style.opacity = ""; }); return; }
-    var hit = null;
-    nodes.forEach(function (n) {
-      var id = n.getAttribute("data-id");
-      var match = id.indexOf(q) !== -1;
-      n.style.opacity = match ? "1" : ".18";
-      if (match && !hit) hit = id;
-    });
-    if (hit && q.length > 2) focus(hit);
   });
 
   fit();

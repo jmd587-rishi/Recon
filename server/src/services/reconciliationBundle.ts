@@ -1,5 +1,11 @@
 import type { ReconCheck, ReconCheckKind, ReconScript } from "../types/index.js";
-import type { ReconHopFacts, ReconTargetFacts } from "./reconciliationScripts.js";
+import {
+  countableAs,
+  distinctGrainCount,
+  measureExpr,
+  type ReconHopFacts,
+  type ReconTargetFacts
+} from "./reconciliationScripts.js";
 import { stripSqlComments } from "./tableLineage.js";
 
 /**
@@ -228,18 +234,36 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
   const appendix: Appendix[] = [];
 
   const keyColumns = facts.key.columns;
+  // A measure whose type nothing declares is converted before it is totalled — see `measureExpr`.
+  const untyped = new Set(facts.untypedMeasures);
+  const total = (measure: string) => `SUM(${measureExpr(measure, !untyped.has(measure))})`;
+
   const targetExpressions = [
     "COUNT(*) AS row_count",
     ...(keyColumns.length > 0
       ? [`SUM(CASE WHEN ${keyColumns.map((c) => `${c} IS NULL`).join(" OR ")} THEN 1 ELSE 0 END) AS null_key_rows`]
       : []),
-    ...facts.measureColumns.map((measure) => `SUM(${measure}) AS ${sumAlias(measure)}`),
+    ...facts.measureColumns.map((measure) => `${total(measure)} AS ${sumAlias(measure)}`),
     // A label is counted, never summed: how many distinct values it holds is the comparable number.
     ...facts.categoryColumns.map((column) => `COUNT(DISTINCT ${column}) AS ${distinctAlias(column)}`)
   ];
 
+  const drivers = facts.perSource.filter((entry) => entry.role === "driver");
+  const lookups = facts.perSource.filter((entry) => entry.role === "lookup");
+
   const header = [
-    `${facts.target}  <-  ${facts.sources.join(", ")}`,
+    `${facts.target}  <-  ${facts.sources.join(", ") || "(no source supplies its rows)"}`,
+    // What each source is *for* is the difference between a check and a distraction, so it is stated
+    // here rather than left for the reader to work out from which rows appeared.
+    `  rows come from: ${
+      drivers
+        .map((entry) => `${entry.source}${entry.grainColumns.length > 0 ? ` grouped by ${entry.grainColumns.join(" + ")}` : ""}`)
+        .join(", ") || "nothing in this hop — the rows are generated, not read"
+    }`,
+    ...(lookups.length > 0 ? [`  joined for columns only (not row-counted): ${lookups.map((e) => e.source).join(", ")}`] : []),
+    ...(facts.incidentalSources.length > 0
+      ? [`  read but not reconciled (rows do not reach the target): ${facts.incidentalSources.join(", ")}`]
+      : []),
     `  key: ${keyColumns.length > 0 ? `${keyColumns.join(", ")} (${facts.key.reason})` : "none found"}`,
     `  measures (totalled): ${facts.measureColumns.length > 0 ? facts.measureColumns.join(", ") : "none on both sides"}`,
     `  labels (values compared): ${facts.categoryColumns.length > 0 ? facts.categoryColumns.join(", ") : "none on both sides"}`,
@@ -250,12 +274,19 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
     statsCte(prefix, facts.target, targetExpressions, `-- ${padded(index)}. ${facts.target}  <-  ${facts.sources.join(", ")}`)
   );
 
-  facts.perSource.forEach(({ source, measures, categories }, i) => {
+  facts.perSource.forEach((entry, i) => {
+    const { source, measures, categories } = entry;
     const name = `${prefix}_s${i + 1}`;
+    const countable = countableAs(entry);
     ctes.push(
       statsCte(name, source, [
+        // A source whose count means nothing against the target still needs the CTE for its measures
+        // and labels; the count is simply not put on a row.
         "COUNT(*) AS row_count",
-        ...measures.map((measure) => `SUM(${measure}) AS ${sumAlias(measure)}`),
+        ...(countable && entry.grainColumns.length > 0
+          ? [`${distinctGrainCount(source, entry.grainColumns)} AS grain_count`]
+          : []),
+        ...measures.map((measure) => `${total(measure)} AS ${sumAlias(measure)}`),
         ...categories.map((column) => `COUNT(DISTINCT ${column}) AS ${distinctAlias(column)}`)
       ])
     );
@@ -314,17 +345,27 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
 
   // ---- the rows those CTEs feed ----
 
-  facts.perSource.forEach(({ source }, i) => {
+  facts.perSource.forEach((entry, i) => {
+    const countable = countableAs(entry);
+    // No row for a source the target's count is not a function of. A lookup joined in for its columns
+    // has its own population, and a row comparing the two can only ever read REVIEW.
+    if (!countable) return;
     const s = `${prefix}_s${i + 1}`;
+    const value = entry.grainColumns.length > 0 ? "s.grain_count" : "s.row_count";
     rows.push({
       checkName: "Row count",
       target: facts.target,
-      source,
-      metric: "rows",
-      sourceValue: cast("s.row_count"),
+      source: entry.source,
+      metric: countable.metric,
+      sourceValue: cast(value),
       targetValue: cast("t.row_count"),
-      difference: cast("t.row_count - s.row_count"),
-      status: "CASE WHEN t.row_count = s.row_count THEN 'PASS' ELSE 'REVIEW' END",
+      difference: cast(`t.row_count - ${value}`),
+      // Grouping can only collapse rows, so under `at_most` fewer is the transformation working and
+      // more is rows appearing from nowhere — which is a defect on its own terms, not a REVIEW.
+      status:
+        countable.comparison === "equal"
+          ? `CASE WHEN t.row_count = ${value} THEN 'PASS' ELSE 'REVIEW' END`
+          : `CASE WHEN t.row_count <= ${value} THEN 'PASS' ELSE 'FAIL' END`,
       from: `FROM ${prefix} t CROSS JOIN ${s} s`
     });
   });

@@ -9,7 +9,18 @@ import type {
 } from "../types/index.js";
 import { type LocalProject, splitQualifiedTable } from "./localProject.js";
 import { buildHopBundle, buildProjectBundle } from "./reconciliationBundle.js";
-import { type ColumnIndex, type ColumnInfo, buildColumnIndex, type TableColumns } from "./sqlColumns.js";
+import {
+  buildColumnIndex,
+  buildColumnUsage,
+  type ColumnFacts,
+  type ColumnIndex,
+  type ColumnInfo,
+  emittableColumns,
+  isEmittableIdentifier,
+  kindsConflict,
+  type TableColumns
+} from "./sqlColumns.js";
+import { analyseSourceUsage, mergeUsage, type SourceRole, type SourceUsage } from "./sourceRoles.js";
 import { isTempTable, type LineageFact } from "./tableLineage.js";
 import { extractWherePredicate } from "./whereClauseAnalyzer.js";
 
@@ -181,21 +192,54 @@ function targetKey(table: string, columns: TableColumns | undefined): KeyChoice 
  * otherwise whatever `_key`/`_id` columns the two share. Returning [] means the pair has no column
  * in common that could identify a row, so the key-level checks are skipped rather than invented.
  */
-function joinKey(key: KeyChoice, target: TableColumns | undefined, source: TableColumns | undefined): KeyChoice {
+/**
+ * Whether a column of the same name means the same thing on both sides.
+ *
+ * A warehouse hashes its surrogate keys, so `trn_revenue.date_key` is an MD5 string while the table
+ * it feeds calls its actual date `date_key` too. Joining the two on the shared name is a conversion
+ * error at run time, and — where the engine is willing to coerce instead — a join that matches
+ * nothing and reports every row as missing, which is worse: a break that isn't there.
+ */
+function comparable(name: string, target: TableColumns | undefined, source: TableColumns | undefined): boolean {
+  const inTarget = target?.columns.find((c) => c.name === name)?.kind ?? "other";
+  const inSource = source?.columns.find((c) => c.name === name)?.kind ?? "other";
+  return !kindsConflict(inTarget, inSource);
+}
+
+function joinKey(
+  key: KeyChoice,
+  target: TableColumns | undefined,
+  source: TableColumns | undefined,
+  mismatched: Set<string>
+): KeyChoice {
   const sourceNames = new Set(source?.columns.map((c) => c.name) ?? []);
   if (sourceNames.size === 0) {
     return { columns: [], confidence: "none", reason: "no columns could be read for the source table" };
   }
-  if (key.columns.length > 0 && key.columns.every((column) => sourceNames.has(column))) return key;
+
+  const usable = (name: string) => {
+    if (comparable(name, target, source)) return true;
+    mismatched.add(name);
+    return false;
+  };
+
+  if (key.columns.length > 0 && key.columns.every((column) => sourceNames.has(column) && usable(column))) return key;
 
   const shared = (target?.columns ?? [])
     .map((c) => c.name)
-    .filter((name) => sourceNames.has(name) && KEY_SUFFIX.test(name))
+    .filter((name) => sourceNames.has(name) && KEY_SUFFIX.test(name) && usable(name))
     .slice(0, MAX_KEY_COLUMNS);
 
   return shared.length > 0
     ? { columns: shared, confidence: "inferred", reason: "the key columns both tables share" }
-    : { columns: [], confidence: "none", reason: "source and target share no key column" };
+    : {
+        columns: [],
+        confidence: "none",
+        reason:
+          mismatched.size > 0
+            ? "the columns the two share by name hold different types of value"
+            : "source and target share no key column"
+      };
 }
 
 // ---- deciding what a column can be checked with ----
@@ -291,6 +335,13 @@ function rankedCategories(candidates: ColumnInfo[], filters: string[]): string[]
 interface SharedColumns {
   /** Totalled on both sides. */
   measures: string[];
+  /**
+   * Measures no DDL declares a numeric type for on either side — their `SUM` is wrapped, see
+   * `measureExpr`. A column called `net_change` in a table built by `SELECT ... INTO` has no declared
+   * type at all, and reads as a measure on its name alone; when it turns out to hold `nvarchar(max)`,
+   * a bare `SUM` of it is not a wrong number but a hard error that stops the whole file.
+   */
+  untyped: string[];
   /** Compared as sets of values on both sides, most worth checking first. */
   categories: string[];
 }
@@ -304,20 +355,27 @@ function sharedColumns(
   source: TableColumns | undefined,
   filters: string[]
 ): SharedColumns {
-  if (!target || !source) return { measures: [], categories: [] };
+  if (!target || !source) return { measures: [], untyped: [], categories: [] };
   const sourceByName = new Map(source.columns.map((c) => [c.name, c]));
 
   const measures: string[] = [];
+  const untyped: string[] = [];
   const categories: ColumnInfo[] = [];
   for (const column of target.columns) {
     const counterpart = sourceByName.get(column.name);
     if (!counterpart) continue;
+    // Same name, provably different types — comparing them is a conversion error, not a check.
+    if (kindsConflict(column.kind, counterpart.kind)) continue;
     const role = sharedRole(column, counterpart);
-    if (role === "measure") measures.push(column.name);
-    else if (role === "categorical") categories.push(column);
+    if (role === "measure") {
+      measures.push(column.name);
+      // Both sides have to declare it numeric for the total to be safe. One side declaring it says
+      // nothing about the column being summed on the other.
+      if (column.kind !== "numeric" || counterpart.kind !== "numeric") untyped.push(column.name);
+    } else if (role === "categorical") categories.push(column);
   }
 
-  return { measures, categories: rankedCategories(categories, filters) };
+  return { measures, untyped, categories: rankedCategories(categories, filters) };
 }
 
 // ---- SQL fragments ----
@@ -326,8 +384,26 @@ function countOf(table: string): string {
   return `(SELECT COUNT(*) FROM ${table})`;
 }
 
-function sumOf(table: string, column: string): string {
-  return `(SELECT SUM(${column}) FROM ${table})`;
+/** What a total is accumulated as, and what an undeclared measure is converted to before totalling. */
+export const MEASURE_TYPE = "DECIMAL(38, 6)";
+
+/**
+ * The expression a measure is totalled through.
+ *
+ * A column the project declares numeric is summed as it stands. One whose type nothing declares is
+ * converted first, because `SUM` of a text column is not a wrong answer but a hard error — SQL Server
+ * says *"Operand data type nvarchar(max) is invalid for sum operator"* and stops the file there,
+ * taking every check after it down too. `TRY_CAST` is the one form both SQL Server and Databricks SQL
+ * have that yields NULL instead of failing, so the column is totalled when it really does hold
+ * numbers — a staging table keeping amounts as text is the normal case, not an odd one — and reads
+ * as NULL when it doesn't, which is the honest answer and costs nothing else in the file.
+ */
+export function measureExpr(column: string, typed: boolean): string {
+  return typed ? column : `TRY_CAST(${column} AS ${MEASURE_TYPE})`;
+}
+
+function sumOf(table: string, column: string, typed: boolean): string {
+  return `(SELECT SUM(${measureExpr(column, typed)}) FROM ${table})`;
 }
 
 function quoted(text: string): string {
@@ -338,39 +414,103 @@ function onClause(keyColumns: string[]): string {
   return keyColumns.map((column, i) => `${i === 0 ? "       ON " : "      AND "}t.${column} = s.${column}`).join("\n");
 }
 
-function rowCountCheck(target: string, sources: string[]): ReconCheck {
-  const sql = sources
-    .map(
-      (source) =>
-        `SELECT ${quoted(`${source} -> ${target}`)} AS check_name,\n` +
-        `       ${countOf(source)} AS source_rows,\n` +
+/**
+ * `(SELECT COUNT(*) FROM (SELECT DISTINCT a, b FROM t) g)` — how many rows a grouped read of `t`
+ * produces. Written as a derived table rather than `COUNT(DISTINCT a, b)`, which SQL Server does not
+ * have; this form runs on both engines.
+ */
+export function distinctGrainCount(table: string, columns: string[]): string {
+  return `(SELECT COUNT(*) FROM (SELECT DISTINCT ${columns.join(", ")} FROM ${table}) g)`;
+}
+
+export interface CountableSource {
+  expression: string;
+  /** What was counted, written into the result so the reader isn't guessing. */
+  metric: string;
+  /** `equal` — the two numbers should match. `at_most` — the target may not exceed the source. */
+  comparison: "equal" | "at_most";
+}
+
+/**
+ * What a source's count is compared as, or null when comparing it would say nothing.
+ *
+ * Three cases, and the third is the one worth reading. A driver whose grain is unchanged should match
+ * the target exactly. A driver the transformation groups should match its *distinct group keys*, when
+ * those are columns of the source that can be named. When they are not — `trn_revenue` groups on
+ * `date_key` and other columns built inside the transformation, which `stage.sales_report` has not got
+ * — the comparison that still holds is an inequality: grouping can only ever collapse rows, so a
+ * target with *more* rows than its source means the transformation invented some, which is a fan-out
+ * and a real defect. That is a weaker check than equality and a much better one than nothing.
+ */
+export function countableAs(entry: ReconSource): CountableSource | null {
+  // A lookup's own row count has no relationship to the target's — it is joined in for its columns.
+  if (entry.role !== "driver") return null;
+  if (!entry.grainChanged) return { expression: countOf(entry.source), metric: "rows", comparison: "equal" };
+
+  if (entry.grainColumns.length > 0) {
+    return {
+      expression: distinctGrainCount(entry.source, entry.grainColumns),
+      metric: `distinct (${entry.grainColumns.join(", ")})`,
+      comparison: "equal"
+    };
+  }
+  return { expression: countOf(entry.source), metric: "rows (grouped: target must not exceed source)", comparison: "at_most" };
+}
+
+function rowCountCheck(target: string, perSource: ReconSource[]): ReconCheck | null {
+  const blocks = perSource.flatMap((entry) => {
+    const countable = countableAs(entry);
+    if (!countable) return [];
+    return [
+      `SELECT ${quoted(`${entry.source} -> ${target}`)} AS check_name,\n` +
+        `       ${quoted(countable.metric)} AS source_measured_as,\n` +
+        `       ${countable.expression} AS source_rows,\n` +
         `       ${countOf(target)} AS target_rows,\n` +
-        `       ${countOf(target)} - ${countOf(source)} AS row_diff`
-    )
-    .join("\nUNION ALL\n");
+        `       ${countOf(target)} - ${countable.expression} AS row_diff`
+    ];
+  });
+  if (blocks.length === 0) return null;
+
+  const grouped = perSource.some((entry) => countableAs(entry)?.comparison === "at_most");
 
   return {
     kind: "row_count",
     source: "recon",
     title: "Row counts",
     description:
-      "One row per source table. `row_diff` is target minus source — a non-zero value needs a line " +
-      "of transformation logic you can point at, or it is a reconciliation break.",
-    sql: `${sql};`
+      "One row per source whose count the target's row count is a function of — a table joined in " +
+      "only for its columns is not one, and is left out rather than compared. `source_measured_as` " +
+      "says what was counted: where the transformation groups, the source is measured as its distinct " +
+      "group keys, because that is the number the target's rows should equal. " +
+      (grouped
+        ? "Where the group keys are built inside the transformation and so cannot be counted on the " +
+          "source, plain rows are compared instead and only the direction is meaningful: grouping can " +
+          "only collapse rows, so a NEGATIVE `row_diff` is expected and a POSITIVE one is a fan-out. "
+        : "") +
+      "`row_diff` is target minus source — a non-zero value needs a line of transformation logic you " +
+      "can point at, or it is a reconciliation break.",
+    sql: `${blocks.join("\nUNION ALL\n")};`
   };
 }
 
-function measureCheck(target: string, perSource: { source: string; measures: string[] }[]): ReconCheck | null {
+function measureCheck(
+  target: string,
+  perSource: { source: string; measures: string[] }[],
+  untyped: Set<string>
+): ReconCheck | null {
   const blocks = perSource.flatMap(({ source, measures }) =>
-    measures.map(
-      (measure) =>
+    measures.map((measure) => {
+      const typed = !untyped.has(measure);
+      return (
         `SELECT ${quoted(measure)} AS measure,\n` +
         `       ${quoted(source)} AS source_table,\n` +
-        `       ${sumOf(source, measure)} AS source_total,\n` +
-        `       ${sumOf(target, measure)} AS target_total,\n` +
+        `       ${sumOf(source, measure, typed)} AS source_total,\n` +
+        `       ${sumOf(target, measure, typed)} AS target_total,\n` +
         // An empty table sums to NULL, and `NULL - NULL` would read as "no difference" at a glance.
-        `       COALESCE(${sumOf(target, measure)}, 0) - COALESCE(${sumOf(source, measure)}, 0) AS total_diff`
-    )
+        `       COALESCE(${sumOf(target, measure, typed)}, 0) - ` +
+        `COALESCE(${sumOf(source, measure, typed)}, 0) AS total_diff`
+      );
+    })
   );
   if (blocks.length === 0) return null;
 
@@ -600,17 +740,35 @@ interface TargetGroup {
  * checks, and `aiReconciliation.ts` puts it in the prompt so the model has the exact column lists
  * and never has to guess a name. Keeping it separate is what makes the two paths comparable.
  */
+/** One source of a target, with what the transformation does with it — see `sourceRoles.ts`. */
+export interface ReconSource {
+  source: string;
+  join: KeyChoice;
+  measures: string[];
+  categories: string[];
+  /** `driver` supplies the target's rows; `lookup` is joined in for its columns. */
+  role: SourceRole;
+  /** The transformation collapses rows between here and the target, so counts must differ. */
+  grainChanged: boolean;
+  /** The `GROUP BY` columns that set the grain, when they are nameable columns of this source. */
+  grainColumns: string[];
+}
+
 export interface ReconTargetFacts {
   target: string;
   sources: string[];
   facts: LineageFact[];
   key: KeyChoice;
-  perSource: { source: string; join: KeyChoice; measures: string[]; categories: string[] }[];
+  perSource: ReconSource[];
   measureColumns: string[];
+  /** Of those, the ones no DDL declares numeric, whose total goes through `measureExpr`. */
+  untypedMeasures: string[];
   /** Labels compared as value sets rather than totalled — see `columnRole`. */
   categoryColumns: string[];
   knownFilters: string[];
   columnSources: ReconColumnSource[];
+  /** Tables the transformation reads without their rows reaching the target — nothing to reconcile. */
+  incidentalSources: string[];
   /** Gaps in the grounding worth saying out loud — no columns, no key, lookup-shaped sources. */
   notes: string[];
   /** Filename this target's script takes inside the hop folder. */
@@ -630,6 +788,13 @@ export interface ReconHopFacts {
 export interface ReconGrounding {
   hops: ReconHopFacts[];
   columns: ColumnIndex;
+  /**
+   * The same column knowledge widened by every statement in the folder, including the ones that only
+   * *read*. Nothing here writes from it — a usage-assembled list is never complete, so it can't be
+   * allowed to decide which columns a check totals — but it is what lets `aiReconciliation.ts` ground
+   * the model on a source table the folder never defines, and check what comes back against it.
+   */
+  columnFacts: ColumnFacts;
 }
 
 /** Groups the statements of a hop by the table they build, keeping only sources inside the hop. */
@@ -661,7 +826,11 @@ function groupByTarget(facts: LineageFact[], fromSchema: string | null, toSchema
 }
 
 function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string): ReconTargetFacts {
-  const targetColumns = columns.get(group.target);
+  // A name that isn't a plain identifier can't be written into a portable script — see
+  // `isEmittableIdentifier`. Filtering here, before any of the columns are put to use, is what keeps
+  // it out of the keys, the totals and the value sets alike.
+  const unwritable = new Set<string>();
+  const targetColumns = emittableColumns(columns.get(group.target), unwritable);
   const key = targetKey(group.target, targetColumns);
   const notes: string[] = [];
 
@@ -675,23 +844,110 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
     })
   );
 
+  // What the transformation actually does with each table it reads, so a lookup isn't row-counted
+  // against the target and a table read only to set a variable isn't reconciled against it at all.
+  const usage = mergeUsage(group.facts.map((fact) => analyseSourceUsage(fact.rawSql, group.target)));
+  const usageOf = (source: string): SourceUsage => {
+    if (!usage) return { role: "driver", grainChanged: false, grainColumns: [] };
+    return (
+      usage.get(source.toLowerCase()) ??
+      usage.get(bareName(source)) ?? { role: "incidental", grainChanged: false, grainColumns: [] }
+    );
+  };
+
+  const incidentalSources = group.sources.filter((source) => usageOf(source).role === "incidental");
+  const reconciled = group.sources.filter((source) => usageOf(source).role !== "incidental");
+
   const overflow: string[] = [];
-  const perSource = group.sources.map((source) => {
-    const sourceColumns = columns.get(source);
+  const untyped = new Set<string>();
+  /** Columns the two sides share by name but not by type — see `comparable`. */
+  const mismatched = new Set<string>();
+  const perSource: ReconSource[] = reconciled.map((source) => {
+    const sourceColumns = emittableColumns(columns.get(source), unwritable);
     const shared = sharedColumns(targetColumns, sourceColumns, knownFilters);
     overflow.push(...shared.measures.slice(MAX_MEASURES), ...shared.categories.slice(MAX_CATEGORIES));
+    for (const measure of shared.untyped) untyped.add(measure);
+
+    const how = usageOf(source);
+    // A grain column has to be a column this source really has, or the check won't run.
+    const known = new Set(sourceColumns?.columns.map((c) => c.name) ?? []);
+    const grainColumns = how.grainColumns.filter((column) => isEmittableIdentifier(column));
+    const usable =
+      grainColumns.length === how.grainColumns.length &&
+      grainColumns.length > 0 &&
+      (known.size === 0 || grainColumns.every((column) => known.has(column)));
+
     return {
       source,
-      join: joinKey(key, targetColumns, sourceColumns),
-      measures: shared.measures.slice(0, MAX_MEASURES),
-      categories: shared.categories.slice(0, MAX_CATEGORIES)
+      join: joinKey(key, targetColumns, sourceColumns, mismatched),
+      // Only a driver's totals flow into the target's rows; a lookup's are a different population.
+      measures: how.role === "driver" ? shared.measures.slice(0, MAX_MEASURES) : [],
+      categories: shared.categories.slice(0, MAX_CATEGORIES),
+      role: how.role,
+      grainChanged: how.grainChanged,
+      grainColumns: usable ? grainColumns : []
     };
   });
 
   const measureColumns = unique(perSource.flatMap((p) => p.measures));
+  const untypedMeasures = measureColumns.filter((measure) => untyped.has(measure));
   const categoryColumns = unique(perSource.flatMap((p) => p.categories));
   if (measureColumns.length === 0) {
     notes.push("No measure column is present on both sides, so there are no totals to compare.");
+  }
+  if (mismatched.size > 0) {
+    const listed = Array.from(mismatched).sort();
+    notes.push(
+      `${listed.join(", ")} ${listed.length === 1 ? "is a column" : "are columns"} the two sides share by ` +
+        "name but not by meaning — one side holds a different type of value, typically a hashed " +
+        `surrogate key against a real date or number. ${listed.length === 1 ? "It is" : "They are"} not ` +
+        "used to join or compare: a join across them fails to convert, or silently matches nothing and " +
+        "reports every row as missing."
+    );
+  }
+  if (incidentalSources.length > 0) {
+    notes.push(
+      `${incidentalSources.join(", ")} ${incidentalSources.length === 1 ? "is" : "are"} read by this ` +
+        `transformation but ${incidentalSources.length === 1 ? "its rows do" : "their rows do"} not reach ` +
+        `${group.target} — typically a lookup of a single value such as a maximum date, in a separate ` +
+        "statement from the one that writes the table. Nothing is reconciled against " +
+        `${incidentalSources.length === 1 ? "it" : "them"}: a count comparison there could only ever ` +
+        "differ, and a check that cannot pass is worse than no check."
+    );
+  }
+  for (const entry of perSource) {
+    if (entry.role === "lookup") {
+      notes.push(
+        `${entry.source} is joined in for its columns rather than supplying rows, so its row count is ` +
+          "not compared with the target's. The key checks below still apply: they are what shows a " +
+          "lookup dropping rows or fanning them out."
+      );
+    } else if (entry.grainChanged && entry.grainColumns.length === 0) {
+      notes.push(
+        `The transformation groups ${entry.source} on columns it builds itself, which cannot be counted ` +
+          `on ${entry.source}, so the row-count check compares plain rows and only the direction means ` +
+          "anything: fewer rows in the target is the grouping working, more is a fan-out."
+      );
+    }
+  }
+  if (unwritable.size > 0) {
+    const listed = Array.from(unwritable).sort();
+    notes.push(
+      `${listed.map((name) => `"${name}"`).join(", ")} ${listed.length === 1 ? "is" : "are"} left out of ` +
+        "every check: the name is not a plain identifier — it has a space, punctuation, or is a " +
+        "reserved word — and SQL Server and Databricks SQL quote such a name differently, so no one " +
+        "script can name it and still run on both. Add the check by hand with the quoting your engine " +
+        `uses (${listed.length === 1 ? "e.g. " : ""}\`[${listed[0]}]\` on SQL Server).`
+    );
+  }
+  if (untypedMeasures.length > 0) {
+    notes.push(
+      `${untypedMeasures.join(", ")} ${untypedMeasures.length === 1 ? "is" : "are"} totalled through ` +
+        `TRY_CAST(… AS ${MEASURE_TYPE}) because nothing in this folder declares a numeric type for ` +
+        `${untypedMeasures.length === 1 ? "it" : "them"} — the name says measure, the DDL says nothing. A ` +
+        "NULL total means the column does not hold numbers and the check is not one to make; add the " +
+        "table's CREATE TABLE to the folder and the cast goes away."
+    );
   }
   if (categoryColumns.length === 0) {
     notes.push(
@@ -729,6 +985,13 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
       `No column list could be recovered for ${group.target} — nothing in this folder defines it with ` +
         "CREATE TABLE or builds it with a named select list, so only the row count is checked."
     );
+  } else if (targetColumns.conflicted) {
+    notes.push(
+      `More than one statement in this folder builds ${group.target}, and they do not agree on its ` +
+        "columns — usually two versions of the same script, only one of which is deployed. Only the " +
+        "columns every one of them declares are checked here; a column just one of them adds would be " +
+        "an invalid column name against whichever table is really there."
+    );
   } else if (targetColumns.incomplete) {
     notes.push(
       `The column list for ${group.target} came from a \`SELECT *\` that could not be expanded, so it may ` +
@@ -745,11 +1008,13 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
 
   return {
     target: group.target,
-    sources: group.sources,
+    sources: reconciled,
+    incidentalSources,
     facts: group.facts,
     key,
     perSource,
     measureColumns,
+    untypedMeasures,
     categoryColumns,
     knownFilters,
     columnSources: [group.target, ...group.sources].map((table) => {
@@ -774,11 +1039,13 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
  * deliberately mechanical. Whatever it can't ground it skips and says so in `facts.notes`.
  */
 export function templateChecks(facts: ReconTargetFacts): ReconCheck[] {
-  const checks: ReconCheck[] = [rowCountCheck(facts.target, facts.sources)];
+  const rowCounts = rowCountCheck(facts.target, facts.perSource);
+  const checks: ReconCheck[] = rowCounts ? [rowCounts] : [];
 
   const measures = measureCheck(
     facts.target,
-    facts.perSource.map(({ source, measures: shared }) => ({ source, measures: shared }))
+    facts.perSource.map(({ source, measures: shared }) => ({ source, measures: shared })),
+    new Set(facts.untypedMeasures)
   );
   if (measures) checks.push(measures);
 
@@ -849,6 +1116,21 @@ export function gatherReconciliationFacts(project: LocalProject, layers: LayerRe
       .map((fact) => ({ table: fact.targetTable!, sql: fact.rawSql }))
   );
 
+  // Every table the project names, written or read — the set a `FROM` reference is resolved against.
+  const allTables = unique(
+    project.facts.flatMap((fact) => [
+      ...(fact.targetTable && !isTempTable(fact.targetTable) ? [fact.targetTable] : []),
+      ...fact.sourceTables.filter((source) => !isTempTable(source))
+    ])
+  ).map((table) => table.toLowerCase());
+
+  // Read from *all* the code, not only the statements that build something: a bronze table nothing in
+  // the folder creates is still described by the columns every silver transform selects off it.
+  const columnFacts: ColumnFacts = {
+    index: columns,
+    usage: buildColumnUsage(project.facts.map((fact) => ({ sql: fact.rawSql })), allTables)
+  };
+
   const hopSpecs: { from: LayerRef | null; to: LayerRef | null }[] =
     layers.length >= 2 ? layers.slice(0, -1).map((from, i) => ({ from, to: layers[i + 1] })) : [{ from: null, to: null }];
 
@@ -881,7 +1163,7 @@ export function gatherReconciliationFacts(project: LocalProject, layers: LayerRe
     return { from, to, label: from && to ? `${from.label} -> ${to.label}` : "whole project", folder, targets, notes };
   });
 
-  return { hops, columns };
+  return { hops, columns, columnFacts };
 }
 
 /** Packs one hop's finished scripts, with the single query that covers all of them at once. */

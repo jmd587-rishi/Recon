@@ -19,7 +19,17 @@ import {
   summarizeSuite,
   templateChecks
 } from "./reconciliationScripts.js";
-import type { ColumnIndex } from "./sqlColumns.js";
+import {
+  collectCteBodies,
+  type ColumnFacts,
+  columnKnowledge,
+  declaredKind,
+  isEmittableIdentifier,
+  parenDepths,
+  resolveTableRef,
+  stripStringLiterals,
+  tableBindings
+} from "./sqlColumns.js";
 import { stripSqlComments } from "./tableLineage.js";
 
 /**
@@ -54,24 +64,50 @@ const MAX_SQL_CHARS_PER_TARGET = 6000;
 /** Columns listed per table before the list is cut — a 200-column report table helps nobody. */
 const MAX_COLUMNS_LISTED = 80;
 
-function columnList(index: ColumnIndex, table: string): { table: string; columns: string; note: string } | null {
-  const entry = index.get(table);
-  if (!entry || entry.columns.length === 0) return null;
+/**
+ * One table's columns as the prompt states them, from everything the folder says about it.
+ *
+ * A table the project only reads — the first layer, landed by something outside the folder — has no
+ * DDL and no select list building it, and used to reach the model as "unknown", which is the input
+ * that gets a column invented. The columns other statements are seen selecting off it are named here
+ * instead, marked as the partial list they are.
+ */
+function columnList(facts: ColumnFacts, table: string): { table: string; columns: string; note: string } | null {
+  const key = table.toLowerCase();
+  const entry = facts.index.get(key);
+  // A name no portable script can write is a name the model must not be offered — see
+  // `isEmittableIdentifier`. It is still counted as a gap, so the list reads as partial.
+  const declared = (entry?.columns ?? []).filter((c) => isEmittableIdentifier(c.name));
+  const withheld = (entry?.columns.length ?? 0) - declared.length;
+  const declaredNames = new Set(declared.map((c) => c.name));
+  const observed = Array.from(facts.usage.get(key) ?? [])
+    .filter((name) => !declaredNames.has(name) && isEmittableIdentifier(name))
+    .sort();
+  if (declared.length === 0 && observed.length === 0) return null;
 
-  const shown = entry.columns.slice(0, MAX_COLUMNS_LISTED);
+  const all = [
+    // The inferred kind matters as much as a declared type: a `date_key` that is really a hashed
+    // string must not be joined to a `date_key` that is really a date.
+    ...declared.map((c) => (c.dataType ? `${c.name} ${c.dataType}` : c.kind !== "other" ? `${c.name} (${c.kind})` : c.name)),
+    ...observed.map((name) => `${name} (seen used, type unknown)`)
+  ];
+  const shown = all.slice(0, MAX_COLUMNS_LISTED);
+  const partial = declared.length === 0 || (entry?.incomplete ?? false) || observed.length > 0 || withheld > 0;
+
   const note = [
-    entry.origin === "ddl" ? "from CREATE TABLE" : "inferred from the select list that builds it",
-    entry.incomplete ? "possibly incomplete" : "",
-    shown.length < entry.columns.length ? `${entry.columns.length - shown.length} more not shown` : ""
+    declared.length === 0
+      ? "no DDL in this folder defines it — these are the columns other statements read off it"
+      : entry!.origin === "ddl"
+        ? "from CREATE TABLE"
+        : "inferred from the select list that builds it",
+    partial ? "PARTIAL: there may be more columns, but use no name that is not on this list" : "complete",
+    withheld > 0 ? `${withheld} column${withheld === 1 ? "" : "s"} withheld — the name needs quoting` : "",
+    shown.length < all.length ? `${all.length - shown.length} more not shown` : ""
   ]
     .filter(Boolean)
     .join(", ");
 
-  return {
-    table,
-    columns: shown.map((c) => (c.dataType ? `${c.name} ${c.dataType}` : c.name)).join(", "),
-    note
-  };
+  return { table, columns: shown.join(", "), note };
 }
 
 /**
@@ -80,7 +116,7 @@ function columnList(index: ColumnIndex, table: string): { table: string; columns
  * `baseChecks` are the checks already written for this table, listed by title so the model doesn't
  * spend its answer — and the caller's wall-clock — reproducing them.
  */
-function promptFor(facts: ReconTargetFacts, columns: ColumnIndex, baseChecks: ReconCheck[]): ReconTargetPrompt {
+function promptFor(facts: ReconTargetFacts, columns: ColumnFacts, baseChecks: ReconCheck[]): ReconTargetPrompt {
   const transformationSql: ReconTargetPrompt["transformationSql"] = [];
   let budget = MAX_SQL_CHARS_PER_TARGET;
   for (const fact of facts.facts) {
@@ -93,9 +129,33 @@ function promptFor(facts: ReconTargetFacts, columns: ColumnIndex, baseChecks: Re
   return {
     targetTable: facts.target,
     sourceTables: facts.sources,
+    sourceUsage: [
+      ...facts.perSource.map((entry) =>
+        entry.role === "driver"
+          ? `${entry.source}: it supplies the target's rows` +
+            (entry.grainColumns.length > 0
+              ? `, grouped by ${entry.grainColumns.join(", ")} — so the target should have one row per distinct combination of those`
+              : entry.grainChanged
+                ? ", and the transformation groups them, so the target has fewer rows by design"
+                : ", one for one")
+          : `${entry.source}: it is joined in for its columns only — its own row count has no relationship to the target's, so do not compare them`
+      ),
+      ...facts.incidentalSources.map(
+        (source) =>
+          `${source}: it is read, but its rows never reach the target (a lookup of a single value, or a separate statement) — write no check comparing it with the target`
+      )
+    ],
     columns: [facts.target, ...facts.sources].flatMap((table) => {
       const list = columnList(columns, table);
-      return list ? [list] : [{ table, columns: "(unknown — nothing in the folder describes this table)", note: "" }];
+      return list
+        ? [list]
+        : [
+            {
+              table,
+              columns: "(unknown — nothing in the folder describes this table or reads a column off it)",
+              note: "write NO check that names a column of this table"
+            }
+          ];
     }),
     keyHint:
       facts.key.columns.length > 0
@@ -133,63 +193,260 @@ function referencesKnownTable(sql: string, tables: string[]): boolean {
   return false;
 }
 
-/** Blanks out string literals, so `'silver.orders -> gold.arr'` isn't read as SQL. */
-function stripLiterals(sql: string): string {
-  return sql.replace(/'(?:''|[^'])*'/g, "''");
-}
-
-/** Words that can follow a table name without being an alias for it. */
-const NOT_AN_ALIAS = new Set([
-  "on", "where", "group", "order", "having", "union", "inner", "left", "right", "full", "outer",
-  "cross", "join", "select", "set", "using", "and", "or", "when", "then", "else", "end", "as",
-  "with", "from", "into", "values", "limit", "except", "intersect", "qualify", "window"
+/**
+ * Words that are SQL rather than column names. Over-listing is safe: every word here is one the
+ * scanner below declines to judge, so the cost is a check that goes out unverified, never a good
+ * check dropped.
+ */
+const SQL_WORDS = new Set([
+  "select", "distinct", "all", "from", "where", "group", "by", "order", "having", "join", "inner",
+  "left", "right", "full", "outer", "cross", "lateral", "natural", "semi", "anti", "apply", "on",
+  "using", "and", "or", "not", "in", "exists", "between", "like", "ilike", "rlike", "is", "null",
+  "case", "when", "then", "else", "end", "as", "union", "except", "intersect", "asc", "desc",
+  "with", "over", "partition", "rows", "range", "unbounded", "preceding", "following", "current",
+  "row", "values", "into", "insert", "update", "delete", "set", "matched", "merge", "top", "limit",
+  "offset", "fetch", "next", "first", "only", "true", "false", "unknown", "escape", "collate",
+  "interval", "qualify", "window", "pivot", "unpivot", "for", "default", "primary", "key", "table",
+  "view", "create", "drop", "alter", "cast", "convert", "nulls", "last", "within", "filter",
+  // type names, which appear bare inside CAST/CONVERT
+  "varchar", "nvarchar", "char", "nchar", "text", "int", "integer", "bigint", "smallint", "tinyint",
+  "decimal", "numeric", "float", "real", "double", "precision", "money", "bit", "boolean", "date",
+  "datetime", "datetime2", "timestamp", "time", "string", "long"
 ]);
 
-const ALIAS_RE = /\b(?:from|join)\s+([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*)\s+(?:as\s+)?([A-Za-z_]\w*)/gi;
+/** What is wrong with a check, in the terms the note shown to the user is written in. */
+export type CheckProblemKind =
+  | "unknown_column"
+  | "unverifiable_column"
+  | "ambiguous_column"
+  | "non_numeric_total"
+  | "misplaced_function";
 
-/** Every `FROM|JOIN <table> [AS] <alias>` binding in the statement, alias -> table, lowercased. */
-function aliasBindings(sql: string): Map<string, string> {
-  const bindings = new Map<string, string>();
-  let match: RegExpExecArray | null;
-  ALIAS_RE.lastIndex = 0;
-  while ((match = ALIAS_RE.exec(sql))) {
-    const alias = match[2].toLowerCase();
-    if (NOT_AN_ALIAS.has(alias)) continue;
-    bindings.set(alias, match[1].toLowerCase());
-  }
-  return bindings;
+export interface CheckProblem {
+  kind: CheckProblemKind;
+  /** `silver.orders.total_amount`, or the bare column for an ambiguous one. */
+  detail: string;
 }
 
+/** Clause keywords that own everything written after them, until the next one at their own depth. */
+const CLAUSE_RE = /\b(?:select|from|where|group|having|order|on|qualify|set)\b/gi;
+
 /**
- * Columns the check reads as `<alias>.<column>` where the alias is bound to a table whose complete
- * column list is known — and that the table doesn't have.
+ * Which clause the text at `at` sits in.
  *
- * Deliberately narrow. Validating every bare identifier would need a parser per dialect and would
- * throw away good checks over a result alias like `row_diff`; an alias bound to a real table in the
- * same statement is unambiguous, which is exactly the case a hallucinated column shows up in. A
- * table whose list came from an unexpandable `SELECT *` is skipped: a name missing from a list that
- * is *known* to be partial proves nothing.
+ * Scanning left while tracking the shallowest depth reached is what makes a nested query answer for
+ * itself: `WHERE x > (SELECT SUM(y) FROM t)` puts the `SUM` inside the subquery's SELECT, where it is
+ * legal, while `WHERE SUM(x) > 0` leaves it in the WHERE, where it is not. Depth alone can't tell
+ * those apart — the `SUM` in `WHERE DATEFROMPARTS(YEAR(MAX(z) OVER ()), 12, 1)` is three parens deep
+ * and still belongs to the WHERE.
  */
-export function unknownColumns(sql: string, columns: ColumnIndex, tables: string[]): string[] {
-  const cleaned = stripLiterals(stripSqlComments(sql));
-  const inScope = new Set(tables.map((t) => t.toLowerCase()));
-  const found = new Set<string>();
+function enclosingClause(sql: string, depths: number[], at: number): string | null {
+  const clauses: { word: string; at: number }[] = [];
+  CLAUSE_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CLAUSE_RE.exec(sql)) && match.index < at) {
+    clauses.push({ word: match[0].toLowerCase(), at: match.index });
+  }
 
-  for (const [alias, table] of aliasBindings(cleaned)) {
-    if (!inScope.has(table)) continue;
-    const entry = columns.get(table);
-    if (!entry || entry.columns.length === 0 || entry.incomplete) continue;
+  let shallowest = depths[at] ?? 0;
+  for (let i = clauses.length - 1; i >= 0; i--) {
+    const clause = clauses[i];
+    // Everything between the keyword and `at` has to stay inside the keyword's own parenthesis.
+    for (let j = clause.at; j < at; j++) shallowest = Math.min(shallowest, depths[j]);
+    if (depths[clause.at] === shallowest) return clause.word;
+  }
+  return null;
+}
 
-    const known = new Set(entry.columns.map((c) => c.name.toLowerCase()));
-    const useRe = new RegExp(`\\b${alias}\\.([A-Za-z_]\\w*)`, "gi");
-    let use: RegExpExecArray | null;
-    while ((use = useRe.exec(cleaned))) {
-      const column = use[1].toLowerCase();
-      if (!known.has(column)) found.add(`${table}.${column}`);
+/** Aggregates, whose clause placement T-SQL is strict about. */
+const AGGREGATE_RE = /\b(sum|avg|min|max|count|stdev|stdevp|var|varp)\s*\(/gi;
+/** A window function, legal only in a SELECT list or an ORDER BY. */
+const WINDOW_RE = /\bover\s*\(/gi;
+
+/**
+ * Placements of an aggregate or a window function that no engine will run.
+ *
+ * Both are ordinary mistakes to make when writing a check from the outside — "flag the rows where the
+ * total differs" reads naturally as `WHERE SUM(a) <> SUM(b)`, and it is `Msg 147`; "compare against
+ * the latest month" reads as `WHERE d >= MAX(d) OVER ()`, and it is `Msg 4108`. Neither is a wrong
+ * answer, and neither is caught by checking column names, so they are checked for here.
+ */
+function misplacedFunctions(sql: string, depths: number[]): CheckProblem[] {
+  const problems: CheckProblem[] = [];
+
+  WINDOW_RE.lastIndex = 0;
+  let window: RegExpExecArray | null;
+  while ((window = WINDOW_RE.exec(sql))) {
+    const clause = enclosingClause(sql, depths, window.index);
+    if (clause !== null && clause !== "select" && clause !== "order") {
+      problems.push({ kind: "misplaced_function", detail: `a window function (OVER) in the ${clause.toUpperCase()} clause` });
     }
   }
 
-  return Array.from(found);
+  AGGREGATE_RE.lastIndex = 0;
+  let aggregate: RegExpExecArray | null;
+  while ((aggregate = AGGREGATE_RE.exec(sql))) {
+    const clause = enclosingClause(sql, depths, aggregate.index);
+    if (clause === "where" || clause === "on") {
+      problems.push({
+        kind: "misplaced_function",
+        detail: `${aggregate[1].toUpperCase()}(…) in the ${clause.toUpperCase()} clause`
+      });
+    }
+  }
+
+  return problems;
+}
+
+/** A total taken over one plain column — the only shape whose operand type can be checked. */
+const TOTAL_RE = /\b(?:sum|avg)\s*\(\s*(?:distinct\s+)?([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)*)\s*\)/gi;
+
+/** Identifiers the statement defines itself, so they name no table column and can't be judged. */
+function definedNames(sql: string, bindings: { alias: string | null }[]): Set<string> {
+  const defined = new Set<string>(Array.from(collectCteBodies(sql).keys()));
+
+  for (const binding of bindings) {
+    if (binding.alias) defined.add(binding.alias);
+  }
+  // Result aliases and CTE names (`... AS total`, `WITH totals AS (`), plus derived-table aliases
+  // written without AS (`) x`). Over-collecting here only means judging less.
+  for (const re of [/\bas\s+([A-Za-z_]\w*)/gi, /\)\s*(?:as\s+)?([A-Za-z_]\w*)/gi]) {
+    let match: RegExpExecArray | null;
+    re.lastIndex = 0;
+    while ((match = re.exec(sql))) defined.add(match[1].toLowerCase());
+  }
+
+  return defined;
+}
+
+/**
+ * Every bare word in the statement's own scope that could be an unqualified column reference.
+ *
+ * Only paren-depth 0 is judged. A name inside a subquery resolves against that subquery's tables,
+ * which this scanner has no way to know, and reading it against the outer query's would call a
+ * perfectly good `(SELECT AVG(amount) FROM silver.orders)` ambiguous.
+ */
+function bareColumnRefs(sql: string, defined: Set<string>, depths: number[]): string[] {
+  const found: string[] = [];
+  const wordRe = /[A-Za-z_]\w*/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = wordRe.exec(sql))) {
+    const word = match[0].toLowerCase();
+    if (SQL_WORDS.has(word) || defined.has(word) || depths[match.index] > 0) continue;
+
+    let before = match.index - 1;
+    while (before >= 0 && /\s/.test(sql[before])) before--;
+    // `t.month` is qualified, and `month.x` is a qualifier rather than a column.
+    if (sql[before] === ".") continue;
+
+    let after = wordRe.lastIndex;
+    while (after < sql.length && /\s/.test(sql[after])) after++;
+    if (sql[after] === "(" || sql[after] === ".") continue;
+
+    found.push(word);
+  }
+
+  return found;
+}
+
+/**
+ * Everything about a model-written check that the project's own SQL proves wrong, in the two ways a
+ * generated check actually fails when you run it.
+ *
+ * **Invalid column** — the check names a column of a table that hasn't got it. Judged only where the
+ * project describes the table completely, from DDL or a select list with no unexpanded `*`; where it
+ * only knows *some* of a table's columns, a name missing from that list proves nothing and is left
+ * alone. The third case is a table the project describes not at all: a qualified reference to one is
+ * neither provable nor disprovable, and is dropped rather than shipped — an unverifiable column is
+ * exactly what a hallucination looks like, and one of them fails the whole file it lands in.
+ *
+ * **Ambiguous column** — a column named with no table alias in a statement where two of the joined
+ * tables both have it. Perfectly plausible SQL to read and a hard error to run, and the derived
+ * checks never produce one because they qualify everything, so this is a check on the model's SQL
+ * specifically. Positive evidence is enough to judge it: the column list needn't be complete for two
+ * tables demonstrably having the same column to make an unqualified use of it ambiguous.
+ */
+export function checkProblems(sql: string, facts: ColumnFacts, tables: string[]): CheckProblem[] {
+  const cleaned = stripStringLiterals(stripSqlComments(sql));
+  // Quoting characters carry no meaning to the scanner, and dropping them keeps `t.[month]` a
+  // qualified reference rather than a bare word preceded by a bracket.
+  const scan = cleaned.replace(/[`[\]"]/g, "");
+
+  const depths = parenDepths(scan);
+  const problems = new Map<string, CheckProblem>();
+  const report = (kind: CheckProblemKind, detail: string) => problems.set(`${kind}:${detail}`, { kind, detail });
+
+  // Independent of what the tables are: this is about where the functions sit in the statement.
+  for (const problem of misplacedFunctions(scan, depths)) report(problem.kind, problem.detail);
+
+  const bindings = tableBindings(scan);
+  const bound = bindings.flatMap((binding) => {
+    const table = resolveTableRef(binding.ref, tables);
+    if (!table) return [];
+    return [{ ...binding, table, knowledge: columnKnowledge(facts, table) }];
+  });
+  if (bound.length === 0) return Array.from(problems.values());
+
+  for (const entry of bound) {
+    const names = entry.alias ? [entry.alias] : [entry.table, entry.table.split(".").pop()!];
+    for (const name of names) {
+      const useRe = new RegExp(`\\b${name.replace(/[.$#]/g, "\\$&")}\\s*\\.\\s*([A-Za-z_]\\w*)`, "gi");
+      let use: RegExpExecArray | null;
+      while ((use = useRe.exec(scan))) {
+        const column = use[1].toLowerCase();
+        if (entry.knowledge.names.has(column)) continue;
+        if (entry.knowledge.complete) report("unknown_column", `${entry.table}.${column}`);
+        else if (entry.knowledge.names.size === 0) report("unverifiable_column", `${entry.table}.${column}`);
+      }
+    }
+  }
+
+  // `SUM(o.status)` is not a wrong number, it is `Msg 8117` and the end of the file. Only a declared
+  // type can rule a column out — a select-list column states none, and is left to `measureExpr`.
+  TOTAL_RE.lastIndex = 0;
+  let total: RegExpExecArray | null;
+  while ((total = TOTAL_RE.exec(scan))) {
+    const [qualifier, column] = total[1].includes(".")
+      ? [total[1].slice(0, total[1].lastIndexOf(".")).toLowerCase(), total[1].slice(total[1].lastIndexOf(".") + 1)]
+      : [null, total[1]];
+    const owner = qualifier
+      ? bound.find((entry) => (entry.alias ?? entry.table) === qualifier || entry.table.endsWith(`.${qualifier}`))
+      : bound.length === 1
+        ? bound[0]
+        : undefined;
+    if (!owner) continue;
+
+    const kind = declaredKind(facts, owner.table, column);
+    if (kind !== null && kind !== "numeric") {
+      report("non_numeric_total", `${owner.table}.${column.toLowerCase()} (${kind})`);
+    }
+  }
+
+  const defined = definedNames(scan, bindings);
+  const bare = bareColumnRefs(scan, defined, depths);
+  // Only the statement's own scope: a bare name is resolved against the tables the outer query joins.
+  const outer = bound.filter((entry) => depths[entry.at] === 0 && entry.knowledge.names.size > 0);
+
+  for (const column of bare) {
+    const owners = outer.filter((entry) => entry.knowledge.names.has(column));
+    if (owners.length > 1) {
+      report("ambiguous_column", column);
+      continue;
+    }
+    // A statement reading one table and nothing else has nowhere else a bare name could come from,
+    // so — and only then — a name that table hasn't got is a name nothing has.
+    const single = owners.length === 0 && bindings.length === 1 && outer.length === 1;
+    if (single && outer[0].knowledge.complete && !/\bwith\b/i.test(scan)) {
+      report("unknown_column", `${outer[0].table}.${column}`);
+    }
+  }
+
+  return Array.from(problems.values());
+}
+
+function unique(values: string[]): string[] {
+  return Array.from(new Set(values));
 }
 
 /** Ends every check with exactly one `;`, so the file can be run straight through. */
@@ -213,13 +470,21 @@ interface MergedChecks {
  * ones — the model was told not to write those, and the derived version is the one that is certainly
  * correct. Whatever happens the base checks remain, so the script is runnable either way.
  */
-function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: ReconLlmScript | null, columns: ColumnIndex): MergedChecks {
+function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: ReconLlmScript | null, columns: ColumnFacts): MergedChecks {
   if (!written) return { checks: base, notes: [], aiCount: 0 };
 
   const tables = [facts.target, ...facts.sources];
   const covered = new Set<ReconCheckKind>(base.map((c) => c.kind));
   const kept: ReconCheck[] = [];
-  const dropped = { unknownTable: 0, duplicate: 0, badColumns: [] as string[] };
+  const dropped = {
+    unknownTable: 0,
+    duplicate: 0,
+    unknownColumns: [] as string[],
+    unverifiable: [] as string[],
+    ambiguous: [] as string[],
+    nonNumeric: [] as string[],
+    misplaced: [] as string[]
+  };
 
   for (const check of written.checks) {
     if (kept.length >= MAX_CUSTOM_CHECKS_PER_TARGET) break;
@@ -231,9 +496,15 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
       dropped.duplicate++;
       continue;
     }
-    const bad = unknownColumns(check.sql, columns, tables);
-    if (bad.length > 0) {
-      dropped.badColumns.push(...bad);
+    const problems = checkProblems(check.sql, columns, tables);
+    if (problems.length > 0) {
+      for (const problem of problems) {
+        if (problem.kind === "unknown_column") dropped.unknownColumns.push(problem.detail);
+        else if (problem.kind === "unverifiable_column") dropped.unverifiable.push(problem.detail);
+        else if (problem.kind === "non_numeric_total") dropped.nonNumeric.push(problem.detail);
+        else if (problem.kind === "misplaced_function") dropped.misplaced.push(problem.detail);
+        else dropped.ambiguous.push(problem.detail);
+      }
       continue;
     }
     kept.push({
@@ -251,10 +522,38 @@ function mergeChecks(facts: ReconTargetFacts, base: ReconCheck[], written: Recon
       `${dropped.unknownTable} suggested check${dropped.unknownTable === 1 ? "" : "s"} named no table from this hop and ${dropped.unknownTable === 1 ? "was" : "were"} dropped before you saw ${dropped.unknownTable === 1 ? "it" : "them"}.`
     );
   }
-  if (dropped.badColumns.length > 0) {
+  if (dropped.unknownColumns.length > 0) {
     notes.push(
-      `A suggested check referenced ${Array.from(new Set(dropped.badColumns)).join(", ")}, which ` +
-        "this project's DDL does not declare, and was dropped before you saw it."
+      `A suggested check referenced ${unique(dropped.unknownColumns).join(", ")}, which this project's ` +
+        "SQL does not declare, and was dropped before you saw it — it would have failed with an invalid " +
+        "column name."
+    );
+  }
+  if (dropped.ambiguous.length > 0) {
+    notes.push(
+      `A suggested check named ${unique(dropped.ambiguous).join(", ")} without saying which table it ` +
+        "came from, in a query where more than one of them has that column, and was dropped — it would " +
+        "have failed with an ambiguous column name."
+    );
+  }
+  if (dropped.misplaced.length > 0) {
+    notes.push(
+      `A suggested check put ${unique(dropped.misplaced).join(", ")}, which no engine will run, and was ` +
+        "dropped. The comparison it was reaching for belongs in a HAVING clause or a subquery."
+    );
+  }
+  if (dropped.nonNumeric.length > 0) {
+    notes.push(
+      `A suggested check totalled ${unique(dropped.nonNumeric).join(", ")} — a column this project ` +
+        "declares as text or a date — and was dropped; summing it is an invalid-operand error, not a " +
+        "wrong number."
+    );
+  }
+  if (dropped.unverifiable.length > 0) {
+    notes.push(
+      `A suggested check referenced ${unique(dropped.unverifiable).join(", ")} on a table nothing in this ` +
+        "folder describes, so the column could not be confirmed to exist, and it was dropped rather than " +
+        "risk breaking the script. Add that table's CREATE TABLE to the folder to get checks on it."
     );
   }
   if (dropped.duplicate > 0) {
@@ -323,7 +622,7 @@ export async function buildAiReconciliationSuite(
   project: LocalProject,
   layers: LayerRef[]
 ): Promise<LocalReconciliationSuite> {
-  const { hops, columns } = gatherReconciliationFacts(project, layers);
+  const { hops, columns, columnFacts } = gatherReconciliationFacts(project, layers);
 
   // The derived checks are written first and unconditionally: they are the script, and what the
   // model returns is an addition to them. They also tell the model what not to write again.
@@ -340,7 +639,7 @@ export async function buildAiReconciliationSuite(
         hopLabel: hop.label,
         prompts: hop.targets
           .slice(i, i + MAX_TARGETS_PER_CALL)
-          .map((facts) => promptFor(facts, columns, baseChecks.get(facts)!))
+          .map((facts) => promptFor(facts, columnFacts, baseChecks.get(facts)!))
       });
     }
   });
@@ -363,7 +662,7 @@ export async function buildAiReconciliationSuite(
     const scripts: ReconScript[] = hop.targets.map((facts) => {
       const base = baseChecks.get(facts)!;
       const written = byHop[hopIndex].get(facts.target.toLowerCase()) ?? null;
-      const merged = mergeChecks(facts, base, written, columns);
+      const merged = mergeChecks(facts, base, written, columnFacts);
 
       if (merged.aiCount > 0) aiTables++;
       else plainTables++;

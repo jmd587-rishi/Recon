@@ -21,7 +21,12 @@ const ROLE_DEFS: { role: LayerRole; rank: number; keys: string[] }[] = [
   {
     role: "serve",
     rank: 3,
-    keys: ["gold", "datamart", "mart", "curated", "presentation", "serving", "serve", "reporting", "analytics", "consumption", "semantic"]
+    keys: [
+      "gold", "datamart", "mart", "curated", "presentation", "serving", "serve", "reporting",
+      // "analytical" is not a substring of "analytics", so a schema named `analytical` matched
+      // nothing until it was listed in its own right.
+      "analytics", "analytical", "analytic", "consumption", "semantic"
+    ]
   }
 ];
 

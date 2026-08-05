@@ -794,6 +794,12 @@ export async function suggestLevelCodeFixes(
 export interface ReconTargetPrompt {
   targetTable: string;
   sourceTables: string[];
+  /**
+   * What the transformation does with each table it reads — supplies the rows, is joined in for its
+   * columns, or is read without its rows reaching the target. Stated because it decides which
+   * comparisons can mean anything: a lookup's row count has no relationship to the target's.
+   */
+  sourceUsage: string[];
   /** `name type` per column, per table — the only names the model is allowed to use. */
   columns: { table: string; columns: string; note: string }[];
   /** Key columns the static analysis found, and how sure it is. */
@@ -844,6 +850,7 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
       const lines = [
         `### ${t.targetTable}`,
         `sources (in the order the statement reads them): ${t.sourceTables.join(", ") || "(none)"}`,
+        ...t.sourceUsage.map((line) => `how this transformation uses ${line}`),
         ...t.columns.map((c) => `columns of ${c.table}${c.note ? ` [${c.note}]` : ""}: ${c.columns}`),
         `key columns found: ${t.keyHint}`,
         ...t.joinHints.map((j) => `shares with ${j.source}: ${j.columns.join(", ")}`),
@@ -883,13 +890,26 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         "padding: only write a check when you can point at the line of transformation SQL that makes it " +
         "necessary. If the transformation is a plain column-for-column copy, return no checks for it and " +
         "say so in `notes` — that is a correct and useful answer. " +
-        "HARD RULES, they matter more than completeness: " +
+        "HARD RULES, they matter more than completeness. The scripts are handed to an engineer to run " +
+        "as they are, and one statement that will not compile stops the whole file, so a check you are " +
+        "not certain runs is worse than no check: " +
         "(1) Use ONLY the table and column names given to you above. Never invent, guess, pluralise or " +
         "abbreviate a column name. If a check would need a column that is not listed, do not write that " +
-        "check — say so in `notes` instead. " +
+        "check — say so in `notes` instead. A column list marked PARTIAL is still the complete set of " +
+        "names you may use; a table whose columns are unknown may be counted but none of its columns " +
+        "may be named. " +
+        "(1a) Qualify EVERY column reference with the alias of the table it comes from as soon as a " +
+        "query names more than one table — `i.invoice_date`, never `invoice_date`. Give every table in " +
+        "a join an alias. An unqualified column that two of the joined tables both have is an ambiguous " +
+        "column name and the check will not run. " +
         "(2) Portable SQL only: no TOP, no LIMIT, no temp tables, no vendor-specific functions, nothing " +
         "that runs on only one engine. It must run unchanged on SQL Server and on Databricks SQL. " +
         "(3) Every check is ONE self-contained statement ending in a semicolon. " +
+        "(3a) An aggregate (SUM, COUNT, MIN, MAX, AVG) may not appear in a WHERE or a JOIN ON clause, " +
+        "and a window function (anything with OVER) may appear only in a SELECT list or an ORDER BY. " +
+        "To compare totals, aggregate in a subquery or a CTE and compare the results; to compare " +
+        "against a maximum, put it in a scalar subquery. `WHERE SUM(a) <> SUM(b)` and " +
+        "`WHERE d >= MAX(d) OVER ()` are both errors that stop the whole file. " +
         "(4) A check must return NO rows when the data is correct, except count/total comparisons, which " +
         "return one row per pair being compared. " +
         "(5) `description` states in one or two sentences what a non-empty result means for this " +

@@ -53,11 +53,19 @@ export function parseNotebookSource(
     const trimmed = rawCell.replace(/^\n+/, "").replace(/\n+$/, "");
     if (trimmed.length === 0) return;
 
-    const lines = trimmed.split("\n");
+    const allLines = trimmed.split("\n");
     const magicLinePattern = new RegExp(`^${prefixRe}\\s*MAGIC\\b ?(.*)$`);
-    const firstLineMagic = lines[0].match(magicLinePattern);
 
-    if (firstLineMagic) {
+    // `# DBTITLE 1,<title>` is cell metadata, not body: Databricks writes it above the `# MAGIC`
+    // marker whenever a cell has been given a name. Testing only the very first line for the marker
+    // therefore misses every *named* `%sql` cell, and the whole cell is then read as Python — which
+    // means its CREATE/INSERT statements contribute no lineage at all, silently.
+    const titlePattern = new RegExp(`^${prefixRe}\\s*DBTITLE\\b`);
+    let start = 0;
+    while (start < allLines.length && titlePattern.test(allLines[start])) start++;
+    const lines = allLines.slice(start);
+
+    if (lines.length > 0 && magicLinePattern.test(lines[0])) {
       const magicLines = lines.map((line) => {
         const m = line.match(magicLinePattern);
         return m ? m[1] : line;

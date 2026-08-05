@@ -2,6 +2,15 @@ import pkg from "node-sql-parser";
 import type { ConnectionConfig, LineageEdge, NotebookCell, ParsedNotebook, Table } from "../types/index.js";
 import { exportNotebookSource, listNotebooksRecursive } from "./databricksClient.js";
 import { parseNotebookSource } from "./notebookParser.js";
+import {
+  alignmentRowCount,
+  collectPythonSymbols,
+  emptySymbols,
+  expandTemplate,
+  readCallArgument,
+  resolveExpression,
+  type PythonSymbols
+} from "./pythonSymbols.js";
 import { snippet } from "./reconciliationEngine.js";
 import { extractJoinKeyHint } from "./whereClauseAnalyzer.js";
 
@@ -60,13 +69,45 @@ function cleanTaggedRef(ref: string): { op: string; table: string } {
   return { op, table: qualified.toLowerCase() };
 }
 
+/** Every dotted identifier of three or more parts appearing literally in the statement. */
+const THREE_PART_RE = /\b[a-zA-Z0-9_`[\]]+(?:\.[a-zA-Z0-9_`[\]]+){2,}/g;
+
+/**
+ * Puts back the qualifier node-sql-parser drops from a three-part name.
+ *
+ * The library's `tableList()` carries only two name parts (`op::db::table`), so Databricks/Unity's
+ * `catalog.schema.table` comes back as `catalog.table` — the *schema* is the part discarded, and the
+ * schema is exactly what decides which medallion layer a table belongs to. Left alone this splits one
+ * table into two graph nodes, since statements the parser rejects (`CREATE OR REPLACE TABLE`, `MERGE`)
+ * fall back to the regex path and keep all three parts, while plain `SELECT`s parse and lose one.
+ *
+ * The AST is still the right authority on *which op* touches a table, so only the name is repaired,
+ * and only when the statement text contains exactly one three-part spelling with the same first and
+ * last segments. An ambiguous match is left as it came rather than guessed at.
+ */
+function restoreDroppedQualifier(name: string, inStatement: Set<string>): string {
+  const parts = name.split(".");
+  if (parts.length !== 2) return name;
+  const hits = new Set<string>();
+  for (const full of inStatement) {
+    const p = full.split(".");
+    if (p.length >= 3 && p[0] === parts[0] && p[p.length - 1] === parts[1]) hits.add(full);
+  }
+  return hits.size === 1 ? [...hits][0] : name;
+}
+
 function splitTablesByOp(sql: string): TableOpSplit | null {
+  const qualified = new Set(
+    (stripSqlComments(sql).match(THREE_PART_RE) ?? []).map(cleanIdentifier)
+  );
+
   for (const database of SQL_DIALECTS) {
     try {
       const refs = parser
         .tableList(sql, { database })
         .map(cleanTaggedRef)
-        .filter((r) => !NON_LINEAGE_OPS.has(r.op));
+        .filter((r) => !NON_LINEAGE_OPS.has(r.op))
+        .map((r) => ({ ...r, table: restoreDroppedQualifier(r.table, qualified) }));
       const sourceTables = Array.from(new Set(refs.filter((r) => !WRITE_OPS.has(r.op)).map((r) => r.table)));
       const targetTable = refs.find((r) => WRITE_OPS.has(r.op))?.table ?? null;
       return { sourceTables, targetTable };
@@ -289,48 +330,199 @@ function splitStatements(source: string): string[] {
 
 const SPARK_SQL_RE =
   /(?:(\w+)\s*=\s*)?spark\.sql\(\s*f?"""([\s\S]*?)"""\s*\)|(?:(\w+)\s*=\s*)?spark\.sql\(\s*f?"([^"]*)"\s*\)|(?:(\w+)\s*=\s*)?spark\.sql\(\s*f?'([^']*)'\s*\)/g;
-const WRITE_TARGET_RE = /\.(?:saveAsTable|insertInto)\(\s*["']([\w.`]+)["']/;
-const READ_TABLE_RE = /spark\.(?:read\.)?table\(\s*["']([\w.`]+)["']\s*\)/g;
+const WRITE_CALL_RE = /\.(?:saveAsTable|insertInto)\(/g;
+const READ_CALL_RE = /\bspark\.(?:read\.)?table\(/g;
 
 /**
- * Best-effort fallback for pure DataFrame-API notebooks (no spark.sql() at all): pairs a
- * `.saveAsTable(...)`/`.insertInto(...)` write with any `spark.table(...)` / `spark.read.table(...)`
- * reads in the same cell. Skipped if the cell already yielded a spark.sql-based fact for the same
- * target, since that fact carries the actual query rather than just the cell text.
+ * Whether a resolved string is actually a table name.
+ *
+ * A variable that resolves is not automatically a table: `S3_BASE_PATH` resolves perfectly well to
+ * `s3://bucket/`, and an f-string whose placeholders were only partly resolved still carries `{}`.
+ * Letting either through invents a node that no query could ever reference.
  */
-function extractPysparkDataframeLineage(cell: NotebookCell, targetsAlreadyFound: Set<string>): LineageFact | null {
-  const writeMatch = cell.source.match(WRITE_TARGET_RE);
-  if (!writeMatch) return null;
-  const targetTable = cleanIdentifier(writeMatch[1]);
-  if (targetsAlreadyFound.has(targetTable)) return null;
+function isPlausibleTableName(name: string): boolean {
+  return name.length > 0 && name.length < 300 && !/[\s{}/:\\*?"'()]/.test(name);
+}
 
-  const sourceTables = new Set<string>();
+/** The argument expression of every `re` call site in `source`. */
+function callArguments(source: string, re: RegExp): string[] {
+  const args: string[] = [];
+  re.lastIndex = 0;
   let m: RegExpExecArray | null;
-  READ_TABLE_RE.lastIndex = 0;
-  while ((m = READ_TABLE_RE.exec(cell.source))) {
-    sourceTables.add(cleanIdentifier(m[1]));
+  while ((m = re.exec(source))) {
+    const arg = readCallArgument(source, re.lastIndex - 1);
+    if (arg) args.push(arg);
   }
-  if (sourceTables.size === 0) return null;
+  return args;
+}
 
-  return {
-    notebookPath: "",
-    cellIndex: cell.index,
-    sourceTables: Array.from(sourceTables),
-    targetTable,
-    rawSql: cell.source
-  };
+/** Net bracket depth a line adds, ignoring strings and `#` comments. */
+function bracketDelta(line: string): number {
+  let depth = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "#") break;
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      i++;
+      while (i < line.length && line[i] !== quote) i += line[i] === "\\" ? 2 : 1;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+  }
+  return depth;
+}
+
+/**
+ * Joins physical lines into Python logical statements — backslash continuations and open brackets.
+ *
+ * A DataFrame write is almost always written across several lines
+ * (`valid_df.drop(...).write \` / `.format("delta") \` / `.saveAsTable(SILVER_TABLE)`), and the name
+ * of the variable being written is on the *first* of them while the target is on the last. Reading
+ * the file line by line loses the connection between the two.
+ */
+function logicalLines(source: string): string[] {
+  const out: string[] = [];
+  let parts: string[] = [];
+  let depth = 0;
+
+  for (const raw of source.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    const continued = /\\\s*$/.test(line);
+    const text = line.replace(/\\\s*$/, "");
+    parts.push(parts.length === 0 ? text : text.trim());
+    depth = Math.max(0, depth + bracketDelta(text));
+    if (!continued && depth === 0) {
+      out.push(parts.join(" "));
+      parts = [];
+    }
+  }
+  if (parts.length > 0) out.push(parts.join(" "));
+  return out;
+}
+
+const ASSIGN_RE = /^\s*([A-Za-z_]\w*)\s*=(?!=)\s*(.+)$/;
+const RECEIVER_RE = /^\s*([A-Za-z_]\w*)/;
+const IDENT_RE = /\b[A-Za-z_]\w*\b/g;
+
+/**
+ * Lineage for DataFrame-API notebooks, tracked through the variables rather than within one cell.
+ *
+ * The earlier per-cell pairing only saw a write whose read sat in the *same* cell, which is not how
+ * these notebooks are written: the read is a cell near the top (`bronze_df = spark.table(BRONZE)`),
+ * a dozen cells of transformation follow, and the write is a cell at the bottom
+ * (`valid_df...saveAsTable(SILVER)`). Nothing pairs, and the notebook silently yields no lineage.
+ *
+ * So each variable carries the set of tables it was ultimately derived from: a read seeds it, an
+ * assignment mentioning other DataFrames unions theirs, and a write attributes the receiver's set to
+ * the target. That handles the two-target case for free — `valid_df` and `exception_df` both descend
+ * from the same read, so both writes are attributed correctly, where taking one write per cell got
+ * at most one of them.
+ *
+ * The walk is replayed once per metadata row (`alignmentRowCount`) so a loop whose read and write
+ * are separate statements still pairs row-by-row rather than crossing every source with every target.
+ *
+ * A target already written by a SQL statement in this notebook is skipped: that fact carries the
+ * real query, and this one would only carry the surrounding Python.
+ */
+function dataframeFacts(
+  path: string,
+  cells: NotebookCell[],
+  symbols: PythonSymbols,
+  sqlTargets: Set<string>
+): LineageFact[] {
+  const pythonCells = cells
+    .filter((cell) => cell.language === "python")
+    .map((cell) => ({ index: cell.index, source: cell.source, lines: logicalLines(cell.source) }));
+  if (pythonCells.length === 0) return [];
+
+  const everyExpr = pythonCells.flatMap((cell) =>
+    cell.lines.flatMap((line) => [...callArguments(line, WRITE_CALL_RE), ...callArguments(line, READ_CALL_RE)])
+  );
+  if (everyExpr.length === 0) return [];
+
+  const rowCount = alignmentRowCount(everyExpr, symbols);
+  const facts: LineageFact[] = [];
+  const seen = new Set<string>();
+
+  for (let row = 0; row < (rowCount ?? 1); row++) {
+    const rowIdx = rowCount === null ? null : row;
+    const varSources = new Map<string, Set<string>>();
+
+    const resolveTable = (expr: string): string | null => {
+      const value = resolveExpression(expr, symbols, rowIdx);
+      return value !== null && isPlausibleTableName(value) ? cleanIdentifier(value) : null;
+    };
+
+    for (const cell of pythonCells) {
+      for (const line of cell.lines) {
+        const reads = new Set<string>();
+        for (const arg of callArguments(line, READ_CALL_RE)) {
+          const table = resolveTable(arg);
+          if (table) reads.add(table);
+        }
+
+        const writeArgs = callArguments(line, WRITE_CALL_RE);
+        if (writeArgs.length > 0) {
+          const receiver = RECEIVER_RE.exec(line)?.[1];
+          const inherited = receiver ? varSources.get(receiver) : undefined;
+          const sources = new Set<string>([...(inherited ?? []), ...reads]);
+
+          for (const arg of writeArgs) {
+            const targetTable = resolveTable(arg);
+            if (targetTable === null || sqlTargets.has(targetTable)) continue;
+            // A table read back to assert its own row count is not one of its own sources.
+            const sourceTables = [...sources].filter((s) => s !== targetTable).sort();
+            const key = `${cell.index}|${targetTable}|${sourceTables.join(",")}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            facts.push({
+              notebookPath: path,
+              cellIndex: cell.index,
+              sourceTables,
+              targetTable,
+              rawSql: cell.source
+            });
+          }
+          continue;
+        }
+
+        const assign = ASSIGN_RE.exec(line);
+        if (!assign) continue;
+        const derived = new Set(reads);
+        for (const ident of assign[2].match(IDENT_RE) ?? []) {
+          const known = varSources.get(ident);
+          if (known) for (const table of known) derived.add(table);
+        }
+        // Reassignment to something unrelated drops what the name used to mean.
+        if (derived.size > 0) varSources.set(assign[1], derived);
+        else varSources.delete(assign[1]);
+      }
+    }
+  }
+
+  return facts;
 }
 
 export function extractLineageFacts(parsed: ParsedNotebook): LineageFact[] {
   const facts: LineageFact[] = [];
 
-  for (const cell of parsed.cells) {
-    const targetsInCell = new Set<string>();
+  // Notebook-wide, not per-cell: Databricks cells share one namespace and the catalog/schema
+  // constants a table name is built from are conventionally set in the first cell, several cells
+  // above the write that uses them.
+  const pythonCells = parsed.cells.filter((c) => c.language === "python");
+  const symbols = pythonCells.length > 0 ? collectPythonSymbols(pythonCells.map((c) => c.source)) : emptySymbols();
 
+  // Collected across the whole notebook, not per cell: the DataFrame pass below runs once at the end
+  // over every cell, so it needs to know every target a SQL statement anywhere already accounted for.
+  const sqlTargets = new Set<string>();
+
+  for (const cell of parsed.cells) {
     if (cell.language === "sql") {
       for (const stmt of splitStatements(cell.source)) {
         const split = splitSqlTablesByOp(stmt);
-        if (split.targetTable) targetsInCell.add(split.targetTable);
+        if (split.targetTable) sqlTargets.add(split.targetTable);
         facts.push({
           notebookPath: parsed.path,
           cellIndex: cell.index,
@@ -343,10 +535,14 @@ export function extractLineageFacts(parsed: ParsedNotebook): LineageFact[] {
       let match: RegExpExecArray | null;
       SPARK_SQL_RE.lastIndex = 0;
       while ((match = SPARK_SQL_RE.exec(cell.source))) {
-        const sql = match[2] ?? match[4] ?? match[6] ?? "";
-        if (!sql.trim()) continue;
+        const raw = match[2] ?? match[4] ?? match[6] ?? "";
+        if (!raw.trim()) continue;
+        // An f-string here is the norm — `spark.sql(f"CREATE TABLE {CATALOG}.{SCHEMA}.x ...")`.
+        // Substituting what's known beats handing the parser a literal `{CATALOG}`; whatever can't be
+        // resolved is left verbatim, exactly as before.
+        const sql = expandTemplate(raw, symbols, null).text;
         const split = splitSqlTablesByOp(sql);
-        if (split.targetTable) targetsInCell.add(split.targetTable);
+        if (split.targetTable) sqlTargets.add(split.targetTable);
         facts.push({
           notebookPath: parsed.path,
           cellIndex: cell.index,
@@ -355,11 +551,10 @@ export function extractLineageFacts(parsed: ParsedNotebook): LineageFact[] {
           rawSql: sql
         });
       }
-
-      const dfFact = extractPysparkDataframeLineage(cell, targetsInCell);
-      if (dfFact) facts.push({ ...dfFact, notebookPath: parsed.path });
     }
   }
+
+  facts.push(...dataframeFacts(parsed.path, parsed.cells, symbols, sqlTargets));
 
   return facts;
 }

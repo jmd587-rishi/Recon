@@ -39,6 +39,22 @@ type ScanState = "code" | "line-comment" | "block-comment" | "single" | "double"
 const GO_LINE_RE = /^[ \t]*go(?:[ \t]+\d+)?[ \t]*(?:--.*)?$/i;
 
 /**
+ * The Databricks cell separator, for the same reason `GO` is handled: a `.sql` file exported from a
+ * workspace is a *notebook* (`-- Databricks notebook source` on line 1) whose statements are delimited
+ * by `-- COMMAND ----------` and, very often, by nothing else — Databricks does not require a trailing
+ * `;` on a cell, so a file of a dozen `CREATE OR REPLACE TABLE ... AS SELECT` cells can contain no
+ * semicolon at all. Splitting such a file on `;` alone glues every one of those statements into a
+ * single span, and `splitSqlTablesByOp` then reports the first CREATE target as reading every table
+ * mentioned anywhere in the blob.
+ *
+ * `notebookParser.ts` is still the right primitive for a notebook *export fetched from a workspace* —
+ * it resolves per-cell languages and `%magic`. This is the narrower case of the same format arriving
+ * as a file on disk, where byte spans have to survive so a corrected statement can be spliced back.
+ * A `-- MAGIC %python` cell is all comment text and so is dropped by `push`, exactly as intended.
+ */
+const COMMAND_LINE_RE = /^[ \t]*--[ \t]*COMMAND[ \t]+-+[ \t]*$/i;
+
+/**
  * Statements that stay whole no matter how many semicolons they contain: the `;`s inside a procedure
  * or function body separate statements *within* the routine, and splitting there hands out fragments
  * — a bare `END`, a dangling `SET NOCOUNT ON` — while tearing the routine's real
@@ -129,8 +145,9 @@ export function splitSqlStatements(content: string): SqlStatement[] {
       if (i === 0 || content[i - 1] === "\n") {
         const nl = content.indexOf("\n", i);
         const lineEnd = nl < 0 ? content.length : nl;
-        if (GO_LINE_RE.test(content.slice(i, lineEnd).replace(/\r$/, ""))) {
-          // The `GO` line itself belongs to no statement — the next span starts after it.
+        const line = content.slice(i, lineEnd).replace(/\r$/, "");
+        if (GO_LINE_RE.test(line) || COMMAND_LINE_RE.test(line)) {
+          // The separator line itself belongs to no statement — the next span starts after it.
           breakAt(i, nl < 0 ? content.length : nl + 1);
           i = spanStart;
           continue;
