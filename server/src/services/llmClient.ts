@@ -1454,3 +1454,131 @@ export async function describeHopContext(
   });
   return parseHopContextResponse(content);
 }
+
+// ---- Why a reconciliation check would not tie out (the `comments` column) ----
+
+/**
+ * One generated check, described to the model in the terms the reader will see it in.
+ *
+ * Deliberately the *whole* row of the emitted table rather than a summary of it: the model is being
+ * asked to explain a specific line of output to the person reading that line, so it should be looking
+ * at the same four facts they are — which two tables, which column, how the code relates them.
+ */
+export interface ReconCommentInput {
+  sourceTable: string;
+  targetTable: string;
+  /** The column being reconciled, or null for a check on whole rows. */
+  column: string | null;
+  /** How the transformation reaches the source: `FROM`, `LEFT JOIN`, `INNER JOIN`, … */
+  joinType: string;
+  /** Exactly what the generated SQL compares, e.g. `SUM(revenue)` or `COUNT(DISTINCT status)`. */
+  comparison: string;
+}
+
+/**
+ * The prompt behind the `comments` column: what, in this project's own SQL, would stop these two
+ * numbers agreeing.
+ *
+ * The framing matters more than the wording. Recon reads code and never reads data, so the honest
+ * question is not "why did this fail" — nothing has run yet — but "what in what you wrote could make
+ * this differ". Asking for that, and requiring the answer to quote the fragment responsible, is what
+ * keeps the column from filling up with generic reconciliation advice that would read the same for
+ * any pipeline. It is also why the answer may be wrong: it is a reading of the code, offered as a
+ * first place to look, and the prompt says so rather than letting confident prose imply otherwise.
+ */
+export function buildReconCommentMessages(
+  scope: string,
+  inputs: ReconCommentInput[],
+  transformationSql: { path: string; builds: string; sql: string }[]
+): ChatMessage[] {
+  const checks = inputs
+    .map(
+      (input, i) =>
+        `[${i}] compare ${input.comparison}\n` +
+        `     target: ${input.targetTable}\n` +
+        `     source: ${input.sourceTable}  (reached by ${input.joinType})\n` +
+        `     column: ${input.column ?? "(whole rows — no single column)"}`
+    )
+    .join("\n\n");
+
+  const code = transformationSql
+    .map((entry) => `--- ${entry.path} — builds ${entry.builds} ---\n${entry.sql}`)
+    .join("\n\n");
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior data engineer reviewing a SQL pipeline for a colleague who is about to run a " +
+        "reconciliation over it. Each numbered item is one row of a reconciliation report: two tables, the " +
+        "column being reconciled, how the code relates them, and exactly what the SQL compares. You are " +
+        "also given the transformation SQL that builds these tables.\n\n" +
+        "For each item, write the comment that row should carry if it does NOT tie out. Rules:\n" +
+        "1. Open with the cause, in the form \"Because <what the code does> ...\". Name and quote the " +
+        "actual fragment responsible — the WHERE predicate, the join and its type, the GROUP BY, the CASE, " +
+        "the CAST/TRY_CONVERT, the ISNULL/COALESCE default, the window function. Quote it exactly as written.\n" +
+        "2. Then one clause on what that does to this particular comparison.\n" +
+        "3. Then what the engineer should check or change first.\n" +
+        "4. Two or three sentences, under 120 words. Plain prose. No markdown, no bullets, no preamble. " +
+        "Do not use semicolons — the answer is embedded in a SQL string literal and a semicolon breaks it.\n" +
+        "5. You are reading code only and cannot see any data, so write what WOULD explain a difference. " +
+        "Never state that a difference exists, and never quote a row count or a total.\n" +
+        "6. If nothing in the code would make these two sides differ, write one sentence that starts " +
+        "\"Nothing between these two tables changes\" and names the columns or statements you checked. Do " +
+        "not restate this instruction.\n" +
+        "7. Never name a table, column or predicate that is not in the SQL you were given. If the SQL " +
+        "shown does not build one of the tables, say the code for it is not in this project.\n\n" +
+        'Respond with ONLY compact JSON: {"comments": [{"index": <int from the list>, "comment": "<2-3 ' +
+        'sentences>"}, ...]}, exactly one entry per item. No text outside the JSON object.'
+    },
+    {
+      role: "user",
+      content:
+        `Pipeline layer: ${scope}\n\nReconciliation rows to comment on:\n\n${checks}\n\n` +
+        `Transformation SQL:\n\n${code || "(no SQL in this project builds these tables)"}`
+    }
+  ];
+}
+
+export function parseReconCommentResponse(raw: string, count: number): string[] {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  const byIndex = new Map<number, string>();
+  try {
+    const parsed = JSON.parse(cleaned) as { comments?: unknown };
+    for (const entry of Array.isArray(parsed.comments) ? parsed.comments : []) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const rec = entry as Record<string, unknown>;
+      if (typeof rec.index !== "number" || typeof rec.comment !== "string") continue;
+      const comment = rec.comment.trim();
+      if (comment.length > 0) byIndex.set(Math.trunc(rec.index), comment);
+    }
+  } catch {
+    // A malformed answer leaves every comment empty rather than putting the raw text — possibly a
+    // refusal, possibly half a JSON document — into a column people are meant to trust.
+    return Array.from({ length: count }, () => "");
+  }
+
+  return Array.from({ length: count }, (_, index) => byIndex.get(index) ?? "");
+}
+
+/**
+ * One comment per input, in the same order. An entry the model skipped comes back as an empty string
+ * rather than as a stand-in: a row with no explanation is honest, and an invented one is not.
+ */
+export async function explainReconciliationChecks(
+  scope: string,
+  inputs: ReconCommentInput[],
+  transformationSql: { path: string; builds: string; sql: string }[],
+  options: LlmCallOptions = {}
+): Promise<string[]> {
+  if (inputs.length === 0) return [];
+  const content = await callAzureOpenAi(buildReconCommentMessages(scope, inputs, transformationSql), {
+    label: `reconciliation comments ${scope}`,
+    ...options
+  });
+  return parseReconCommentResponse(content, inputs.length);
+}

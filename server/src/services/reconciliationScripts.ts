@@ -20,7 +20,7 @@ import {
   kindsConflict,
   type TableColumns
 } from "./sqlColumns.js";
-import { analyseSourceUsage, mergeUsage, type SourceRole, type SourceUsage } from "./sourceRoles.js";
+import { analyseSourceUsage, type JoinKind, mergeUsage, type SourceRole, type SourceUsage } from "./sourceRoles.js";
 import { isTempTable, type LineageFact } from "./tableLineage.js";
 import { extractWherePredicate } from "./whereClauseAnalyzer.js";
 
@@ -54,6 +54,15 @@ const MAX_MEASURES = 6;
 const MAX_CATEGORIES = 3;
 /** Cap on an inferred composite key — past this it's guessing at the grain, not identifying a row. */
 const MAX_KEY_COLUMNS = 4;
+/**
+ * Shared columns reconciled one row at a time per source, kept in the order the target declares them.
+ *
+ * Higher than the measure and label caps: one row per column is the whole shape of the per-layer
+ * script, so cutting it low would leave the reader wondering which columns were skipped and why. It
+ * is still bounded — a 200-column report table reconciled column by column against four sources is a
+ * file nobody opens twice — and everything left out is stated in the header rather than silently gone.
+ */
+const MAX_FIELDS = 25;
 /** Longest filter text quoted in a script header before it's cut. */
 const MAX_FILTER_CHARS = 240;
 /** Declared text length that reads as a code rather than as free text. */
@@ -73,8 +82,24 @@ export type ColumnRole = "key" | "measure" | "categorical" | "temporal" | "other
 const MEASURE_WORDS = new Set([
   "amount", "amt", "revenue", "arr", "mrr", "acv", "tcv", "qty", "quantity", "count", "total",
   "sum", "price", "cost", "value", "balance", "sales", "spend", "fee", "fees", "tax", "discount",
-  "margin", "profit", "net", "gross", "volume", "units", "hours", "days", "weight", "delta",
+  "margin", "profit", "net", "gross", "volume", "units", "hours", "days", "weight",
   "grr", "nrr"
+]);
+
+/**
+ * Head words for a number that is a *difference between rows*, not a quantity the row carries.
+ *
+ * These are measure-shaped — numeric, and named after the measure they derive from — but their total
+ * answers nothing, because summing a first difference telescopes: `SUM(arr - prev_month_arr)` over a
+ * window-partitioned series collapses to the series' closing value, not to `SUM(arr)`. Pairing one
+ * against the source measure it was computed from (which `kindRef` will happily do) therefore reports
+ * a difference of most of the measure and calls it a discrepancy, when both numbers are correct.
+ *
+ * They are left to the row-count and key checks rather than given a check of their own: a delta
+ * reconciles against a *recomputation*, which is a different question from the one this file asks.
+ */
+const NON_ADDITIVE_WORDS = new Set([
+  "delta", "change", "diff", "difference", "variance", "growth", "movement", "uplift", "swing"
 ]);
 
 /**
@@ -283,6 +308,9 @@ export function columnRole(column: ColumnInfo): ColumnRole {
   if (column.kind === "boolean" || /^(?:is|has)_/.test(name)) return "categorical";
   if (column.kind === "date" || TEMPORAL_WORDS.has(head)) return "temporal";
   if (CATEGORY_WORDS.has(head)) return "categorical";
+  // Ahead of the measure words, and on the head only: `delta_amount` is an amount, `arr_delta` is a
+  // difference. Same asymmetry as categories — the head noun says what the column *is*.
+  if (NON_ADDITIVE_WORDS.has(head)) return "other";
   if (MEASURE_WORDS.has(head)) return summable ? "measure" : "other";
   if (LABEL_WORDS.has(head)) return "other";
   if (segments.some((segment) => CATEGORY_WORDS.has(segment))) return "categorical";
@@ -346,7 +374,41 @@ export interface ColumnPair {
   source: string;
 }
 
+/**
+ * The source column a target column corresponds to: the one it was *built from* where the
+ * transformation says so, and otherwise whatever shares its name.
+ *
+ * The order matters and is the whole reason this isn't a name lookup. A transformation writing
+ * `prm.jman_product_family AS product_family` produces a target column whose name belongs to a
+ * different source column; comparing the two `product_family`s compares things that were never meant
+ * to match, and the difference it reports is an artefact of the naming rather than a finding.
+ */
+function counterpart(column: ColumnInfo, sourceByName: Map<string, ColumnInfo>): ColumnInfo | undefined {
+  const origin = column.kindRef && column.kindRef !== column.name ? sourceByName.get(column.kindRef) : undefined;
+  return origin ?? sourceByName.get(column.name);
+}
+
+/**
+ * One column both sides carry, with everything a per-column check needs to know about it.
+ *
+ * `measures` and `categories` below are the columns that admit a *cross-table* check; this is the
+ * whole shared list, and it is what `layerReconciliation.ts` reconciles a row at a time. The pairing
+ * is lineage, not name matching: `counterpart` follows what the transformation says the column was
+ * built from, so a renamed column is compared with the column it actually came from.
+ */
+export interface ReconField {
+  target: string;
+  source: string;
+  role: ColumnRole;
+  /** Neither side declares a numeric type, so a total has to go through `measureExpr`. */
+  untyped: boolean;
+  /** Both sides hold text, so a blank-string check is safe to write and means something. */
+  text: boolean;
+}
+
 interface SharedColumns {
+  /** Every column both sides carry, most worth checking first. */
+  fields: ReconField[];
   /** Totalled on both sides. */
   measures: ColumnPair[];
   /**
@@ -371,35 +433,52 @@ function sharedColumns(
   source: TableColumns | undefined,
   filters: string[]
 ): SharedColumns {
-  if (!target || !source) return { measures: [], untyped: [], categories: [], renamed: [] };
+  if (!target || !source) return { fields: [], measures: [], untyped: [], categories: [], renamed: [] };
   const sourceByName = new Map(source.columns.map((c) => [c.name, c]));
 
+  const fields: ReconField[] = [];
   const measures: ColumnPair[] = [];
   const untyped: string[] = [];
   const categories: { column: ColumnInfo; source: string }[] = [];
   const renamed: string[] = [];
 
   for (const column of target.columns) {
-    // Where the transformation says this column came from, ahead of whatever shares its name: a
-    // target `product_family` built from `jman_product_family` corresponds to *that*, and the
-    // source's own `product_family` is a different column that happens to be spelled the same.
-    const origin = column.kindRef && column.kindRef !== column.name ? sourceByName.get(column.kindRef) : undefined;
-    const counterpart = origin ?? sourceByName.get(column.name);
-    if (!counterpart) continue;
-    if (origin) renamed.push(`${column.name} <- ${origin.name}`);
+    const other = counterpart(column, sourceByName);
+    if (!other) continue;
+    if (other.name !== column.name) renamed.push(`${column.name} <- ${other.name}`);
 
     // Provably different types — comparing them is a conversion error, not a check.
-    if (kindsConflict(column.kind, counterpart.kind)) continue;
-    const role = sharedRole(column, counterpart);
+    if (kindsConflict(column.kind, other.kind)) continue;
+    const role = sharedRole(column, other);
+
+    if (isEmittableIdentifier(column.name) && isEmittableIdentifier(other.name)) {
+      fields.push({
+        target: column.name,
+        source: other.name,
+        role,
+        untyped: column.kind !== "numeric" || other.kind !== "numeric",
+        text: column.kind === "text" && other.kind === "text"
+      });
+    }
+
     if (role === "measure") {
-      measures.push({ target: column.name, source: counterpart.name });
+      measures.push({ target: column.name, source: other.name });
       // Both sides have to declare it numeric for the total to be safe. One side declaring it says
       // nothing about the column being summed on the other.
-      if (column.kind !== "numeric" || counterpart.kind !== "numeric") untyped.push(column.name);
-    } else if (role === "categorical") categories.push({ column, source: counterpart.name });
+      if (column.kind !== "numeric" || other.kind !== "numeric") untyped.push(column.name);
+    } else if (role === "categorical") categories.push({ column, source: other.name });
   }
 
-  return { measures, untyped, categories: rankedCategories(categories, filters), renamed: unique(renamed) };
+  return {
+    // Left in the order the target declares them, which is the order the transformation's own select
+    // list writes them. Sorting by anything else — how interesting the check is, say — makes the
+    // generated file read as an arbitrary sequence rather than as a walk down the table.
+    fields,
+    measures,
+    untyped,
+    categories: rankedCategories(categories, filters),
+    renamed: unique(renamed)
+  };
 }
 
 // ---- SQL fragments ----
@@ -778,10 +857,23 @@ export interface ReconSource {
   categories: ColumnPair[];
   /** `driver` supplies the target's rows; `lookup` is joined in for its columns. */
   role: SourceRole;
+  /**
+   * How the transformation reaches this table — the driving `FROM`, or the kind of join. Half the
+   * explanation of any field-level finding: nulls in a column taken through a `LEFT JOIN` are the
+   * join working as written, and the same nulls under an `INNER JOIN` are not.
+   */
+  joinKind: JoinKind;
   /** The transformation collapses rows between here and the target, so counts must differ. */
   grainChanged: boolean;
   /** The `GROUP BY` columns that set the grain, when they are nameable columns of this source. */
   grainColumns: string[];
+  /**
+   * Every column both sides carry, whatever this table's role — the input to the field-level checks
+   * in `layerScripts.ts`. Unlike `measures`, which is empty for a lookup because a lookup's totals are
+   * a different population, a shared *field* is worth checking however the table was joined in: the
+   * question "is this column null" is about the target, and the source only says where it came from.
+   */
+  fields: ReconField[];
 }
 
 export interface ReconTargetFacts {
@@ -882,22 +974,26 @@ export function lineageStatements(all: LineageFact[], target: string, maxHops: n
   return out;
 }
 
-/** Groups the statements of a hop by the table they build, keeping only sources inside the hop. */
-function groupByTarget(facts: LineageFact[], fromSchema: string | null, toSchema: string | null): TargetGroup[] {
+/**
+ * Groups the statements that build a table, keeping the sources `keepSource` accepts.
+ *
+ * A group with no sources left is dropped: with nothing feeding the target there is nothing to
+ * reconcile it against, and the caller that wants those tables anyway (`groupByLayer`, whose quality
+ * checks apply to a table with no lineage at all) adds them back itself.
+ */
+function groupWrites(
+  facts: LineageFact[],
+  keepTarget: (target: string) => boolean,
+  keepSource: (source: string, target: string) => boolean
+): Map<string, TargetGroup> {
   const groups = new Map<string, TargetGroup>();
 
   for (const fact of facts) {
     const target = fact.targetTable;
-    if (!target || isTempTable(target) || !inSchema(target, toSchema)) continue;
+    if (!target || isTempTable(target) || !keepTarget(target)) continue;
 
-    // Sources from the layer feeding this hop, plus the target's own layer: a report built from a
-    // fact table next to it is still a reconciliation the engineer has to do, and it belongs to the
-    // hop that produces that layer rather than to no hop at all.
     const sources = fact.sourceTables.filter(
-      (source) =>
-        !isTempTable(source) &&
-        source !== target &&
-        (inSchema(source, fromSchema) || (toSchema !== null && inSchema(source, toSchema)))
+      (source) => !isTempTable(source) && source !== target && keepSource(source, target)
     );
     if (sources.length === 0) continue;
 
@@ -907,7 +1003,53 @@ function groupByTarget(facts: LineageFact[], fromSchema: string | null, toSchema
     groups.set(target, group);
   }
 
+  return groups;
+}
+
+function sortedGroups(groups: Map<string, TargetGroup>): TargetGroup[] {
   return Array.from(groups.values()).sort((a, b) => a.target.localeCompare(b.target));
+}
+
+/** Groups the statements of a hop by the table they build, keeping only sources inside the hop. */
+function groupByTarget(facts: LineageFact[], fromSchema: string | null, toSchema: string | null): TargetGroup[] {
+  return sortedGroups(
+    groupWrites(
+      facts,
+      (target) => inSchema(target, toSchema),
+      // Sources from the layer feeding this hop, plus the target's own layer: a report built from a
+      // fact table next to it is still a reconciliation the engineer has to do, and it belongs to the
+      // hop that produces that layer rather than to no hop at all.
+      (source) => inSchema(source, fromSchema) || (toSchema !== null && inSchema(source, toSchema))
+    )
+  );
+}
+
+/**
+ * Every table of one layer, with everything feeding it wherever that came from.
+ *
+ * Two things separate this from `groupByTarget`, and both follow from the question being asked. A hop
+ * asks "does this pair of layers agree", so it keeps only the sources that lie across the pair; a
+ * layer asks "is this layer sound and where did it come from", so a table built directly out of the
+ * raw layer three hops back is described by the table that actually builds it rather than dropped for
+ * skipping a layer. And a table the project never writes — the raw feed the pipeline starts from — is
+ * still a table of the layer, so it is kept with no sources: the quality checks apply to it, and its
+ * being an entry point is a fact about the pipeline worth stating rather than an absence.
+ */
+function groupByLayer(facts: LineageFact[], schema: string | null): TargetGroup[] {
+  const groups = groupWrites(
+    facts,
+    (target) => inSchema(target, schema),
+    () => true
+  );
+
+  for (const fact of facts) {
+    for (const table of [fact.targetTable, ...fact.sourceTables]) {
+      if (!table || isTempTable(table) || !inSchema(table, schema) || groups.has(table)) continue;
+      groups.set(table, { target: table, sources: [], facts: [] });
+    }
+  }
+
+  return sortedGroups(groups);
 }
 
 function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string): ReconTargetFacts {
@@ -933,10 +1075,10 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
   // against the target and a table read only to set a variable isn't reconciled against it at all.
   const usage = mergeUsage(group.facts.map((fact) => analyseSourceUsage(fact.rawSql, group.target)));
   const usageOf = (source: string): SourceUsage => {
-    if (!usage) return { role: "driver", grainChanged: false, grainColumns: [] };
+    if (!usage) return { role: "driver", joinKind: "from", grainChanged: false, grainColumns: [] };
     return (
       usage.get(source.toLowerCase()) ??
-      usage.get(bareName(source)) ?? { role: "incidental", grainChanged: false, grainColumns: [] }
+      usage.get(bareName(source)) ?? { role: "incidental", joinKind: "from", grainChanged: false, grainColumns: [] }
     );
   };
 
@@ -968,13 +1110,17 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
       grainColumns.length > 0 &&
       (known.size === 0 || grainColumns.every((column) => known.has(column)));
 
+    const join = joinKey(key, targetColumns, sourceColumns, mismatched);
+
     return {
       source,
-      join: joinKey(key, targetColumns, sourceColumns, mismatched),
+      join,
       // Only a driver's totals flow into the target's rows; a lookup's are a different population.
       measures: how.role === "driver" ? shared.measures.slice(0, MAX_MEASURES) : [],
       categories: shared.categories.slice(0, MAX_CATEGORIES),
+      fields: shared.fields.slice(0, MAX_FIELDS),
       role: how.role,
+      joinKind: how.joinKind,
       grainChanged: how.grainChanged,
       grainColumns: usable ? grainColumns : []
     };
@@ -1213,14 +1359,9 @@ export function assembleScript(params: {
 }
 
 /**
- * Reads the project into one set of grounded facts per target table, grouped into the pipeline hop
- * that produces it. Nothing is written here — this is the input both script writers share.
- *
- * `layers` are the confirmed pipeline layers, most-raw first; adjacent pairs become hops. With fewer
- * than two layers — the SQL never qualifies its tables, so none could be inferred — every lineage
- * pair in the project is grouped into a single scope instead, exactly as the governance review does.
+ * What the project's SQL says every table's columns are, read once for whichever grouping wants it.
  */
-export function gatherReconciliationFacts(project: LocalProject, layers: LayerRef[]): ReconGrounding {
+function indexProjectColumns(project: LocalProject): { columns: ColumnIndex; columnFacts: ColumnFacts } {
   const columns = buildColumnIndex(
     project.facts
       .filter((fact) => fact.targetTable !== null && !isTempTable(fact.targetTable))
@@ -1241,6 +1382,20 @@ export function gatherReconciliationFacts(project: LocalProject, layers: LayerRe
     index: columns,
     usage: buildColumnUsage(project.facts.map((fact) => ({ sql: fact.rawSql })), allTables)
   };
+
+  return { columns, columnFacts };
+}
+
+/**
+ * Reads the project into one set of grounded facts per target table, grouped into the pipeline hop
+ * that produces it. Nothing is written here — this is the input both script writers share.
+ *
+ * `layers` are the confirmed pipeline layers, most-raw first; adjacent pairs become hops. With fewer
+ * than two layers — the SQL never qualifies its tables, so none could be inferred — every lineage
+ * pair in the project is grouped into a single scope instead, exactly as the governance review does.
+ */
+export function gatherReconciliationFacts(project: LocalProject, layers: LayerRef[]): ReconGrounding {
+  const { columns, columnFacts } = indexProjectColumns(project);
 
   const hopSpecs: { from: LayerRef | null; to: LayerRef | null }[] =
     layers.length >= 2 ? layers.slice(0, -1).map((from, i) => ({ from, to: layers[i + 1] })) : [{ from: null, to: null }];
@@ -1275,6 +1430,66 @@ export function gatherReconciliationFacts(project: LocalProject, layers: LayerRe
   });
 
   return { hops, columns, columnFacts };
+}
+
+export interface ReconLayerFacts {
+  /** Null only when the SQL never qualifies its tables, so no layer could be inferred. */
+  layer: LayerRef | null;
+  /** `transformation`, or `whole project` when there are no layers. */
+  label: string;
+  /** `03_transformation.sql` — position first, so the files list in pipeline order. */
+  filename: string;
+  targets: ReconTargetFacts[];
+  notes: string[];
+}
+
+export interface ReconLayerGrounding {
+  layers: ReconLayerFacts[];
+  columns: ColumnIndex;
+  columnFacts: ColumnFacts;
+}
+
+/**
+ * The same grounding as `gatherReconciliationFacts`, grouped by the layer a table *lives in* rather
+ * than by the hop that produces it.
+ *
+ * The two answer different questions and both are worth asking. A hop asks whether one pair of layers
+ * agrees, and it is the right unit for signing off a load. A layer asks what a layer contains, where
+ * each of its tables came from and whether each is sound — the unit for reviewing one stage of a
+ * warehouse, which is how the work is actually divided up. The difference shows in what each keeps:
+ * a hop drops a table built straight out of a layer two hops back, and a layer keeps it and names the
+ * real source; a hop has nothing to say about a table nothing in the project builds, and a layer
+ * still checks it, because a raw feed nobody wrote is exactly the table whose row count matters.
+ */
+export function gatherLayerFacts(project: LocalProject, layers: LayerRef[]): ReconLayerGrounding {
+  const { columns, columnFacts } = indexProjectColumns(project);
+  const specs: (LayerRef | null)[] = layers.length > 0 ? layers : [null];
+
+  const built = specs.map((layer, index) => {
+    const groups = groupByLayer(project.facts, layer?.schema ?? null);
+    const stem = `${String(index + 1).padStart(2, "0")}_${slug(layer?.label ?? "all tables")}`;
+
+    const takenNames = new Set<string>();
+    const targets = groups.map((group) => {
+      let name = `${slug(bareName(group.target))}.sql`;
+      for (let n = 2; takenNames.has(name); n++) name = `${slug(bareName(group.target))}_${n}.sql`;
+      takenNames.add(name);
+      return targetFacts(group, columns, name);
+    });
+
+    const notes: string[] = [];
+    if (targets.length === 0) {
+      notes.push(
+        layer
+          ? `No SQL in this project names a table in the ${layer.schema} schema, so this layer has nothing to check. Check that the layers match the schema names the SQL uses.`
+          : "No table could be found in this project's SQL."
+      );
+    }
+
+    return { layer, label: layer?.label ?? "whole project", filename: `${stem}.sql`, targets, notes };
+  });
+
+  return { layers: built, columns, columnFacts };
 }
 
 /** Packs one hop's finished scripts, with the single query that covers all of them at once. */

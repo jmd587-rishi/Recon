@@ -5,6 +5,10 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { buildAiReconciliationSuite } from "../services/aiReconciliation.js";
 import { buildDocumentation } from "../services/documentation.js";
+import {
+  buildLayerReconciliation,
+  summarizeLayerReconciliation
+} from "../services/layerReconciliation.js";
 import { detectLayers, unassignedSchemas } from "../services/layers.js";
 import { LlmConfigError } from "../services/llmClient.js";
 import type { LocalProject } from "../services/localProject.js";
@@ -402,6 +406,9 @@ async function writeSuite(
     "PASS on every row means the hop ties out. REVIEW means the numbers differ and a filter or",
     "aggregation has to explain it; FAIL means duplicate keys, null keys, or target rows no source",
     "accounts for. The detail queries behind any count are at the foot of the same file, commented out.",
+    "",
+    "The layers/ folder beside this one reconciles the same pipeline column by column, one file per",
+    "layer, with the reviewer model's reading of why each row might not tie out.",
     ...(split ? ["", "--split also wrote the per-table scripts, one folder per hop."] : []),
     ...(suite.notice ? ["", suite.notice] : []),
     "",
@@ -417,10 +424,6 @@ async function writeSuite(
   console.log(`Wrote ${outRoot}`);
   for (const line of written) console.log(`  ${line}`);
   if (suite.notice) console.log(`\nNote: ${suite.notice}`);
-  if (suggestDocument) {
-    console.log("\nWrite this up as a document with: reconcile document");
-    console.log("Export the lineage as editable PowerPoint shapes with: reconcile diagrams");
-  }
 }
 
 /** The governance half, shared by `scripts` and the tail of `run`. */
@@ -452,7 +455,50 @@ async function generateAndWriteSuite(
     }
   }
 
-  await writeSuite(args.dir, args.out, suite, args.split, args.oneFile, suggestDocument);
+  await writeSuite(args.dir, args.out, suite, args.split, args.oneFile, false);
+  await writeLayerReconciliation(args, project, layers);
+
+  if (suggestDocument) {
+    console.log("\nWrite this up as a document with: reconcile document");
+    console.log("Export the lineage as editable PowerPoint shapes with: reconcile diagrams");
+  }
+}
+
+/**
+ * The per-layer reconciliation, written straight after the governance scripts and from the same
+ * project — never as a command of its own.
+ *
+ * The hop bundles say whether the pipeline ties out. This says, for every column of every table, which
+ * source it came from, how the code relates the two, and — when it does not tie out — what in the
+ * transformation SQL would explain it, as read by the reviewer model. One is the status, the other is
+ * the reason, and asking someone to remember a second command to get the reason is how the reason
+ * stops being read.
+ */
+async function writeLayerReconciliation(args: Args, project: LocalProject, layers: LayerRef[]): Promise<void> {
+  console.log("\nReconciling each layer column by column, and asking the reviewer model to explain each row...");
+
+  const suite = await buildLayerReconciliation(project, layers, args.useAi);
+  const outRoot = path.join(args.dir, args.out, "layers");
+  await mkdir(outRoot, { recursive: true });
+
+  for (const script of suite.scripts) {
+    await writeFile(path.join(outRoot, script.filename), script.sql, "utf8");
+  }
+  await writeFile(path.join(outRoot, "SUMMARY.txt"), summarizeLayerReconciliation(suite, new Date()), "utf8");
+
+  console.log("");
+  console.log(`Wrote ${outRoot}`);
+  for (const script of suite.scripts) {
+    console.log(
+      `  ${script.filename}  (${script.pairCount} source/target pair${script.pairCount === 1 ? "" : "s"}, ` +
+        `${script.rowCount} column${script.rowCount === 1 ? "" : "s"}` +
+        `${script.commentedCount > 0 ? `, ${script.commentedCount} explained` : ""})`
+    );
+  }
+  console.log("");
+  console.log("  six columns: source_table, target_table, reconciled_column, join_type, result, comments");
+  if (suite.notice) console.log(`
+  Note: comments is empty — ${suite.notice}`);
 }
 
 async function runScripts(args: Args): Promise<void> {

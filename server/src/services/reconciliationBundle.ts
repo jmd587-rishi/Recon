@@ -39,8 +39,16 @@ const MAX_FILTER_CHARS = 160;
 
 // ---- small SQL helpers ----
 
+/**
+ * A SQL string literal, with the two characters that could escape it neutralised.
+ *
+ * Doubling the quote is what makes it a literal. Dropping the semicolon is what keeps the file usable:
+ * the whole bundle is a single statement, so one `;` inside a literal would turn it into two for
+ * everything that splits on the character rather than parsing — plenty of runners, migration tools and
+ * `sqlcmd` wrappers do, and so does the obvious way to check "is this one statement".
+ */
 function quoted(text: string): string {
-  return `'${text.replace(/'/g, "''")}'`;
+  return `'${text.replace(/'/g, "''").replace(/;/g, ",")}'`;
 }
 
 function cast(expr: string): string {
@@ -84,8 +92,15 @@ interface BundleRow {
   targetValue: string;
   /** Reads 0 when the check passes — every row obeys this, which is what makes the table scannable. */
   difference: string;
-  /** A CASE expression returning PASS / REVIEW / FAIL. */
-  status: string;
+  /**
+   * The boolean condition under which this check passes — the one place a row says what "right" is.
+   *
+   * Kept as the condition rather than as a rendered `CASE` so a caller adding a column that depends on
+   * the same verdict — an explanation, a severity — writes it from this and cannot drift out of step.
+   */
+  passWhen: string;
+  /** What the row reads when `passWhen` doesn't hold: `'REVIEW'` or `'FAIL'`. */
+  failStatus: string;
   /** The FROM clause tying the row to its CTEs. */
   from: string;
 }
@@ -124,7 +139,7 @@ function renderRow(row: BundleRow, seq: number, scope: string, first: boolean): 
     row.sourceValue,
     row.targetValue,
     row.difference,
-    row.status
+    `CASE WHEN ${row.passWhen} THEN 'PASS' ELSE ${row.failStatus} END`
   ];
 
   const select = values
@@ -222,9 +237,8 @@ function tidyFilter(filter: string): string {
 }
 
 /** Duplicate and null keys are a defect when the key is declared, and evidence the guess was wrong when it isn't. */
-function keyStatus(facts: ReconTargetFacts, expr: string): string {
-  const bad = facts.key.confidence === "declared" ? "'FAIL'" : "'REVIEW'";
-  return `CASE WHEN ${expr} = 0 THEN 'PASS' ELSE ${bad} END`;
+function keyFailStatus(facts: ReconTargetFacts): string {
+  return facts.key.confidence === "declared" ? "'FAIL'" : "'REVIEW'";
 }
 
 function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, index: number): TargetBundle {
@@ -369,22 +383,20 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
       difference: cast(`t.row_count - ${value}`),
       // Grouping can only collapse rows, so under `at_most` fewer is the transformation working and
       // more is rows appearing from nowhere — which is a defect on its own terms, not a REVIEW.
-      status:
-        countable.comparison === "equal"
-          ? `CASE WHEN t.row_count = ${value} THEN 'PASS' ELSE 'REVIEW' END`
-          : `CASE WHEN t.row_count <= ${value} THEN 'PASS' ELSE 'FAIL' END`,
+      passWhen: countable.comparison === "equal" ? `t.row_count = ${value}` : `t.row_count <= ${value}`,
+      failStatus: countable.comparison === "equal" ? "'REVIEW'" : "'FAIL'",
       from: `FROM ${prefix} t CROSS JOIN ${s} s`
     });
   });
 
-  facts.perSource.forEach(({ source, measures }, i) => {
+  facts.perSource.forEach((entry, i) => {
     const s = `${prefix}_s${i + 1}`;
-    for (const measure of measures) {
+    for (const measure of entry.measures) {
       const column = sumAlias(measure.target);
       rows.push({
         checkName: "Measure total",
         target: facts.target,
-        source,
+        source: entry.source,
         metric:
           measure.target === measure.source
             ? `SUM(${measure.target})`
@@ -392,33 +404,35 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
         sourceValue: cast(`s.${column}`),
         targetValue: cast(`t.${column}`),
         difference: cast(`COALESCE(t.${column}, 0) - COALESCE(s.${column}, 0)`),
-        status: `CASE WHEN COALESCE(t.${column}, 0) = COALESCE(s.${column}, 0) THEN 'PASS' ELSE 'REVIEW' END`,
+        passWhen: `COALESCE(t.${column}, 0) = COALESCE(s.${column}, 0)`,
+        failStatus: "'REVIEW'",
         from: `FROM ${prefix} t CROSS JOIN ${s} s`
       });
     }
   });
 
-  facts.perSource.forEach(({ source, categories }, i) => {
-    categories.forEach((column, j) => {
+  facts.perSource.forEach((entry, i) => {
+    entry.categories.forEach((column, j) => {
       const alias = distinctAlias(column.target);
       const label =
         column.target === column.source ? column.target : `${column.target} against ${column.source}`;
       rows.push({
         checkName: "Label values",
         target: facts.target,
-        source,
+        source: entry.source,
         metric: `COUNT(DISTINCT ${label})`,
         sourceValue: cast(`s.${alias}`),
         targetValue: cast(`t.${alias}`),
         difference: cast(`COALESCE(t.${alias}, 0) - COALESCE(s.${alias}, 0)`),
-        status: `CASE WHEN COALESCE(t.${alias}, 0) = COALESCE(s.${alias}, 0) THEN 'PASS' ELSE 'REVIEW' END`,
+        passWhen: `COALESCE(t.${alias}, 0) = COALESCE(s.${alias}, 0)`,
+        failStatus: "'REVIEW'",
         from: `FROM ${prefix} t CROSS JOIN ${prefix}_s${i + 1} s`
       });
 
       rows.push({
         checkName: "Label values on one side only",
         target: facts.target,
-        source,
+        source: entry.source,
         metric: `unmatched values of ${label}`,
         // Equal distinct counts still hide a value swapped for another, which is what this row is
         // for. Never FAIL, whichever direction it goes: a value dropped may be the filter doing its
@@ -427,39 +441,43 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
         sourceValue: cast("v.values_dropped"),
         targetValue: cast("v.values_added"),
         difference: cast("v.values_added + v.values_dropped"),
-        status: "CASE WHEN v.values_added + v.values_dropped = 0 THEN 'PASS' ELSE 'REVIEW' END",
+        passWhen: "v.values_added + v.values_dropped = 0",
+        failStatus: "'REVIEW'",
         from: `FROM ${prefix}_s${i + 1}_v${j + 1} v`
       });
     });
   });
 
-  facts.perSource.forEach(({ source, join }, i) => {
+  facts.perSource.forEach((entry, i) => {
+    const join = entry.join;
     if (join.columns.length === 0) return;
     const key = join.columns.join(", ");
 
     rows.push({
       checkName: "Keys missing from target",
       target: facts.target,
-      source,
+      source: entry.source,
       metric: `unmatched source rows on (${key})`,
       sourceValue: cast("m.rows_missing"),
       targetValue: NO_VALUE,
       difference: cast("m.rows_missing"),
-      status: "CASE WHEN m.rows_missing = 0 THEN 'PASS' ELSE 'REVIEW' END",
+      passWhen: "m.rows_missing = 0",
+      failStatus: "'REVIEW'",
       from: `FROM ${prefix}_s${i + 1}_missing m`
     });
 
     rows.push({
       checkName: "Target keys with no source row",
       target: facts.target,
-      source,
+      source: entry.source,
       metric: `unmatched target rows on (${key})`,
       sourceValue: NO_VALUE,
       targetValue: cast("o.rows_orphaned"),
       difference: cast("o.rows_orphaned"),
       // With more than one source, rows this source cannot account for may simply have come from
       // another of them — a fact worth reading, not a defect on its own.
-      status: `CASE WHEN o.rows_orphaned = 0 THEN 'PASS' ELSE ${facts.sources.length > 1 ? "'REVIEW'" : "'FAIL'"} END`,
+      passWhen: "o.rows_orphaned = 0",
+      failStatus: facts.sources.length > 1 ? "'REVIEW'" : "'FAIL'",
       from: `FROM ${prefix}_s${i + 1}_orphan o`
     });
   });
@@ -474,7 +492,8 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
       sourceValue: NO_VALUE,
       targetValue: cast("d.dup_rows"),
       difference: cast("d.dup_rows"),
-      status: keyStatus(facts, "d.dup_rows"),
+      passWhen: "d.dup_rows = 0",
+      failStatus: keyFailStatus(facts),
       from: `FROM ${prefix}_dup d`
     });
 
@@ -486,7 +505,8 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
       sourceValue: NO_VALUE,
       targetValue: cast("t.null_key_rows"),
       difference: cast("t.null_key_rows"),
-      status: keyStatus(facts, "t.null_key_rows"),
+      passWhen: "t.null_key_rows = 0",
+      failStatus: keyFailStatus(facts),
       from: `FROM ${prefix} t`
     });
   }
@@ -519,7 +539,8 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
       sourceValue: NO_VALUE,
       targetValue: cast("c.rows_flagged"),
       difference: cast("c.rows_flagged"),
-      status: "CASE WHEN c.rows_flagged = 0 THEN 'PASS' ELSE 'REVIEW' END",
+      passWhen: "c.rows_flagged = 0",
+      failStatus: "'REVIEW'",
       from: `FROM ${name} c`
     });
 
@@ -540,7 +561,7 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
   return { ctes, rows, header, appendix };
 }
 
-function indent(text: string, spaces: number): string {
+export function indent(text: string, spaces: number): string {
   const pad = " ".repeat(spaces);
   return text
     .split("\n")
@@ -550,7 +571,11 @@ function indent(text: string, spaces: number): string {
 
 // ---- the file ----
 
-function wrap(text: string, indentText: string, width = 76): string[] {
+/**
+ * Exported so every generated file looks the same: `layerScripts.ts` writes a different query over the
+ * same facts, and a second copy of these would drift into a second house style.
+ */
+export function wrap(text: string, indentText: string, width = 76): string[] {
   const lines: string[] = [];
   let line = "";
   for (const word of text.split(" ")) {
@@ -565,7 +590,7 @@ function wrap(text: string, indentText: string, width = 76): string[] {
   return lines;
 }
 
-const RULE = "=".repeat(76);
+export const RULE = "=".repeat(76);
 
 function fileHeader(hopLabel: string, folderName: string, targets: TargetBundle[], checkCount: number): string {
   const lines = [

@@ -30,8 +30,21 @@ const MAX_CHAIN_DEPTH = 8;
 
 export type SourceRole = "driver" | "lookup" | "incidental";
 
+/**
+ * How the statement reaches a table: the driving `FROM`, or the kind of join that brought it in.
+ *
+ * Worth recording separately from the role because it is half the explanation of a field-level
+ * finding. A column sourced through a `LEFT JOIN` is null on every row the join failed to match —
+ * that is the join working as written, not a defect — while the same nulls under an `INNER JOIN` mean
+ * the rows should not have survived at all. A check that reports the count without saying which is
+ * making the reader go and read the SQL to interpret its own output.
+ */
+export type JoinKind = "from" | "inner" | "left" | "right" | "full" | "cross";
+
 export interface SourceUsage {
   role: SourceRole;
+  /** `from` for the table the statement reads first, otherwise the join that brought this one in. */
+  joinKind: JoinKind;
   /**
    * The transformation aggregates or dedups between this source and the target, so their row counts
    * are expected to differ and comparing them says nothing.
@@ -102,7 +115,15 @@ export function splitSubStatements(sql: string): { text: string; start: number }
 // ---- reading one query block ----
 
 const IDENT = "[\\w.$#`\\[\\]\"]+";
-const REF_RE = new RegExp(`\\b(from|join)\\s+(${IDENT}|\\()`, "gi");
+/**
+ * The join keyword and everything that qualifies it: `LEFT OUTER JOIN`, `INNER JOIN`, `CROSS JOIN`,
+ * Spark's `LEFT SEMI`/`LEFT ANTI JOIN`, and a bare `JOIN` (which is an inner one). A plain `FROM`
+ * matches with no qualifier, which is how the driving table is told apart from the joined ones.
+ */
+const REF_RE = new RegExp(
+  `(?:\\b(inner|left|right|full|cross)(?:\\s+outer)?(?:\\s+(?:semi|anti))?\\s+)?\\b(from|join)\\s+(${IDENT}|\\()`,
+  "gi"
+);
 
 function cleanRef(ref: string): string {
   return ref.replace(/[`[\]"]/g, "").trim().toLowerCase();
@@ -131,6 +152,8 @@ interface BlockRef {
   derived: string | null;
   /** The first thing the block reads — what its row count is a function of. */
   driving: boolean;
+  /** How this block reaches it: the driving `FROM`, or the kind of join written in front of it. */
+  joinKind: JoinKind;
 }
 
 /** Every table, CTE or derived table this block reads, in the order it reads them. */
@@ -141,14 +164,18 @@ function blockRefs(block: string): BlockRef[] {
 
   while ((match = REF_RE.exec(block))) {
     const driving = refs.length === 0;
-    if (match[2] === "(") {
+    // A bare `JOIN` is an inner one; `FROM` is not a join at all.
+    const joinKind: JoinKind =
+      match[2].toLowerCase() === "from" ? "from" : ((match[1]?.toLowerCase() as JoinKind) ?? "inner");
+
+    if (match[3] === "(") {
       const group = parenContent(block, match.index + match[0].length - 1);
       if (!group) continue;
-      refs.push({ ref: "", derived: group.content, driving });
+      refs.push({ ref: "", derived: group.content, driving, joinKind });
       REF_RE.lastIndex = group.end;
       continue;
     }
-    refs.push({ ref: cleanRef(match[2]), derived: null, driving });
+    refs.push({ ref: cleanRef(match[3]), derived: null, driving, joinKind });
   }
 
   return refs;
@@ -213,6 +240,12 @@ interface Visit {
   grainChanged: boolean;
   /** The innermost `GROUP BY` seen on the way down, which is the grain the base table is read at. */
   grainColumns: string[];
+  /**
+   * The outermost join on the way down, which is the one that decides what reaches the target. A CTE
+   * `LEFT JOIN`ed into the write query contributes its own tables through that left join however they
+   * are joined inside it — the outer join is what leaves their columns null.
+   */
+  joinKind: JoinKind;
   depth: number;
 }
 
@@ -237,7 +270,9 @@ function walk(start: Visit, ctes: Map<string, string>, found: Map<string, Source
 
     for (const ref of blockRefs(visit.block)) {
       const driving = visit.driving && ref.driving;
-      const next = { driving, grainChanged, grainColumns, depth: visit.depth + 1 };
+      // Once inside a join, everything below it arrives through that join whatever it says locally.
+      const joinKind = visit.joinKind === "from" ? ref.joinKind : visit.joinKind;
+      const next = { driving, grainChanged, grainColumns, joinKind, depth: visit.depth + 1 };
 
       if (ref.derived !== null) {
         queue.push({ block: ref.derived, ...next });
@@ -256,6 +291,7 @@ function walk(start: Visit, ctes: Map<string, string>, found: Map<string, Source
       if (existing && existing.role === "driver" && role !== "driver") continue;
       found.set(ref.ref, {
         role,
+        joinKind,
         grainChanged: role === "driver" ? grainChanged : existing?.grainChanged ?? grainChanged,
         grainColumns: role === "driver" ? grainColumns : existing?.grainColumns ?? []
       });
@@ -298,7 +334,11 @@ export function analyseSourceUsage(rawSql: string, targetTable: string): Map<str
   // The write query itself is everything after the last CTE body, which `blockRefs` reaches by
   // skipping what `collectCteBodies` already consumed — passing the whole text is equivalent, since
   // a CTE reached from the outer query is followed anyway and one that isn't contributes nothing.
-  walk({ block: outerQuery(writing.text, ctes), driving: true, grainChanged: false, grainColumns: [], depth: 0 }, ctes, found);
+  walk(
+    { block: outerQuery(writing.text, ctes), driving: true, grainChanged: false, grainColumns: [], joinKind: "from", depth: 0 },
+    ctes,
+    found
+  );
 
   return found;
 }
