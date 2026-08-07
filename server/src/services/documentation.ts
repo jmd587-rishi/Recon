@@ -6,6 +6,7 @@ import type {
   LocalFileSummary,
   LocalSkippedFile,
   ProjectDocumentationProse,
+  ReconCheckKind,
   TableKind
 } from "../types/index.js";
 import { Resvg } from "@resvg/resvg-js";
@@ -28,6 +29,12 @@ import {
   templateChecks,
   type ReconTargetFacts
 } from "./reconciliationScripts.js";
+import {
+  buildTroubleshootingPlan,
+  FAILURE_GUIDE,
+  KIND_LABELS,
+  type TroubleshootingPlan
+} from "./troubleshooting.js";
 
 /**
  * `reconcile document` — the whole reconciliation exercise written up as a document.
@@ -944,6 +951,123 @@ function reconciliationSection(facts: DocFacts, governanceFiles: string[]): DocB
   return blocks;
 }
 
+/**
+ * `a, b or c` — for the sentences naming which checks send you to a query.
+ *
+ * Separate from `list` above, which is for inventories where a trailing conjunction would read oddly
+ * ("tables x, y and z" is a set; "run this when x, y fails" is a sentence and needs the word).
+ */
+function orList(values: string[]): string {
+  if (values.length <= 1) return values[0] ?? "";
+  return `${values.slice(0, -1).join(", ")} or ${values[values.length - 1]}`;
+}
+
+/** The order the guide reads in — the order someone works in, not the order the enum declares. */
+const GUIDE_ORDER: ReconCheckKind[] = [
+  "row_count",
+  "measure_totals",
+  "missing_keys",
+  "orphan_keys",
+  "duplicate_keys",
+  "null_keys",
+  "category_values",
+  "custom"
+];
+
+/**
+ * What to do when a check fails — the section that turns a REVIEW into a next action.
+ *
+ * Everything structural about this document says whether the pipeline ties out. This is the only part
+ * that says what to do when it doesn't, and it is deliberately the last thing before the open
+ * questions: by here the reader knows the layers, the lineage and the checks, so a drill-down naming
+ * two of their own tables reads as a next step rather than as more generated SQL.
+ *
+ * The queries are written into the document rather than into the scripts on purpose. A reconciliation
+ * file is run and read down its status column; padding it with diagnostics for failures that mostly
+ * won't happen is how it stops being read. Here they cost nothing until they are needed.
+ */
+function troubleshootingSection(plan: TroubleshootingPlan): DocBlock[] {
+  const blocks: DocBlock[] = [{ kind: "heading", level: 1, text: "If a check fails" }];
+
+  blocks.push({
+    kind: "para",
+    text:
+      "A REVIEW or FAIL row names the table, the source and the metric, but not the cause. This section " +
+      "is the step after that: what each kind of failure usually means, and — for this project's own " +
+      "tables — the query to run next, so a difference can be chased down without anyone rewriting the " +
+      "join by hand."
+  });
+
+  blocks.push({ kind: "heading", level: 2, text: "Where to start, by check" });
+  blocks.push({
+    kind: "table",
+    columns: [
+      { header: "Check", widthPct: 16 },
+      { header: "Suspect first", widthPct: 42 },
+      { header: "Next step", widthPct: 42 }
+    ],
+    rows: GUIDE_ORDER.map((kind) => [KIND_LABELS[kind], FAILURE_GUIDE[kind].suspect, FAILURE_GUIDE[kind].nextStep])
+  });
+
+  if (plan.targets.length === 0) {
+    blocks.push({
+      kind: "para",
+      text:
+        "No drill-down queries could be built for this project: they are keyed on the join columns " +
+        "between a target and its sources, and none were recoverable here. The guidance above still " +
+        "applies — the queries would only have saved the typing."
+    });
+    return blocks;
+  }
+
+  blocks.push({ kind: "heading", level: 2, text: "Ready-made drill-down queries" });
+  blocks.push({
+    kind: "para",
+    text:
+      `${plural(plan.shown, "query", "queries")} for ${plural(plan.targets.length, "table")}, built from the same ` +
+      "lineage and column lists as the checks themselves, so every table and column named below is one " +
+      "this project defines. They are read-only and portable — the same SQL runs on SQL Server and " +
+      "Databricks SQL. Work down each table in the order given: prove the joins are clean before " +
+      "believing what the totals say, because one source that fans out fails every other check at once."
+  });
+
+  for (const entry of plan.targets) {
+    blocks.push({ kind: "heading", level: 3, text: `${entry.target} (${entry.hopLabel})` });
+    for (const query of entry.queries) {
+      // Level 4 so the queries don't each claim a line in the table of contents, which lists 1 and 2.
+      blocks.push({ kind: "heading", level: 4, text: query.title });
+      blocks.push({
+        kind: "para",
+        text:
+          `Run this when ${orList(query.triggeredBy.map((kind) => KIND_LABELS[kind].toLowerCase()))} ` +
+          `${agree(query.triggeredBy.length, "fails", "fail")}. ${query.reading}`
+      });
+      blocks.push({ kind: "code", text: query.sql });
+    }
+  }
+
+  if (plan.omitted > 0) {
+    blocks.push({
+      kind: "para",
+      text:
+        `${plural(plan.omitted, "further query", "further queries")} of the same shapes were left out to keep this ` +
+        "section readable. The patterns above are identical for every table — copy the nearest one and " +
+        "change the table and key names."
+    });
+  }
+
+  if (plan.withoutQueries.length > 0) {
+    blocks.push({
+      kind: "para",
+      text:
+        `No drill-down could be built for ${list(plan.withoutQueries, 8)} — these have no recoverable join ` +
+        "key between target and source, which is the same reason their row-level checks are limited."
+    });
+  }
+
+  return blocks;
+}
+
 function risksSection(facts: DocFacts, prose: DocProse): DocBlock[] {
   const blocks: DocBlock[] = [{ kind: "heading", level: 1, text: "Gaps and open questions" }];
 
@@ -1069,20 +1193,28 @@ export function humanizeProjectName(folderName: string): string {
 
 /**
  * Assembles the document: cover, contents, and the sections in the order a reader needs them —
- * what this is, how it's laid out, how the data flows, what each stage means, how it is proved, and
- * what is still open. Pure, so the assembly is testable without a model or a template.
+ * what this is, how it's laid out, how the data flows, what each stage means, how it is proved, what
+ * to do when it isn't, and what is still open. Pure, so the assembly is testable without a model or a
+ * template.
  */
 export function buildDocumentationModel(
   facts: DocFacts,
   prose: DocProse,
   options: { generatedAt: Date; governanceFiles?: string[] }
 ): DocDocument {
+  // Derived from the same target facts the checks are, so a drill-down can only name a column the
+  // project defines — and needs no model, so it is one section that cannot arrive empty.
+  const troubleshooting = buildTroubleshootingPlan(
+    facts.hops.map((hop) => ({ label: hop.label, targets: hop.targets }))
+  );
+
   const blocks: DocBlock[] = [
     ...introSection(facts, prose, options.generatedAt),
     ...layerSection(facts, prose),
     ...lineageSection(facts, prose),
     ...hopSection(facts, prose),
     ...reconciliationSection(facts, options.governanceFiles ?? []),
+    ...troubleshootingSection(troubleshooting),
     ...risksSection(facts, prose),
     ...appendixSection(facts)
   ];

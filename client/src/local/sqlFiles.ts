@@ -1,10 +1,10 @@
 import type { LocalSkippedFile } from "../types";
 
 /**
- * Locates the SQL in a folder the user picked from disk.
+ * Locates the pipeline code in a folder the user picked from disk.
  *
  * A directory `<input>` hands back every file under the folder — hundreds of them in a real repo,
- * most irrelevant. Filtering and reading happen here in the browser so only the SQL text crosses the
+ * most irrelevant. Filtering and reading happen here in the browser so only the code text crosses the
  * wire, and so the caps below are enforced before a multi-megabyte request is built rather than
  * after the server rejects it.
  */
@@ -13,9 +13,18 @@ export const MAX_FILES = 300;
 export const MAX_FILE_BYTES = 512 * 1024;
 export const MAX_TOTAL_BYTES = 6 * 1024 * 1024;
 
-/** Kept in step with the server's `isSqlFile` — both sides filter, the server has the last word. */
+/**
+ * Extensions holding pipeline code, kept in step with the server's `codeFiles.CODE_EXTENSIONS` — both
+ * sides filter and the server has the last word. A warehouse project is rarely one language: SSDT
+ * `.sql` scripts next to Databricks notebooks exported as `.py` or `.scala`, with the lineage running
+ * straight through both, so filtering to `.sql` alone leaves half the pipeline looking like it comes
+ * from nowhere.
+ */
+const CODE_EXTENSIONS = [".sql", ".py", ".scala", ".r", ".ipynb"];
+
 export function isSqlFileName(path: string): boolean {
-  return path.toLowerCase().endsWith(".sql");
+  const lower = path.toLowerCase();
+  return CODE_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
 export interface LocatedSqlFile {
