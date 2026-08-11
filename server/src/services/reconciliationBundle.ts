@@ -6,7 +6,8 @@ import {
   type ReconHopFacts,
   type ReconTargetFacts
 } from "./reconciliationScripts.js";
-import { stripSqlComments } from "./tableLineage.js";
+import { platformNote, type SqlPlatform } from "./sqlPlatform.js";
+import { splitSqlTablesByOp, stripSqlComments } from "./tableLineage.js";
 
 /**
  * One hop, one file, one query.
@@ -84,7 +85,11 @@ interface Cte {
 interface BundleRow {
   checkName: string;
   target: string;
-  /** Null for a check that looks at the target alone: duplicates, null keys, a custom check. */
+  /**
+   * Null for a check that looks at the target alone: duplicates, null keys, a model-written check
+   * whose SQL names no source. Those rows are dropped before rendering — every row of this table
+   * compares two tables — and `targetOnlyNote` says which were left out.
+   */
   source: string | null;
   /** What the numbers on this row are measuring, e.g. `rows` or `SUM(amount)`. */
   metric: string;
@@ -229,6 +234,8 @@ interface TargetBundle {
   /** Header lines describing this table's key, measures and filters. */
   header: string[];
   appendix: Appendix[];
+  /** Checks left out because they compare the target with nothing — see `withSource`. */
+  targetOnly: string[];
 }
 
 function tidyFilter(filter: string): string {
@@ -241,7 +248,12 @@ function keyFailStatus(facts: ReconTargetFacts): string {
   return facts.key.confidence === "declared" ? "'FAIL'" : "'REVIEW'";
 }
 
-function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, index: number): TargetBundle {
+function targetBundle(
+  facts: ReconTargetFacts,
+  script: ReconScript | undefined,
+  index: number,
+  platform: SqlPlatform
+): TargetBundle {
   const prefix = `t${padded(index)}`;
   const ctes: Cte[] = [];
   const rows: BundleRow[] = [];
@@ -250,7 +262,7 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
   const keyColumns = facts.key.columns;
   // A measure whose type nothing declares is converted before it is totalled — see `measureExpr`.
   const untyped = new Set(facts.untypedMeasures);
-  const total = (measure: string) => `SUM(${measureExpr(measure, !untyped.has(measure))})`;
+  const total = (measure: string) => `SUM(${measureExpr(measure, !untyped.has(measure), platform)})`;
 
   const targetExpressions = [
     "COUNT(*) AS row_count",
@@ -534,7 +546,7 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
     rows.push({
       checkName: `${check.title} [ai]`,
       target: facts.target,
-      source: null,
+      source: sourceOfCheck(check.sql, facts.sources),
       metric: "rows returned by the check",
       sourceValue: NO_VALUE,
       targetValue: cast("c.rows_flagged"),
@@ -558,7 +570,29 @@ function targetBundle(facts: ReconTargetFacts, script: ReconScript | undefined, 
     appendix.push({ title: check.title, description: check.description, sql: check.sql });
   }
 
-  return { ctes, rows, header, appendix };
+  const paired = rows.filter((row) => row.source !== null);
+  return {
+    ctes,
+    rows: paired,
+    header,
+    appendix,
+    targetOnly: rows.filter((row) => row.source === null).map((row) => row.checkName)
+  };
+}
+
+/**
+ * Which of the target's sources a model-written check is about, when the check's own SQL says.
+ *
+ * Every other row of the bundle names two tables, and a check that names one is the odd row out — it
+ * compares the target with nothing, so its `source_value` is blank and its `difference` is really a
+ * count. Rather than let those rows sit in the table unattributed, the check's SQL is read for the
+ * sources it actually touches: one match is an answer, several is not, and guessing between them
+ * would put a table name on a row that is not about that table.
+ */
+function sourceOfCheck(sql: string, sources: string[]): string | null {
+  const read = new Set(splitSqlTablesByOp(sql).sourceTables.map((table) => table.toLowerCase()));
+  const hits = sources.filter((source) => read.has(source.toLowerCase()));
+  return hits.length === 1 ? hits[0] : null;
 }
 
 export function indent(text: string, spaces: number): string {
@@ -592,7 +626,13 @@ export function wrap(text: string, indentText: string, width = 76): string[] {
 
 export const RULE = "=".repeat(76);
 
-function fileHeader(hopLabel: string, folderName: string, targets: TargetBundle[], checkCount: number): string {
+function fileHeader(
+  hopLabel: string,
+  folderName: string,
+  targets: TargetBundle[],
+  checkCount: number,
+  platform: SqlPlatform
+): string {
   const lines = [
     `/* ${RULE}`,
     `   Reconciliation — ${hopLabel}`,
@@ -611,9 +651,9 @@ function fileHeader(hopLabel: string, folderName: string, targets: TargetBundle[
     "     REVIEW  the numbers differ, and something has to explain it — a filter or an",
     "             aggregation in the transformation (the ones found are listed per table",
     "             below), or a reconciliation break.",
-    "     FAIL    wrong on its own terms: duplicate keys, null keys, or target rows the",
-    "             only source cannot account for.",
+    "     FAIL    wrong on its own terms: target rows the only source cannot account for.",
     "",
+    ...targetOnlyNote(targets),
     ...wrap(
       "Keep the result by wrapping it: `CREATE TABLE recon_results AS <query>` on Databricks SQL, " +
         "or `SELECT … INTO recon_results FROM (<query>) r` on SQL Server.",
@@ -622,8 +662,7 @@ function fileHeader(hopLabel: string, folderName: string, targets: TargetBundle[
     "",
     ...wrap(
       `Generated by Recon from the SQL in \`${folderName}\`. Every table and column name came from ` +
-        "that SQL — nothing was measured and nothing was invented. Portable SQL: no TOP/LIMIT, so it " +
-        "runs unchanged on SQL Server and Databricks SQL.",
+        `that SQL — nothing was measured and nothing was invented. ${platformNote(platform)}`,
       "   "
     ),
     ""
@@ -635,6 +674,29 @@ function fileHeader(hopLabel: string, folderName: string, targets: TargetBundle[
 
   lines.push(`   ${RULE} */`, "");
   return lines.join("\n");
+}
+
+/**
+ * Says what was left out, so the omission is a decision the reader can see rather than a gap.
+ *
+ * Every row of this table compares two tables, which is the property that makes the `source_table`
+ * column worth reading and the file worth scanning. A check that looks at the target alone — its
+ * duplicate keys, its null keys, a model-written check whose SQL names no source — has nothing to put
+ * in half the columns, so it is not a row here. The model's ones are still in the appendix as SQL.
+ */
+function targetOnlyNote(targets: TargetBundle[]): string[] {
+  const left = Array.from(new Set(targets.flatMap((target) => target.targetOnly)));
+  if (left.length === 0) return [];
+  return [
+    ...wrap(
+      `Every row compares a source with a target, so ${left.length} check${left.length === 1 ? "" : "s"} that ` +
+        `look at the target alone ${left.length === 1 ? "is" : "are"} not in this table: ` +
+        `${left.slice(0, 6).join(", ")}${left.length > 6 ? ", ..." : ""}. Any of them written by the reviewer ` +
+        "model are in the appendix below as runnable SQL.",
+      "   "
+    ),
+    ""
+  ];
 }
 
 function appendixText(entries: { target: string; entries: Appendix[] }[]): string {
@@ -678,7 +740,13 @@ export interface ProjectBundleEntry {
   scripts: ReconScript[];
 }
 
-function projectHeader(folderName: string, hopLabels: string[], targetCount: number, checkCount: number): string {
+function projectHeader(
+  folderName: string,
+  hopLabels: string[],
+  targetCount: number,
+  checkCount: number,
+  platform: SqlPlatform
+): string {
   const lines = [
     `/* ${RULE}`,
     `   Reconciliation — ${folderName}`,
@@ -706,8 +774,7 @@ function projectHeader(folderName: string, hopLabels: string[], targetCount: num
     "     REVIEW  the numbers differ, and something has to explain it — a filter or an",
     "             aggregation in the transformation (the ones found are listed per table",
     "             below), or a reconciliation break.",
-    "     FAIL    wrong on its own terms: duplicate keys, null keys, or target rows the",
-    "             only source cannot account for.",
+    "     FAIL    wrong on its own terms: target rows the only source cannot account for.",
     "",
     ...wrap(
       "Keep the result by wrapping it: `CREATE TABLE recon_results AS <query>` on Databricks SQL, " +
@@ -717,8 +784,7 @@ function projectHeader(folderName: string, hopLabels: string[], targetCount: num
     "",
     ...wrap(
       `Generated by Recon from the SQL in \`${folderName}\`. Every table and column name came from ` +
-        "that SQL — nothing was measured and nothing was invented. Portable SQL: no TOP/LIMIT, so it " +
-        "runs unchanged on SQL Server and Databricks SQL.",
+        `that SQL — nothing was measured and nothing was invented. ${platformNote(platform)}`,
       "   "
     ),
     ""
@@ -738,7 +804,11 @@ function projectHeader(folderName: string, hopLabels: string[], targetCount: num
  * that index (`t01`, `t01_s1`, `t01_dup`); restarting would collide the moment two hops were folded
  * into one `WITH` clause.
  */
-export function buildProjectBundle(entries: ProjectBundleEntry[], folderName: string): ReconBundle {
+export function buildProjectBundle(
+  entries: ProjectBundleEntry[],
+  folderName: string,
+  platform: SqlPlatform = "portable"
+): ReconBundle {
   const filename = "reconciliation.sql";
 
   const ctes: Cte[] = [];
@@ -753,7 +823,7 @@ export function buildProjectBundle(entries: ProjectBundleEntry[], folderName: st
 
   for (const entry of entries) {
     const byTarget = new Map(entry.scripts.map((script) => [script.targetTable, script]));
-    const targets = entry.hop.targets.map((facts) => targetBundle(facts, byTarget.get(facts.target), ++index));
+    const targets = entry.hop.targets.map((facts) => targetBundle(facts, byTarget.get(facts.target), ++index, platform));
 
     notes.push(...entry.hop.notes);
     if (targets.length === 0) continue;
@@ -790,7 +860,7 @@ export function buildProjectBundle(entries: ProjectBundleEntry[], folderName: st
   }
 
   const header =
-    projectHeader(folderName, hopLabels, targetCount, scoped.length).replace(/\n$/, "") +
+    projectHeader(folderName, hopLabels, targetCount, scoped.length, platform).replace(/\n$/, "") +
     headerBlocks.join("\n") +
     `\n   ${RULE} */\n\n`;
 
@@ -807,11 +877,16 @@ export function buildProjectBundle(entries: ProjectBundleEntry[], folderName: st
  * Builds the hop's single-query file. `scripts` are the per-table scripts already assembled for the
  * same hop — the source of the model's checks and of the row-level detail queries.
  */
-export function buildHopBundle(hop: ReconHopFacts, scripts: ReconScript[], folderName: string): ReconBundle {
+export function buildHopBundle(
+  hop: ReconHopFacts,
+  scripts: ReconScript[],
+  folderName: string,
+  platform: SqlPlatform = "portable"
+): ReconBundle {
   const filename = "00_reconciliation.sql";
   const byTarget = new Map(scripts.map((script) => [script.targetTable, script]));
 
-  const targets = hop.targets.map((facts, i) => targetBundle(facts, byTarget.get(facts.target), i + 1));
+  const targets = hop.targets.map((facts, i) => targetBundle(facts, byTarget.get(facts.target), i + 1, platform));
   const rows = targets.flatMap((target) => target.rows);
 
   if (rows.length === 0) {
@@ -843,6 +918,6 @@ export function buildHopBundle(hop: ReconHopFacts, scripts: ReconScript[], folde
 
   return {
     filename,
-    sql: `${fileHeader(hop.label, folderName, targets, rows.length)}${body}${hasAppendix ? appendixText(appendix) : ""}`
+    sql: `${fileHeader(hop.label, folderName, targets, rows.length, platform)}${body}${hasAppendix ? appendixText(appendix) : ""}`
   };
 }

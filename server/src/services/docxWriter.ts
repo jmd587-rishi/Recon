@@ -12,6 +12,15 @@ import type { DocBlock, DocDocument, DocTableColumn, DocTocEntry } from "./docMo
  * `Style1`, `TOC1`) are the template's own: change the template's look and the generated document
  * follows, with no code change here.
  *
+ * **One typeface, one size.** Nothing here sets `w:rFonts` or `w:sz` on a run, so every paragraph the
+ * generator writes takes the font and the size the template's own styles give it — body text, table
+ * cells and SQL blocks alike. The document reads as one document rather than as a report with code
+ * pasted into it, and changing the face or the size for the whole thing is one edit to the template.
+ * A `mono` column still renders as code in the Markdown output, where a monospace span costs nothing;
+ * in Word it is ordinary text, and a code block is marked out by its shading and indent instead. The
+ * only run properties left are the header row's bold white, which is weight and colour rather than a
+ * second typeface.
+ *
  * Three things are edited outside the body, all of them consequences of generating the document:
  * `docProps/core.xml` (the cover-page title is a content control bound to `dc:title`, so the property
  * and the visible text have to agree), `word/settings.xml` (`updateFields`, so Word replaces the
@@ -80,7 +89,6 @@ function paragraph(text: string, style: string | null, props = "", runProps = ""
   return `<w:p>${pPr ? `<w:pPr>${pPr}</w:pPr>` : ""}${text.length > 0 ? runs(text, runProps) : ""}</w:p>`;
 }
 
-const MONO_RUN_PROPS = '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="17"/>';
 const HEADER_RUN_PROPS = '<w:b/><w:color w:val="FFFFFF" w:themeColor="background1"/>';
 const TIGHT_SPACING = '<w:spacing w:after="0" w:line="240" w:lineRule="auto"/>';
 
@@ -92,8 +100,10 @@ function columnWidths(columns: DocTableColumn[]): number[] {
   return columns.map((c) => Math.round((c.widthPct ?? share) * 50));
 }
 
-function tableCell(text: string, widthPct50: number, mono: boolean, header = false): string {
-  const runProps = `${header ? HEADER_RUN_PROPS : ""}${mono ? MONO_RUN_PROPS : ""}`;
+function tableCell(text: string, widthPct50: number, header = false): string {
+  // Bold and white on the header row, nothing at all on the body rows: a cell holding a table name is
+  // the same face and size as one holding a sentence, so a row reads across rather than in two voices.
+  const runProps = header ? HEADER_RUN_PROPS : "";
   return (
     `<w:tc><w:tcPr><w:tcW w:w="${widthPct50}" w:type="pct"/></w:tcPr>` +
     paragraph(text, null, TIGHT_SPACING, runProps) +
@@ -116,14 +126,14 @@ function renderTable(columns: DocTableColumn[], rows: string[][]): string {
 
   const headerRow =
     '<w:tr><w:trPr><w:cnfStyle w:val="100000000000" w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:oddVBand="0" w:evenVBand="0" w:oddHBand="0" w:evenHBand="0" w:firstRowFirstColumn="0" w:firstRowLastColumn="0" w:lastRowFirstColumn="0" w:lastRowLastColumn="0"/><w:tblHeader/><w:trHeight w:val="397"/></w:trPr>' +
-    columns.map((c, i) => tableCell(c.header, widths[i], false, true)).join("") +
+    columns.map((c, i) => tableCell(c.header, widths[i], true)).join("") +
     "</w:tr>";
 
   const bodyRows = rows
     .map(
       (row) =>
         "<w:tr>" +
-        columns.map((c, i) => tableCell(row[i] ?? "", widths[i], c.mono === true)).join("") +
+        columns.map((_c, i) => tableCell(row[i] ?? "", widths[i])).join("") +
         "</w:tr>"
     )
     .join("");
@@ -210,11 +220,13 @@ function renderBlock(block: DocBlock, imageRels: Map<DocBlock, ImageRelId>): str
     case "table":
       return renderTable(block.columns, block.rows);
     case "code":
+      // Shading and an indent mark the block out, not a monospace face. SQL set in the document's own
+      // font loses its column alignment and keeps its indentation, which is the half that carries the
+      // structure — and the document keeps one typeface from cover to appendix.
       return paragraph(
         block.text,
         null,
-        `${TIGHT_SPACING}<w:shd w:val="clear" w:color="auto" w:fill="F4F4F6"/><w:ind w:left="113" w:right="113"/>`,
-        MONO_RUN_PROPS
+        `${TIGHT_SPACING}<w:shd w:val="clear" w:color="auto" w:fill="F4F4F6"/><w:ind w:left="113" w:right="113"/>`
       );
     case "toc":
       return renderToc(block.entries);

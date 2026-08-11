@@ -24,8 +24,10 @@ function buildReadme(suite: LocalReconciliationSuite): string {
     "",
     "One folder per pipeline hop. In each: `00_reconciliation.sql` is the hop's whole reconciliation as",
     "a single query — row counts, measure totals, keys that went missing, keys with no source,",
-    "duplicate keys, null keys, for every table the hop builds — returning one row per check with a",
-    "`status` of PASS, REVIEW or FAIL. Run that one file. The per-table scripts beside it are the same",
+    "for every table the hop builds — returning one row per check with a",
+    "`status` of PASS, REVIEW or FAIL. Every row compares a source with a target; a check that looks",
+    "at the target alone is listed in the file header instead.",
+    "Run that one file. The per-table scripts beside it are the same",
     "checks written out a table at a time, for when a number needs chasing down.",
     "",
     suite.generatedBy === "ai"

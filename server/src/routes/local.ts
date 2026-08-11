@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { detectProjectLayers } from "../services/layerDetection.js";
+import { detectPlatform, parsePlatform } from "../services/sqlPlatform.js";
 import { type CodeFixCandidate, LlmConfigError, suggestLevelCodeFixes } from "../services/llmClient.js";
 import {
   candidateKey,
@@ -81,6 +83,33 @@ localRouter.get("/scan", (_req, res) => {
   res.json(project.scan);
 });
 
+/**
+ * The pipeline layers of the uploaded folder, worked out by reading it rather than by recognising
+ * its schema names — see `layerDetection.ts`.
+ *
+ * The client can already infer layers on its own (`wizard/layers.ts`), and still does when this
+ * fails: the keyword list needs no round trip and no key. What it cannot do is read the SQL, and a
+ * folder whose schemas are named after the business rather than after a medallion convention is
+ * exactly the one where the names say nothing.
+ *
+ * Never 503s the way `/governance` does. Detection degrades internally — model, then names, then the
+ * dependency graph — and `source` and `notice` say which answered, so an unconfigured deployment
+ * costs the reading rather than the step.
+ */
+localRouter.post("/layers", async (_req, res) => {
+  const project = memoryStore.getLocalProject();
+  if (!project) {
+    res.status(409).json({ error: "No SQL folder has been uploaded yet." });
+    return;
+  }
+
+  try {
+    res.json(await detectProjectLayers(project, { useAi: true }));
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : "Layer detection failed." });
+  }
+});
+
 localRouter.delete("/", (_req, res) => {
   memoryStore.setLocalProject(null);
   res.json({ cleared: true });
@@ -109,8 +138,14 @@ localRouter.post("/reconciliation", async (req, res) => {
     return;
   }
 
+  // The CLI asks which engine the scripts must run on; there is nobody to ask on a request, so the
+  // caller may say and the project's own SQL decides when it doesn't. Detected beats `portable`: a
+  // folder written in Snowflake gets Snowflake either way, and only an explicit choice overrides it.
+  const platform =
+    (typeof body.platform === "string" ? parsePlatform(body.platform) : null) ?? detectPlatform(project).platform;
+
   try {
-    res.json(await buildAiReconciliationSuite(project, layers));
+    res.json(await buildAiReconciliationSuite(project, layers, platform));
   } catch (err) {
     if (err instanceof LlmConfigError) {
       res.json(
@@ -118,7 +153,8 @@ localRouter.post("/reconciliation", async (req, res) => {
           project,
           layers,
           "Azure OpenAI isn't configured, so these are Recon's standard schema-derived checks rather than " +
-            "scripts written for this pipeline. Set AZURE_OPENAI_* in server/.env and regenerate."
+            "scripts written for this pipeline. Set AZURE_OPENAI_* in server/.env and regenerate.",
+          platform
         )
       );
       return;

@@ -10,8 +10,15 @@ import {
   type DagLayout
 } from "./dagLayout.js";
 import { buildDiagramComponents, type DiagramComponent, type DiagramGraph } from "./diagramComponents.js";
+import { layerHasTable } from "./layers.js";
 import { edgeKey } from "./lineageOverrides.js";
-import type { LineageEdge, LineageEdgeNotes } from "../types/index.js";
+import type {
+  LayerRef,
+  LineageEdge,
+  LineageEdgeNotes,
+  LocalFileSummary,
+  LocalTableRef
+} from "../types/index.js";
 
 /**
  * Renders the extracted lineage as a page the user can actually reason about before approving it.
@@ -35,6 +42,11 @@ import type { LineageEdge, LineageEdgeNotes } from "../types/index.js";
  * too big to scan. All of that is page-only — `officeSvg.ts` renders a static picture and shares none
  * of it — so filters, animation and custom properties are all fair game here.
  *
+ * Below the graph the same pipeline is shown a second way — as the project's **folder tree**, each
+ * folder carrying the colour of the layer its SQL writes into (see the Project structure block).
+ * Lineage answers "what feeds what"; that answers "where is it", which is the other thing a reader
+ * new to the project needs and cannot get from a graph of table names.
+ *
  * There is deliberately **no find-a-table box**. It dimmed non-matching nodes by writing
  * `style.opacity` straight onto them, and an inline style outranks a stylesheet — so after one
  * keystroke the focus mode's own opacity rules were dead, and clicking a table appeared to highlight
@@ -51,9 +63,13 @@ import type { LineageEdge, LineageEdgeNotes } from "../types/index.js";
  */
 
 export interface LineageDiagramInput extends DiagramGraph {
-  /** Reviewer-model output, all optional — the diagram is fully useful without any of it. */
-  narrative?: string;
-  concerns?: string[];
+  /**
+   * The reviewer model's per-edge notes — the only part of its review this page shows.
+   *
+   * Its prose summary and its list of concerns are deliberately not rendered here: this page is the
+   * graph, and a reader comes to it to see what connects to what. Both are still written to
+   * `lineage.json` and printed at the approval prompt, where they are read once and acted on.
+   */
   notes?: LineageEdgeNotes;
   /**
    * Filename of the editable deck sitting beside this page, linked from it when given.
@@ -63,6 +79,14 @@ export interface LineageDiagramInput extends DiagramGraph {
    * somewhere else, which an absolute path would not survive.
    */
   deckFile?: string;
+  /**
+   * The project's `.sql` files, which the structure block draws as a tree.
+   *
+   * Optional because the graph alone is a complete page — a caller with no file list gets the same
+   * page minus that one section rather than a broken one. `writes` is what ties a file to a layer,
+   * so a summary is enough and no SQL text is needed here.
+   */
+  files?: LocalFileSummary[];
 }
 
 export interface LineageDiagram {
@@ -159,7 +183,7 @@ function edgeTable(edges: LineageEdge[], notes: LineageEdgeNotes | undefined, ta
               `<tr data-from="${escapeHtml(edge.from.toLowerCase())}" data-to="${escapeHtml(edge.to.toLowerCase())}">` +
               `<td><code>${escapeHtml(edge.from)}</code></td>` +
               `<td><code>${escapeHtml(edge.to)}</code></td>` +
-              `<td class="src">${escapeHtml(edge.notebookPath)}<span class="dim"> #${edge.cellIndex}</span></td>` +
+              `<td class="src">${escapeHtml(edge.notebookPath)}</td>` +
               `<td>${escapeHtml(note)}</td>` +
               "</tr>"
             );
@@ -167,7 +191,7 @@ function edgeTable(edges: LineageEdge[], notes: LineageEdgeNotes | undefined, ta
           .join("\n");
 
   return `<table id="${tableId}">
-      <thead><tr><th>Source table</th><th>Target table</th><th>Defined in</th><th>Note</th></tr></thead>
+      <thead><tr><th>Source table</th><th>Target table</th><th>Files</th><th>Notes</th></tr></thead>
       <tbody>
 ${rows}
       </tbody>
@@ -192,6 +216,324 @@ function componentBlock(component: DiagramComponent, index: number, notes: Linea
     ${edgeTable(component.sourceEdges, notes, tableId, empty)}
     </div>
   </section>`;
+}
+
+/* ---- Project structure ---------------------------------------------------
+   The layers beside the folders that build them.
+
+   The diagram above says what feeds what; this says *where in the repo* each stage lives, which is
+   the other half of finding your way around a project you didn't write. A folder is tied to a layer
+   the same way `layerDetection.ts` groups by folder — through the tables the files under it
+   **write** — so a folder coloured `silver` here is a folder whose SQL genuinely builds silver
+   tables, never one whose name merely looks like it should.
+
+   Files are counted, not all listed: a 300-file project drawn in full is a wall nobody reads, so each
+   folder shows a few of its files and says how many it kept back. */
+
+const MAX_FILES_PER_DIR = 6;
+const MAX_TREE_LINES = 260;
+
+interface StructureFile {
+  name: string;
+  /** The layer this file builds into, as an index into the pipeline, or null when it builds nothing. */
+  layer: number | null;
+  /** A node id the diagram above can focus, so a file is one click from what it produces. */
+  focusId: string | null;
+  writes: string[];
+}
+
+interface TreeDir {
+  name: string;
+  dirs: Map<string, TreeDir>;
+  files: StructureFile[];
+}
+
+/**
+ * The layer a set of written tables belongs to — by vote, so a file that writes into two layers is
+ * placed with the one it builds most of rather than being dropped for being ambiguous.
+ */
+function layerOfTables(tables: string[], layers: LayerRef[]): number | null {
+  const votes: number[] = layers.map(() => 0);
+  for (const table of tables) {
+    for (const [i, layer] of layers.entries()) if (layerHasTable(layer, table)) votes[i]++;
+  }
+  let best: number | null = null;
+  for (const [i, count] of votes.entries()) if (count > 0 && (best === null || count > votes[best])) best = i;
+  return best;
+}
+
+function emptyDir(name: string): TreeDir {
+  return { name, dirs: new Map(), files: [] };
+}
+
+function buildTree(
+  files: LocalFileSummary[],
+  root: string,
+  layers: LayerRef[],
+  nodeIds: Set<string>,
+  collapsed: boolean
+): TreeDir {
+  const tree = emptyDir(root);
+
+  for (const file of files) {
+    // Windows paths arrive from the CLI's own walk; the browser's upload uses "/" already.
+    const parts = file.path.split(/[\\/]/).filter((p) => p.length > 0);
+    const name = parts.pop();
+    if (name === undefined) continue;
+
+    let dir = tree;
+    for (const part of parts) {
+      let next = dir.dirs.get(part);
+      if (!next) {
+        next = emptyDir(part);
+        dir.dirs.set(part, next);
+      }
+      dir = next;
+    }
+
+    const written = file.writes.map((t) => t.toLowerCase());
+    const first = written[0];
+    const candidate = first === undefined ? null : collapsed ? schemaOf(first) : first;
+    dir.files.push({
+      name,
+      layer: layerOfTables(written, layers),
+      focusId: candidate !== null && nodeIds.has(candidate) ? candidate : null,
+      writes: written
+    });
+  }
+
+  return tree;
+}
+
+/** Every file at or below `dir`, which is what a folder's own layer is read from. */
+function descendantFiles(dir: TreeDir): StructureFile[] {
+  return [...dir.files, ...Array.from(dir.dirs.values()).flatMap(descendantFiles)];
+}
+
+/**
+ * A folder's layer, and only when the files under it *agree* — a mixed folder gets none.
+ *
+ * By vote instead, the folder every stage lives under wins the layer that happens to have the most
+ * files in it, and a project's `src/` comes out coloured `datamart`. That is worse than uncoloured:
+ * it says the root builds the mart. Unanimity is the claim the colour is actually making, and files
+ * that build nothing (a function, a grant script) abstain rather than break it.
+ */
+function unanimousLayer(files: StructureFile[]): number | null {
+  let layer: number | null = null;
+  for (const file of files) {
+    if (file.layer === null) continue;
+    if (layer === null) layer = file.layer;
+    else if (layer !== file.layer) return null;
+  }
+  return layer;
+}
+
+/**
+ * The palette slot each layer takes, so a layer's box, its folders and its boxes in the diagram are
+ * one colour.
+ *
+ * A layer that *is* a schema takes that schema's slot — `orderedSchemas` lists the pipeline's schemas
+ * first, so this is normally its own position anyway, but going through the palette keeps the two in
+ * step whatever the ordering. A folder layer has no schema to look up (`orderedSchemas` deliberately
+ * reserves nothing for it), so it falls back to its position in the pipeline.
+ */
+function layerColours(layers: LayerRef[], schemas: string[]): number[] {
+  return layers.map((layer, i) =>
+    layer.tables ? i % SCHEMA_COLOURS.length : schemaColourIndex(schemas, layer.schema.toLowerCase())
+  );
+}
+
+/** `layerN` is what carries the colour; the diagram's boxes take theirs from the same class. */
+function layerClass(colour: number | null): string {
+  return colour === null ? "" : ` layer${colour % SCHEMA_COLOURS.length}`;
+}
+
+function treeLine(
+  prefix: string,
+  name: string,
+  layer: number | null,
+  colour: number | null,
+  kind: string,
+  meta: string,
+  attrs = ""
+): string {
+  return (
+    `<div class="tline ${kind}${layerClass(colour)}"${layer === null ? "" : ` data-layer="${layer}"`}${attrs}>` +
+    `<span class="tpre">${prefix}</span><span class="tname">${escapeHtml(name)}</span>` +
+    (meta ? `<span class="tmeta">${escapeHtml(meta)}</span>` : "") +
+    "</div>"
+  );
+}
+
+/**
+ * One folder's lines, depth-first, folders before files.
+ *
+ * `budget` is shared across the whole walk rather than per folder, so a deep project truncates at the
+ * point it gets too long instead of losing a little from every branch.
+ */
+function renderDir(
+  dir: TreeDir,
+  prefix: string,
+  layers: LayerRef[],
+  colours: number[],
+  out: string[],
+  budget: { left: number; cut: boolean }
+): void {
+  const dirs = Array.from(dir.dirs.values()).sort((a, b) => a.name.localeCompare(b.name));
+  const files = dir.files.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const shown = files.slice(0, MAX_FILES_PER_DIR);
+  const hidden = files.length - shown.length;
+  const entries = dirs.length + shown.length + (hidden > 0 ? 1 : 0);
+
+  let seen = 0;
+  for (const child of dirs) {
+    if (budget.left <= 0) {
+      budget.cut = true;
+      return;
+    }
+    budget.left--;
+    seen++;
+    const last = seen === entries;
+    const kids = descendantFiles(child);
+    const layer = unanimousLayer(kids);
+    const count = kids.length;
+    const label = layer === null ? "" : layers[layer].label;
+    out.push(
+      treeLine(
+        `${prefix}${last ? "└── " : "├── "}`,
+        child.name,
+        layer,
+        layer === null ? null : colours[layer],
+        "dir",
+        label ? `${count} file${count === 1 ? "" : "s"} · ${label}` : `${count} file${count === 1 ? "" : "s"}`
+      )
+    );
+    renderDir(child, `${prefix}${last ? "    " : "│   "}`, layers, colours, out, budget);
+  }
+
+  for (const file of shown) {
+    if (budget.left <= 0) {
+      budget.cut = true;
+      return;
+    }
+    budget.left--;
+    seen++;
+    const last = seen === entries;
+    const attrs =
+      (file.focusId ? ` data-focus="${escapeHtml(file.focusId)}"` : "") +
+      (file.writes.length > 0 ? ` title="builds ${escapeHtml(file.writes.join(", "))}"` : "");
+    out.push(
+      treeLine(
+        `${prefix}${last ? "└── " : "├── "}`,
+        file.name,
+        file.layer,
+        file.layer === null ? null : colours[file.layer],
+        file.focusId ? "file link" : "file",
+        file.writes.length > 0 ? file.writes[0] : "",
+        attrs
+      )
+    );
+  }
+
+  if (hidden > 0 && budget.left > 0) {
+    budget.left--;
+    out.push(treeLine(`${prefix}└── `, `… ${hidden} more file${hidden === 1 ? "" : "s"}`, null, null, "more", ""));
+  }
+}
+
+/**
+ * The stack of layers, most-derived at the top, beside the folder tree.
+ *
+ * Reversed deliberately: a pipeline stack is read bottom-up, raw at the bottom and what the business
+ * reads at the top, which is the shape people already have in their heads for a medallion diagram.
+ */
+function layerStack(
+  layers: LayerRef[],
+  colours: number[],
+  tables: LocalTableRef[],
+  fileCounts: number[]
+): string {
+  if (layers.length === 0) {
+    return '<p class="empty">No layers were detected — the SQL never qualifies its tables, so the whole project is one scope.</p>';
+  }
+
+  return layers
+    .map((layer, i) => {
+      const count = tables.filter((t) => layerHasTable(layer, t.qualified)).length;
+      const files = fileCounts[i] ?? 0;
+      return (
+        `<div class="lbox${layerClass(colours[i])}" data-layer="${i}" role="button" tabindex="0">` +
+        `<b>${escapeHtml(layer.label)}</b>` +
+        `<span class="dim small">${escapeHtml(layer.tables ? `${layer.schema} (folder)` : layer.schema)}</span>` +
+        `<span class="dim small">${count} table${count === 1 ? "" : "s"} · ${files} file${
+          files === 1 ? "" : "s"
+        }</span>` +
+        "</div>"
+      );
+    })
+    .reverse()
+    .join("");
+}
+
+function structureSection(
+  input: LineageDiagramInput,
+  schemas: string[],
+  nodeIds: Set<string>,
+  collapsed: boolean
+): string {
+  const files = input.files ?? [];
+  if (files.length === 0) return "";
+
+  const colours = layerColours(input.layers, schemas);
+  const tree = buildTree(files, input.projectName, input.layers, nodeIds, collapsed);
+  const placed = descendantFiles(tree);
+  const fileCounts = input.layers.map((_, i) => placed.filter((file) => file.layer === i).length);
+
+  const lines: string[] = [];
+  const budget = { left: MAX_TREE_LINES, cut: false };
+  renderDir(tree, "", input.layers, colours, lines, budget);
+
+  const unplaced = placed.filter((file) => file.layer === null).length;
+
+  return `  <h2>Project structure</h2>
+  <p class="hint">Where each stage lives on disk. A folder takes the colour of the layer its SQL
+  <em>writes into</em> — read off the tables the files under it build, not off the folder's name — so
+  the boxes on the left and the folders on the right are the same pipeline seen two ways.
+  <strong>Click a layer</strong> to pick out its folders${
+    nodeIds.size > 0 ? ", or a file to light up the table it builds in the diagram above" : ""
+  }.</p>
+  <div class="structure" id="structure">
+    <div>
+      <h3 class="colhead">Layers</h3>
+      <div class="layerstack">
+${layerStack(input.layers, colours, input.tables, fileCounts)}
+      </div>
+      <p class="dim small" style="margin:.5rem 0 0">Read bottom-up: each layer is built from the one below it.</p>
+    </div>
+    <div>
+      <h3 class="colhead">Layered project structure</h3>
+      <div class="card tree">
+        <div class="tline root"><span class="tname">${escapeHtml(input.projectName)}</span><span class="tmeta">${
+          files.length
+        } SQL file${files.length === 1 ? "" : "s"}</span></div>
+${lines.join("\n")}
+      </div>
+      <p class="dim small" style="margin:.45rem 0 0">
+        ${
+          budget.cut
+            ? `Tree cut off at ${MAX_TREE_LINES} lines — this project has more folders than fit here. `
+            : ""
+        }${
+          unplaced > 0
+            ? `${unplaced} file${unplaced === 1 ? " builds" : "s build"} no table any layer claims (a lookup, a
+        procedure, or a table outside the pipeline), so ${unplaced === 1 ? "it is" : "they are"} left uncoloured.`
+            : "Every file here builds into a layer."
+        }
+      </p>
+    </div>
+  </div>
+
+`;
 }
 
 export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram {
@@ -219,11 +561,12 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
   const orphans = input.tables.filter(
     (t) => !input.edges.some((e) => e.from.toLowerCase() === t.qualified || e.to.toLowerCase() === t.qualified)
   );
-  const concerns = (input.concerns ?? []).filter((c) => c.trim().length > 0);
 
   const legend = schemas
     .map((s, i) => `<span class="key layer${i % SCHEMA_COLOURS.length}"><i></i>${escapeHtml(s)}</span>`)
     .join("");
+
+  const structure = structureSection(input, schemas, new Set(layout.nodes.map((n) => n.id)), collapsed);
 
   // Generated from the shared palette rather than written out here, so the boxes on a slide and the
   // boxes on this page cannot drift apart.
@@ -259,8 +602,6 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
            border:1px solid var(--line); border-radius:8px; margin-bottom:1rem; }
   .stats b { font-variant-numeric:tabular-nums; }
   .card { padding:.9rem 1rem; background:var(--card); border:1px solid var(--line); border-radius:8px; }
-  .concerns { border-left:3px solid var(--warn); }
-  .concerns ul { margin:.3rem 0 0; padding-left:1.15rem; }
 
   .toolbar { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; margin-bottom:.6rem; }
   button { padding:.4rem .7rem; border-radius:6px; border:1px solid var(--line);
@@ -348,6 +689,38 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
   .key i { width:11px; height:11px; border-radius:3px; border:1.5px solid var(--nc);
            background:color-mix(in srgb, var(--nc) 25%, transparent); }
 
+  /* ---- Project structure ------------------------------------------------
+     Two columns that must line up as one picture: the layer stack on the left and the folder tree on
+     the right, sharing the diagram's colours. It collapses to one column on a narrow screen rather
+     than letting the tree squeeze — a tree that wraps stops being a tree. */
+  .structure { display:grid; grid-template-columns:minmax(200px,270px) 1fr; gap:1.1rem; align-items:start; }
+  @media (max-width: 880px) { .structure { grid-template-columns:1fr; } }
+  .colhead { margin:0 0 .5rem; font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  .layerstack { display:flex; flex-direction:column; gap:.4rem; }
+  .lbox { border:1.5px solid var(--nc,#888); border-left-width:5px; border-radius:7px; padding:.5rem .65rem;
+          background:color-mix(in srgb, var(--nc) 13%, var(--bg)); cursor:pointer; }
+  .lbox b { display:block; font-size:13.5px; }
+  .lbox span { display:block; font-size:11.5px; line-height:1.35; }
+  .lbox:hover { border-color:var(--sel); }
+  .lbox.on { box-shadow:0 0 0 2px var(--nc) inset; }
+
+  .tree { font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; overflow-x:auto;
+          padding:.7rem .9rem; }
+  .tline { white-space:pre; border-radius:4px; }
+  .tline.root .tname { font-weight:700; }
+  .tpre { color:var(--dim); }
+  .tname { color:var(--fg); }
+  .tline.dir .tname { font-weight:700; color:var(--nc,var(--fg)); }
+  .tline.file .tname { color:var(--nc,var(--fg)); }
+  .tline.more .tname, .tline.more .tpre { color:var(--dim); font-style:italic; }
+  .tmeta { color:var(--dim); font-size:11.5px; margin-left:.6rem; }
+  .tline.link { cursor:pointer; }
+  .tline.link:hover { background:color-mix(in srgb, var(--sel) 14%, transparent); }
+  /* Picking a layer dims the rest rather than hiding it: the point is *where in the whole tree* that
+     layer sits, which is lost the moment everything else disappears. */
+  .structure.filtering .tline:not(.on):not(.root) { opacity:.3; }
+  .structure.filtering .lbox:not(.on) { opacity:.5; }
+
   .deck { border-left:3px solid var(--sel); margin-bottom:.9rem; }
   .deck a { color:var(--sel); }
   .steps { margin:.5rem 0 0; padding-left:1.3rem; font-size:13.5px; }
@@ -387,18 +760,9 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
     <span><b>${input.tables.length}</b> tables</span>
     <span><b>${input.edges.length}</b> edges</span>
     <span><b>${input.layers.length}</b> layers</span>
+    ${input.files && input.files.length > 0 ? `<span><b>${input.files.length}</b> SQL files</span>` : ""}
     ${orphans.length > 0 ? `<span><b>${orphans.length}</b> unconnected</span>` : ""}
   </div>
-
-  ${input.narrative ? `<div class="card"><strong>What this project does</strong><p style="margin:.45rem 0 0">${escapeHtml(input.narrative)}</p></div>` : ""}
-
-  ${
-    concerns.length > 0
-      ? `<h2>Worth a look</h2><div class="card concerns"><ul>${concerns
-          .map((c) => `<li>${escapeHtml(c)}</li>`)
-          .join("")}</ul></div>`
-      : ""
-  }
 
   <h2>Pipeline${collapsed ? " (grouped by schema — too many tables to draw individually)" : ""}</h2>
   <div class="toolbar">
@@ -423,6 +787,7 @@ ${renderSvg(layout, schemas)}
 
   <div class="panel card" id="panel"><span class="empty">No table selected — click one in the diagram.</span></div>
 
+${structure}
   <h2>Copy into Word or PowerPoint</h2>
   ${
     input.deckFile
@@ -689,6 +1054,46 @@ ${components.map((component, i) => componentBlock(component, i, input.notes)).jo
 
   document.getElementById("clear").onclick = clearFocus;
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") clearFocus(); });
+
+  // ---- project structure ------------------------------------------------
+  // Two links, both one-way into what is already here: a layer box picks out its own folders, and a
+  // file jumps to the table it builds in the diagram above. Neither introduces a second way of
+  // dimming the graph — the file click goes through the same focus() the boxes use.
+  var structure = document.getElementById("structure");
+  if (structure) {
+    var lboxes = Array.prototype.slice.call(structure.querySelectorAll(".lbox"));
+    var tlines = Array.prototype.slice.call(structure.querySelectorAll(".tline[data-layer]"));
+    var activeLayer = null;
+
+    function showLayer(layer) {
+      activeLayer = layer;
+      structure.classList.toggle("filtering", layer !== null);
+      lboxes.forEach(function (box) {
+        box.classList.toggle("on", layer !== null && box.getAttribute("data-layer") === layer);
+      });
+      tlines.forEach(function (line) {
+        line.classList.toggle("on", layer !== null && line.getAttribute("data-layer") === layer);
+      });
+    }
+
+    lboxes.forEach(function (box) {
+      function pick() {
+        var layer = box.getAttribute("data-layer");
+        showLayer(layer === activeLayer ? null : layer);
+      }
+      box.addEventListener("click", pick);
+      box.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
+      });
+    });
+
+    structure.addEventListener("click", function (e) {
+      var line = e.target.closest ? e.target.closest(".tline.link") : null;
+      if (!line) return;
+      focus(line.getAttribute("data-focus"));
+      stage.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }
 
   // ---- copy for Word / PowerPoint ---------------------------------------
   // Selecting the real table and copying the selection is what puts genuine text/html on the clipboard,

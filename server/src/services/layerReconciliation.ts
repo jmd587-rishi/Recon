@@ -8,6 +8,7 @@ import {
 } from "./llmClient.js";
 import type { LocalProject } from "./localProject.js";
 import { RULE, wrap } from "./reconciliationBundle.js";
+import { platformNote, type SqlPlatform } from "./sqlPlatform.js";
 import {
   gatherLayerFacts,
   lineageStatements,
@@ -23,19 +24,32 @@ import type { LineageFact } from "./tableLineage.js";
  * One SQL script per pipeline layer, answering the question a data engineer reconciles by hand:
  * *for every table in this layer, does each column still agree with the table it came from?*
  *
- * The script returns six columns and nothing else, because six is what the question needs:
+ * The script returns nine columns and nothing else, because nine is what the question needs:
  *
- *     source_table | target_table | reconciled_column | join_type | result | comments
+ *     source_table | target_table | source_column | target_column | type
+ *     source_value | target_value | result | comments
  *
- * The first four are read out of the project's lineage rather than chosen. `source_table` and
- * `target_table` are a pair the code actually relates; `reconciled_column` is the column the target
- * took *from that source* — followed through `kindRef`, so a renamed column is reconciled against the
- * column it was really built from and not against whatever happens to share its name — listed in the
- * order the target declares them, which is the order the transformation's own select list writes
- * them. `join_type` is how the code reaches the source: `FROM` for the driving read, `LEFT JOIN`,
- * `INNER JOIN` and the rest for everything else, which is what makes a difference interpretable.
+ * The first five are read out of the project's lineage rather than chosen. `source_table` and
+ * `target_table` are a pair the code actually relates; `source_column` and `target_column` are the two
+ * ends of one column's lineage — the column the target took *from that source*, followed through
+ * `kindRef`, so a renamed column is reconciled against the column it was really built from and not
+ * against whatever happens to share its name.
  *
- * `result` is computed when the script runs: PASS when the two sides agree, REVIEW when they don't.
+ * They are **two columns rather than one** because a rename is the thing on the row a reader most needs
+ * to act on, and the single `target <- source` cell that used to carry it hid exactly that: it reads as
+ * one name until you look twice, and a reader who wants the column in the source's own DDL has to take
+ * the cell apart by hand before they can search for it. Split, either side can be searched, sorted or
+ * joined against a schema on its own. Where the transformation renamed nothing the two hold the same
+ * name — so the pair is read the same way on every row, and a difference between them *is* the rename.
+ * They are listed in the order the target declares them, which is the order the transformation's own
+ * select list writes them. `type` is how the code reaches the source: `FROM` for the driving read,
+ * `LEFT JOIN`, `INNER JOIN` and the rest for everything else, which is what makes a difference
+ * interpretable.
+ *
+ * `source_value` and `target_value` are the two numbers the row is about — a measure's total, or a
+ * distinct-value count for everything else — and `result` is computed from those same two expressions
+ * rather than from a second copy of them, so a row can never print two equal numbers beside a REVIEW.
+ * PASS when they agree, REVIEW when they don't.
  *
  * `comments` is the reason, and it is **written by the reviewer model**, not by this file. Recon reads
  * code and never reads data, so no amount of static analysis can say why two numbers differ — but the
@@ -135,17 +149,34 @@ function tidy(text: string): string {
 interface ReconRow {
   sourceTable: string;
   targetTable: string;
-  column: string;
+  /**
+   * The two ends of one column's lineage, kept apart rather than folded into one cell. Equal wherever
+   * the transformation renamed nothing, which is what lets both be read the same way on every row.
+   */
+  sourceColumn: string;
+  targetColumn: string;
   joinType: string;
   /** What is actually compared, e.g. `SUM(revenue)` — shown to the model, not to the reader. */
   comparison: string;
   compare: string;
+  /**
+   * The two numbers the row is about, as SQL. Printed as their own columns *and* used to build
+   * `compare`, so what the reader sees and what decides PASS can never be two different measurements.
+   */
+  sourceValue: string;
+  targetValue: string;
   /** Model-written, or empty when no model was available. */
   comment: string;
 }
 
-/** How the transformation reaches a source, in the words the `join_type` column uses. */
-function joinLabel(entry: ReconSource): string {
+/**
+ * How the transformation reaches a source, in the words the `type` column uses.
+ *
+ * Exported because the generated document describes this report table by table, and a document that
+ * called the same thing a "left join" where the script says `LEFT JOIN` would be describing a
+ * different file. One function, one vocabulary.
+ */
+export function joinLabel(entry: ReconSource): string {
   if (entry.role === "incidental") return "READ SEPARATELY";
   return entry.joinKind === "from" ? "FROM" : `${entry.joinKind.toUpperCase()} JOIN`;
 }
@@ -163,24 +194,34 @@ function scalar(table: string, expression: string): string {
  * fan-out that make a row count differ for reasons that are not defects. `SUM(status)` is the mistake
  * this avoids: it either errors or returns a number that reconciles to nothing.
  */
-function comparisonFor(field: ReconField, target: string, source: string): { comparison: string; compare: string } {
+function comparisonFor(
+  field: ReconField,
+  target: string,
+  source: string,
+  platform: SqlPlatform
+): { comparison: string; compare: string; sourceValue: string; targetValue: string } {
   if (field.role === "measure") {
     const typed = !field.untyped;
-    const targetSide = scalar(target, `SUM(${measureExpr(field.target, typed)})`);
-    const sourceSide = scalar(source, `SUM(${measureExpr(field.source, typed)})`);
+    // An empty table sums to NULL, and NULL = NULL is unknown rather than true, so both sides are
+    // defaulted — two empty tables do agree. The same defaulted expressions are what the value
+    // columns print, so a reader can never see two numbers that look equal beside a REVIEW.
+    const targetValue = `COALESCE(${scalar(target, `SUM(${measureExpr(field.target, typed, platform)})`)}, 0)`;
+    const sourceValue = `COALESCE(${scalar(source, `SUM(${measureExpr(field.source, typed, platform)})`)}, 0)`;
     return {
       comparison: `SUM(${field.target}) against SUM(${field.source})`,
-      // An empty table sums to NULL, and NULL = NULL is unknown rather than true, so both sides are
-      // defaulted — two empty tables do agree.
-      compare: `COALESCE(${targetSide}, 0) = COALESCE(${sourceSide}, 0)`
+      compare: `${targetValue} = ${sourceValue}`,
+      sourceValue,
+      targetValue
     };
   }
 
-  const targetSide = scalar(target, `COUNT(DISTINCT ${field.target})`);
-  const sourceSide = scalar(source, `COUNT(DISTINCT ${field.source})`);
+  const targetValue = scalar(target, `COUNT(DISTINCT ${field.target})`);
+  const sourceValue = scalar(source, `COUNT(DISTINCT ${field.source})`);
   return {
     comparison: `COUNT(DISTINCT ${field.target}) against COUNT(DISTINCT ${field.source})`,
-    compare: `${targetSide} = ${sourceSide}`
+    compare: `${targetValue} = ${sourceValue}`,
+    sourceValue,
+    targetValue
   };
 }
 
@@ -191,21 +232,28 @@ function comparisonFor(field: ReconField, target: string, source: string): { com
  * reads them — the driving `FROM` first, then each join as written — and columns in the order the
  * target declares them. Nothing here is sorted by how interesting it looks.
  */
-function layerRows(facts: ReconLayerFacts): ReconRow[] {
+function layerRows(facts: ReconLayerFacts, platform: SqlPlatform): ReconRow[] {
   const rows: ReconRow[] = [];
 
   for (const target of facts.targets) {
     for (const entry of target.perSource) {
       for (const field of entry.fields) {
-        const { comparison, compare } = comparisonFor(field, target.target, entry.source);
+        const { comparison, compare, sourceValue, targetValue } = comparisonFor(
+          field,
+          target.target,
+          entry.source,
+          platform
+        );
         rows.push({
           sourceTable: entry.source,
           targetTable: target.target,
-          // `a <- b` where the transformation renamed it, so the row says which column on each side.
-          column: field.target === field.source ? field.target : `${field.target} <- ${field.source}`,
+          sourceColumn: field.source,
+          targetColumn: field.target,
           joinType: joinLabel(entry),
           comparison,
           compare,
+          sourceValue,
+          targetValue,
           comment: ""
         });
       }
@@ -257,7 +305,8 @@ function batchesFor(facts: ReconLayerFacts, rows: ReconRow[]): CommentBatch[] {
         inputs: slice.map(({ row }) => ({
           sourceTable: row.sourceTable,
           targetTable: row.targetTable,
-          column: row.column,
+          sourceColumn: row.sourceColumn,
+          targetColumn: row.targetColumn,
           joinType: row.joinType,
           comparison: row.comparison
         }))
@@ -322,14 +371,31 @@ export interface LayerReconciliationSuite {
   stats: { layerCount: number; rowCount: number; commentedCount: number };
 }
 
-const COLUMNS = ["source_table", "target_table", "reconciled_column", "join_type", "result", "comments"];
+const COLUMNS = [
+  "source_table",
+  "target_table",
+  "source_column",
+  "target_column",
+  "type",
+  "source_value",
+  "target_value",
+  "result",
+  "comments"
+];
 
 function renderRow(row: ReconRow, first: boolean): string {
   const values = [
     quoted(row.sourceTable),
     quoted(row.targetTable),
-    quoted(row.column),
+    // Two columns, not one. Identical on a row the transformation did not rename, so a reader never
+    // has to work out which of two forms a cell is in before they can use it.
+    quoted(row.sourceColumn),
+    quoted(row.targetColumn),
     quoted(row.joinType),
+    // Cast to one type because the column carries both kinds of number: a measure's total, which has
+    // a scale, and a distinct count, which does not.
+    cast(row.sourceValue),
+    cast(row.targetValue),
     `CASE WHEN ${row.compare} THEN 'PASS' ELSE 'REVIEW' END`,
     // Same condition, opposite sense: a row that reconciles has nothing to explain. Written from the
     // one comparison rather than from a second copy of it, so the two columns cannot disagree.
@@ -341,7 +407,14 @@ function renderRow(row: ReconRow, first: boolean): string {
     .join(",\n");
 }
 
-function header(facts: ReconLayerFacts, rows: ReconRow[], commented: number, folderName: string, notice: string | null): string {
+function header(
+  facts: ReconLayerFacts,
+  rows: ReconRow[],
+  commented: number,
+  folderName: string,
+  notice: string | null,
+  platform: SqlPlatform
+): string {
   const pairs = new Set(rows.map((row) => `${row.sourceTable} -> ${row.targetTable}`));
 
   const lines = [
@@ -354,13 +427,16 @@ function header(facts: ReconLayerFacts, rows: ReconRow[], commented: number, fol
       "   "
     ),
     "",
-    "     source_table | target_table | reconciled_column | join_type | result | comments",
+    "     source_table | target_table | source_column | target_column | type |",
+    "     source_value | target_value | result | comments",
     "",
     ...wrap(
-      "The first four columns come from this project's lineage, not from a guess. `reconciled_column` is " +
-        "the column the target took from that source — followed through the transformation, so a renamed " +
-        "column is reconciled against the column it was really built from — and the rows are in the order " +
-        "the target declares its columns. `join_type` is how the code reaches the source.",
+      "The first five columns come from this project's lineage, not from a guess. `source_column` and " +
+        "`target_column` are the two ends of one column's lineage: the column the target took from that " +
+        "source, followed through the transformation, so a renamed column is reconciled against the column " +
+        "it was really built from. They hold the same name wherever nothing was renamed, so where they " +
+        "differ, that difference is the rename. The rows are in the order the target declares its columns, " +
+        "and `type` is how the code reaches the source.",
       "   "
     ),
     "",
@@ -384,30 +460,98 @@ function header(facts: ReconLayerFacts, rows: ReconRow[], commented: number, fol
     "",
     ...wrap(
       `Generated by Recon from the SQL in \`${folderName}\`. Every table and column named here came from ` +
-        "that SQL. Portable: no TOP/LIMIT, so it runs unchanged on SQL Server and Databricks SQL.",
+        `that SQL. ${platformNote(platform)}`,
       "   "
     ),
     ""
   ];
 
+  const silent: string[] = [];
   for (const target of facts.targets) {
     const mine = rows.filter((row) => row.targetTable === target.target);
-    if (mine.length === 0) continue;
+    if (mine.length === 0) {
+      // Listed rather than skipped. A layer report that quietly covers three of a layer's five tables
+      // reads as a clean bill of health for all five, and the two it dropped are exactly the ones
+      // worth knowing about — a table with no lineage, or one whose source this project never
+      // defines, is where an unnoticed gap lives.
+      silent.push(`   ${target.target}  —  ${noRowReason(target)}`);
+      continue;
+    }
     lines.push(`   ${target.target}  <-  ${target.perSource.map((e) => `${e.source} [${joinLabel(e)}]`).join(", ")}`);
     lines.push(`     ${mine.length} column${mine.length === 1 ? "" : "s"} reconciled${
       commented > 0 ? `, ${mine.filter((row) => row.comment !== "").length} commented` : ""
     }`);
   }
 
+  if (silent.length > 0) {
+    lines.push("", `   Not reconciled here (${silent.length} of ${facts.targets.length} table(s) in this layer):`, ...silent);
+  }
+
   lines.push("", `   ${RULE} */`, "");
   return lines.join("\n");
 }
 
-function emptyScript(facts: ReconLayerFacts, folderName: string): LayerReconciliationScript {
-  const note =
-    facts.notes.join(" ") ||
+/**
+ * Why a layer produced no rows — three different answers, and saying the wrong one sends the reader
+ * looking in the wrong place.
+ *
+ * The one that used to be given for all three cases, "nothing here is built from another table", is
+ * plainly false for a layer whose tables *are* built from something whose columns this project never
+ * declares. That is the common case for a pipeline whose first stage reads a feed defined elsewhere,
+ * and the fix for it — get the source's DDL into the folder — is nothing like the fix for a layer
+ * that genuinely has no lineage.
+ */
+function emptyReason(facts: ReconLayerFacts): string {
+  if (facts.notes.length > 0) return facts.notes.join(" ");
+  if (facts.targets.length === 0) {
+    return `No table in this project belongs to the ${facts.label} layer, so there is nothing to reconcile across it.`;
+  }
+
+  // A source is paired with the target whether or not anything is known about its columns, so what
+  // says "nothing to line up" is an empty `fields`, not an empty `perSource`.
+  const unknown = Array.from(
+    new Set(
+      facts.targets.flatMap((target) =>
+        target.perSource.length === 0
+          ? target.sources
+          : target.perSource.filter((entry) => entry.fields.length === 0).map((entry) => entry.source)
+      )
+    )
+  );
+  if (unknown.length > 0) {
+    return (
+      `Every table in the ${facts.label} layer is built from tables whose columns this project never ` +
+      `declares (${unknown.slice(0, 6).join(", ")}${unknown.length > 6 ? ", ..." : ""}), so there is no ` +
+      "column on both sides to line up. Add their CREATE TABLE statements to this folder and re-run to " +
+      "reconcile this layer."
+    );
+  }
+
+  return (
     `No table in the ${facts.label} layer is built from another table this project can see, so there is ` +
-      "nothing to reconcile across it.";
+    "nothing to reconcile across it."
+  );
+}
+
+/**
+ * Why one table of a layer produced no row. Three answers, and they call for three different things:
+ * a table with no lineage may be an entry point or may be a gap in what was uploaded, while a table
+ * whose sources have no declared columns needs their DDL adding to the folder.
+ */
+function noRowReason(target: ReconTargetFacts): string {
+  if (target.sources.length === 0) {
+    return "nothing in this project builds it, so there is no source to reconcile it against";
+  }
+  const unknown = target.perSource.filter((entry) => entry.fields.length === 0).map((entry) => entry.source);
+  const named = unknown.length > 0 ? unknown : target.sources;
+  return (
+    `no column is known on both sides — this project never declares the columns of ` +
+    `${named.slice(0, 4).join(", ")}${named.length > 4 ? ", ..." : ""}`
+  );
+}
+
+function emptyScript(facts: ReconLayerFacts, folderName: string): LayerReconciliationScript {
+  const note = emptyReason(facts);
 
   return {
     layer: facts.layer,
@@ -435,7 +579,8 @@ function assemble(
   facts: ReconLayerFacts,
   rows: ReconRow[],
   folderName: string,
-  notice: string | null
+  notice: string | null,
+  platform: SqlPlatform
 ): LayerReconciliationScript {
   if (rows.length === 0) return emptyScript(facts, folderName);
 
@@ -453,7 +598,7 @@ function assemble(
     rowCount: rows.length,
     commentedCount: commented,
     notes: facts.notes,
-    sql: `${header(facts, rows, commented, folderName, notice)}${body}`
+    sql: `${header(facts, rows, commented, folderName, notice, platform)}${body}`
   };
 }
 
@@ -461,17 +606,18 @@ function assemble(
  * The per-layer reconciliation for a whole project, with the reviewer model's comments where it could
  * be reached.
  *
- * `useAi` false, or Azure OpenAI unconfigured, still produces every script — the four lineage columns
+ * `useAi` false, or Azure OpenAI unconfigured, still produces every script — the five lineage columns
  * and the PASS/REVIEW comparison need no model at all. Only the explanation is lost, and the file says
  * so where the explanation would have been.
  */
 export async function buildLayerReconciliation(
   project: LocalProject,
   layers: LayerRef[],
-  useAi: boolean
+  useAi: boolean,
+  platform: SqlPlatform = "portable"
 ): Promise<LayerReconciliationSuite> {
   const grounding = gatherLayerFacts(project, layers);
-  const perLayer = grounding.layers.map((facts) => ({ facts, rows: layerRows(facts) }));
+  const perLayer = grounding.layers.map((facts) => ({ facts, rows: layerRows(facts, platform) }));
 
   let notice: string | null = useAi
     ? null
@@ -506,7 +652,7 @@ export async function buildLayerReconciliation(
     }
   }
 
-  const scripts = perLayer.map(({ facts, rows }) => assemble(facts, rows, project.folderName, notice));
+  const scripts = perLayer.map(({ facts, rows }) => assemble(facts, rows, project.folderName, notice, platform));
 
   return {
     folderName: project.folderName,
@@ -529,10 +675,15 @@ export function summarizeLayerReconciliation(suite: LayerReconciliationSuite, ge
     `${suite.stats.layerCount} layer(s), ${suite.stats.rowCount} column reconciliation(s), ` +
       `${suite.stats.commentedCount} with a reviewer-model comment.`,
     "",
-    "One .sql per layer. Each returns six columns:",
-    "  source_table, target_table, reconciled_column, join_type, result, comments",
+    "One .sql per layer. Each returns nine columns:",
+    "  source_table, target_table, source_column, target_column, type,",
+    "  source_value, target_value, result, comments",
     "",
-    "result is PASS or REVIEW. On REVIEW, comments says what in your own transformation SQL would",
+    "source_column and target_column are the same column at both ends of its lineage — the same name",
+    "wherever the transformation renamed nothing, and where they differ, that difference is the rename.",
+    "",
+    "source_value and target_value are the two numbers compared. result is PASS or REVIEW. On REVIEW,",
+    "comments says what in your own transformation SQL would",
     "explain it — the filter, the join, the CASE, the cast. It is a reading of the code rather than a",
     "measurement, so it is a first place to look rather than a verdict.",
     ...(suite.notice ? ["", `Note: ${suite.notice}`] : []),

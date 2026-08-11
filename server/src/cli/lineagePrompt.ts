@@ -191,12 +191,13 @@ async function writeDiagram(
     console.log(`  (couldn't write ${DECK_FILENAME}: ${err instanceof Error ? err.message : String(err)})`);
   }
 
+  // The file list is the page's only, and the deck deliberately not: a folder tree is a page-sized
+  // thing to read, not a slide.
   const diagram = buildLineageDiagram({
     ...graph,
-    narrative: review.narrative,
-    concerns: review.concerns,
     notes: review.notes,
-    deckFile
+    deckFile,
+    files: project.scan.files
   });
 
   const htmlPath = path.join(outDir, "lineage.html");
@@ -521,4 +522,35 @@ export async function writeLineageArtifacts(options: VerifyOptions, artifacts: L
     );
   }
   return outDir;
+}
+
+/**
+ * One of a fixed set of options, re-asked until one is given. A bare Enter takes `fallback`; input
+ * ending mid-question takes it too, so a piped run is never left waiting on an answer nobody typed.
+ *
+ * Matching is by prefix as well as by full name, because nobody wants to type "databricks" to answer
+ * a question whose options are on the screen in front of them.
+ */
+export async function askOption<T extends string>(
+  ask: Asker,
+  question: string,
+  options: readonly T[],
+  fallback: T
+): Promise<T> {
+  for (;;) {
+    const raw = await ask(question);
+    if (raw === null) {
+      console.log(`\nInput ended before this was answered — using ${fallback}.`);
+      return fallback;
+    }
+    const answer = raw.trim().toLowerCase();
+    if (answer === "") return fallback;
+
+    const exact = options.find((option) => option.toLowerCase() === answer);
+    if (exact) return exact;
+    const prefixed = options.filter((option) => option.toLowerCase().startsWith(answer));
+    if (prefixed.length === 1) return prefixed[0];
+
+    console.log(`  Please answer one of: ${options.join(", ")}.`);
+  }
 }

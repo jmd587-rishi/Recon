@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import dotenv from "dotenv";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { buildAiReconciliationSuite } from "../services/aiReconciliation.js";
 import { buildDocumentation } from "../services/documentation.js";
@@ -9,8 +9,15 @@ import {
   buildLayerReconciliation,
   summarizeLayerReconciliation
 } from "../services/layerReconciliation.js";
-import { detectLayers, unassignedSchemas } from "../services/layers.js";
+import { buildLayerEvidence, detectProjectLayers } from "../services/layerDetection.js";
 import { LlmConfigError } from "../services/llmClient.js";
+import {
+  detectPlatform,
+  parsePlatform,
+  platformLabel,
+  SQL_PLATFORMS,
+  type SqlPlatform
+} from "../services/sqlPlatform.js";
 import type { LocalProject } from "../services/localProject.js";
 import { buildReconciliationSuite } from "../services/reconciliationScripts.js";
 import { buildLocalProject, collectSourceFiles } from "./collectSourceFiles.js";
@@ -23,6 +30,7 @@ import {
 } from "./documentArtifacts.js";
 import {
   askChoice,
+  askOption,
   canPrompt,
   openPromptSession,
   readLineageArtifacts,
@@ -31,7 +39,12 @@ import {
   type PromptSession,
   type VerifyOptions
 } from "./lineagePrompt.js";
-import type { LayerRef, LineageArtifacts, LocalReconciliationSuite } from "../types/index.js";
+import type {
+  LayerDetectionReport,
+  LayerRef,
+  LineageArtifacts,
+  LocalReconciliationSuite
+} from "../types/index.js";
 
 /**
  * `reconcile scripts` — the L4 tab (`/local/reconciliation` in the running app) as a standalone
@@ -51,8 +64,15 @@ import type { LayerRef, LineageArtifacts, LocalReconciliationSuite } from "../ty
  * scripts once they have. Corrections are applied to the underlying facts (`lineageOverrides.ts`),
  * not just to the picture, so approving the diagram approves what the scripts are actually built on.
  *
- * `reconcile layers` runs only the scan + layer-detection step, so a schema-naming convention the
- * heuristic doesn't recognise can be sorted out with `--layers` before spending an LLM call on it.
+ * Every command starts by working out the pipeline's layers, and it does that by reading the project
+ * rather than by recognising its schema names (`layerDetection.ts`): the dependency graph between
+ * schemas is derived from the SQL, and the reviewer model is asked which of those schemas are stages of
+ * the pipeline and what each one is for. A project whose schemas are called `arr` and `prep` gets a
+ * pipeline; the old keyword list is the fallback for when no model is configured, and the graph's own
+ * ordering is the fallback after that. `--layers` still overrides everything.
+ *
+ * `reconcile layers` runs only the scan + layer-detection step, so what the rest of the run will be
+ * built on can be checked — and overridden with `--layers` — before anything is generated from it.
  *
  * `reconcile document` writes the whole thing up — the project, its layers, its lineage, what each hop
  * means for the data, and the reconciliation behind it — into the branded Word template plus a
@@ -77,7 +97,7 @@ Commands:
   scripts     Write one reconciliation query per hop into a governance/ folder
   document    Write the whole pipeline up as a Word document and a Markdown file
   diagrams    Write the lineage as editable PowerPoint shapes and Office-ready SVGs
-  layers      Detect and print the pipeline layers only — writes nothing
+  layers      Work out and print the pipeline layers only — writes nothing
 
 Options:
   --dir <path>        Project folder to scan (default: current directory)
@@ -87,9 +107,11 @@ Options:
   --diagrams-out <name> Folder for the deck and the SVGs (default: diagrams)
   --no-diagrams       document: skip the diagrams that normally accompany it
   --template <path>   Word template to render into (default: the one bundled with Recon)
-  --layers a,b,c      Schema names, most-raw first, overriding auto-detection
+  --layers a,b,c      Schema or folder names, most-raw first, overriding the detected pipeline
+  --platform <name>   SQL engine the scripts must run on: snowflake, sqlserver,
+                      databricks or portable (default: asked, detected from your SQL)
   --env-file <path>   .env file with AZURE_OPENAI_* settings (default: <dir>/.env, then ./.env)
-  --no-ai             Skip the reviewer model — write only the schema-derived standard checks
+  --no-ai             Skip the reviewer model — standard checks only, layers by name and dependency
   --no-notebooks      Read .sql files only, ignoring Databricks notebooks
   --auto-approve      run: accept the extracted lineage without prompting (for CI)
   --document          run: write the document too, without asking
@@ -121,6 +143,7 @@ interface Args {
   diagramsOut: string;
   template: string | null;
   layers: string[] | null;
+  platform: SqlPlatform | null;
   envFile: string | null;
   useAi: boolean;
   includeNotebooks: boolean;
@@ -145,6 +168,7 @@ function parseArgs(argv: string[]): Args {
     diagramsOut: "diagrams",
     template: null,
     layers: null,
+    platform: null,
     envFile: null,
     useAi: true,
     includeNotebooks: true,
@@ -207,6 +231,18 @@ function parseArgs(argv: string[]): Args {
           .map((s) => s.trim())
           .filter(Boolean);
         break;
+      case "--platform": {
+        const raw = next();
+        const parsed = parsePlatform(raw ?? "");
+        if (!parsed) {
+          console.error(`Unknown --platform "${raw}". One of: ${SQL_PLATFORMS.join(", ")}.
+`);
+          args.command = "help";
+        } else {
+          args.platform = parsed;
+        }
+        break;
+      }
       case "--env-file":
         args.envFile = next();
         break;
@@ -263,10 +299,31 @@ function loadEnv(dir: string, explicit: string | null): void {
   console.log("No .env found — the reviewer model step will be skipped unless AZURE_OPENAI_* is already set in the environment.");
 }
 
+/**
+ * Folders Recon writes into, which it must never read back as if they were the project.
+ *
+ * The *configured* names are excluded, and so are the defaults, because those are two different sets
+ * the moment anyone passes `--out`: a run with `--out governance-check` would otherwise scan the
+ * `governance/` an earlier run left behind, take its generated queries for transformation SQL, and
+ * invent a whole extra layer out of them.
+ */
+function outputDirs(args: Args): string[] {
+  return [
+    args.out,
+    args.lineageOut,
+    args.docOut,
+    args.diagramsOut,
+    "governance",
+    "lineage",
+    "documentation",
+    "diagrams"
+  ];
+}
+
 async function scanProject(args: Args): Promise<LocalProject> {
   const scan = await collectSourceFiles(args.dir, {
     maxFiles: args.maxFiles,
-    excludeDirs: [args.out, args.lineageOut, args.docOut, args.diagramsOut],
+    excludeDirs: outputDirs(args),
     includeNotebooks: args.includeNotebooks
   });
 
@@ -303,35 +360,229 @@ async function scanProject(args: Args): Promise<LocalProject> {
   return project;
 }
 
-function resolveLayers(schemas: string[], override: string[] | null): LayerRef[] {
-  if (override) {
-    const known = new Set(schemas.map((s) => s.toLowerCase()));
-    const unknown = override.filter((name) => !known.has(name.toLowerCase()));
-    if (unknown.length > 0) {
-      console.warn(
-        `Warning: --layers named ${unknown.join(", ")}, which no SQL in this project qualifies a table with. ` +
-          "Proceeding anyway — statements naming it will simply produce no hop."
-      );
-    }
-    return override.map((name) => ({ label: name, schema: name }));
+/**
+ * Which engine the generated SQL is written for — asked, not assumed, because it changes what the
+ * scripts may contain.
+ *
+ * The project's own SQL supplies the default (`detectPlatform`), so the usual answer is Enter: a
+ * folder full of `QUALIFY` and `TRY_TO_DECIMAL` is Snowflake and there is no sense making someone
+ * say so. It is still a question, because the engine a project is *written* in and the one it is
+ * *deployed* to are not always the same, and a folder of plain `SELECT`s says nothing either way.
+ *
+ * `--platform` answers it in advance, which is also how a non-interactive run decides — with nobody
+ * to ask, the detected engine is used rather than a prompt nobody would see.
+ */
+async function resolvePlatform(
+  project: LocalProject,
+  args: Args,
+  session: PromptSession | null
+): Promise<SqlPlatform> {
+  if (args.platform) return args.platform;
+
+  const guess = detectPlatform(project);
+  console.log("");
+  if (guess.platform === "portable") {
+    console.log("Nothing in this project's SQL identifies which engine it targets.");
+  } else {
+    console.log(`This project's SQL looks like ${platformLabel(guess.platform)}:`);
+    for (const line of guess.evidence) console.log(`  ${line}`);
   }
-  return detectLayers(schemas);
+
+  if (!session) {
+    console.log(
+      `Writing the scripts for ${platformLabel(guess.platform)} — pass --platform to target a different engine.`
+    );
+    return guess.platform;
+  }
+
+  const answer = await askOption(
+    session.ask,
+    `Which engine will these scripts run on? [${guess.platform}] / ${SQL_PLATFORMS.filter((p) => p !== guess.platform).join(" / ")}: `,
+    SQL_PLATFORMS,
+    guess.platform
+  );
+  console.log(`Writing the scripts for ${platformLabel(answer)}.`);
+  return answer;
 }
 
-function printLayers(schemas: string[], layers: LayerRef[]): void {
-  if (layers.length === 0) {
+/**
+ * The pipeline this run is built around, and where it came from.
+ *
+ * `--layers` is the user's own answer and skips detection altogether — including the model, since
+ * paying for a reading nobody will use is just latency. It is still resolved against the project
+ * rather than taken as bare strings, because a named layer may be a *folder* rather than a schema
+ * (`--layers Prep,Mart,ARR` on a project that writes every stage into one schema), and a folder layer
+ * has to carry its tables or nothing downstream can find them.
+ *
+ * Everything else goes to `layerDetection.ts`, which reads the project rather than pattern-matching
+ * its schema names: the point of `reconcile` is to work on a real project, and a real project is as
+ * likely to be named after its business (`arr`, `prep`, `optum`) as after a medallion convention.
+ */
+async function resolveLayers(project: LocalProject, args: Args): Promise<LayerDetectionReport> {
+  if (args.layers) {
+    const wanted = args.layers;
+    const evidence = buildLayerEvidence(project);
+
+    // One grouping for the whole list, chosen by how much of it each can account for — never a name
+    // from each. `--layers Prep,Mart,ARR` on a project with both a `prep` schema and a `Prep` folder
+    // means the folders, because that is the only grouping that has all three; resolving name by name
+    // would take `prep` from the schemas and the other two from the folders and build a pipeline out
+    // of two incompatible partitions. Schemas win a tie, as everywhere else.
+    const matches = (grouping: { groups: { name: string }[] }) =>
+      wanted.filter((name) => grouping.groups.some((g) => g.name.toLowerCase() === name.toLowerCase())).length;
+    const chosen = evidence.groupings.reduce<(typeof evidence.groupings)[number] | null>(
+      (best, candidate) => (best === null || matches(candidate) > matches(best) ? candidate : best),
+      null
+    );
+
+    const unknown: string[] = [];
+    const layers: LayerRef[] = wanted.map((name) => {
+      const group = chosen?.groups.find((g) => g.name.toLowerCase() === name.toLowerCase());
+      if (!group) {
+        unknown.push(name);
+        return { label: name, schema: name };
+      }
+      return chosen!.kind === "folder"
+        ? { label: group.name, schema: group.name, tables: group.tables }
+        : { label: group.name, schema: group.name };
+    });
+
+    if (unknown.length > 0) {
+      console.warn(
+        `Warning: --layers named ${unknown.join(", ")}, which is neither a ${chosen?.kind ?? "schema"} ` +
+          "this project's SQL uses. Proceeding anyway — statements naming it will simply produce no hop."
+      );
+    }
+
+    return {
+      layers,
+      source: "explicit",
+      grouping: chosen?.kind ?? "schema",
+      reasons: {},
+      excluded: [],
+      unplaced: [],
+      notice: null,
+      warning: null
+    };
+  }
+
+  return detectProjectLayers(project, {
+    useAi: args.useAi,
+    onProgress: (message) => console.log(`${message}...`)
+  });
+}
+
+/**
+ * The layers for a command that re-reads a folder someone has already run — `document` and
+ * `diagrams`.
+ *
+ * An approved layer order beats re-detection, and not only to save a call: these commands describe
+ * and draw what the scripts were built for, and a hop split that has drifted from the one in
+ * `governance/` makes `bronze_to_silver.svg` and `bronze_to_silver.sql` two different hops. An
+ * explicit `--layers` still beats both, because that is the user overriding on purpose.
+ */
+async function layersForExistingRun(
+  project: LocalProject,
+  args: Args,
+  lineage: LineageArtifacts | null
+): Promise<LayerDetectionReport> {
+  if (!args.layers && lineage?.layers.length) {
+    return {
+      layers: lineage.layers,
+      source: "approved",
+      grouping: lineage.layers.some((l) => l.tables) ? "folder" : "schema",
+      reasons: {},
+      excluded: [],
+      unplaced: [],
+      notice: null,
+      warning: null
+    };
+  }
+  return resolveLayers(project, args);
+}
+
+const LAYER_SOURCE_LABEL: Record<LayerDetectionReport["source"], string> = {
+  ai: "read out of the code by the reviewer model",
+  keyword: "matched from the schema names",
+  lineage: "ordered by the dependencies in the SQL",
+  explicit: "as given by --layers",
+  approved: "as approved in the earlier run"
+};
+
+/**
+ * Prints the pipeline and, just as importantly, how confident anyone should be in it: what it was
+ * grouped by, which reading produced it, why each layer is where it is, what was deliberately left
+ * out, and whether the SQL's own dependencies disagree. A layer order is the one input every
+ * generated file is shaped by, so a wrong one is worth catching here rather than in a folder of
+ * queries built on it.
+ */
+function printLayers(report: LayerDetectionReport): void {
+  if (report.notice) console.log(report.notice);
+
+  if (report.layers.length === 0) {
     console.log(
-      "No pipeline layers were detected from the schema names in this project's SQL, so everything will be " +
-        "written as one scope rather than per-hop. Pass --layers to name them explicitly, e.g. --layers raw,staged,mart."
+      "No pipeline layers were detected from this project's SQL, so everything will be written as one " +
+        "scope rather than per-hop. Pass --layers to name them explicitly, e.g. --layers raw,staged,mart."
     );
     return;
   }
-  console.log(`Detected ${layers.length} layer${layers.length === 1 ? "" : "s"}, most-raw first: ${layers.map((l) => l.label).join(" -> ")}`);
-  const unassigned = unassignedSchemas(schemas, layers);
-  if (unassigned.length > 0) {
-    console.log(`Schemas not placed in the pipeline: ${unassigned.join(", ")} (add them with --layers if they belong).`);
+
+  const grouped = report.grouping === "folder" ? "source folder" : "schema";
+  console.log(
+    `Detected ${report.layers.length} layer${report.layers.length === 1 ? "" : "s"} by ${grouped}, ` +
+      `most-raw first (${LAYER_SOURCE_LABEL[report.source]}): ${report.layers.map((l) => l.label).join(" -> ")}`
+  );
+
+  for (const layer of report.layers) {
+    const role = layer.role ? ` [${layer.role}]` : "";
+    const size = layer.tables ? ` (${layer.tables.length} table${layer.tables.length === 1 ? "" : "s"})` : "";
+    const reason = report.reasons[layer.label];
+    if (role || size || reason) console.log(`  ${layer.label}${role}${size}${reason ? ` — ${reason}` : ""}`);
   }
+
+  for (const entry of report.excluded) {
+    console.log(`  (not a pipeline layer) ${entry.schema}${entry.reason ? ` — ${entry.reason}` : ""}`);
+  }
+
+  if (report.unplaced.length > 0) {
+    console.log(
+      `Not placed in the pipeline: ${report.unplaced.join(", ")} (add them with --layers if they belong).`
+    );
+  }
+
+  if (report.warning) console.log(`Warning: ${report.warning}`);
   console.log("Override with --layers a,b,c if this is wrong.");
+}
+
+/**
+ * Names the `.sql` files already in an output folder that this run did not write.
+ *
+ * Changing the layers changes the file names — a project re-read as `Prep -> Mart -> ARR` writes
+ * `prep_to_mart.sql` beside the `prep_to_refined.sql` an earlier schema-based run left behind, and
+ * `01_prep.sql` beside `02_prep.sql`. Both look current. Reported rather than deleted: these sit in
+ * the user's project, and a generator that removes files it did not create this run is a generator
+ * you cannot safely point at a folder.
+ */
+async function reportStale(dir: string, written: string[]): Promise<void> {
+  const mine = new Set(written);
+  let present: string[];
+  try {
+    present = await readdir(dir);
+  } catch {
+    return;
+  }
+
+  const stale = present.filter((name) => name.toLowerCase().endsWith(".sql") && !mine.has(name)).sort();
+  if (stale.length === 0) return;
+
+  console.log("");
+  console.log(
+    `Note: ${stale.length} .sql file(s) in this folder were not written by this run and are left over ` +
+      "from an earlier one with different layers:"
+  );
+  for (const name of stale.slice(0, 12)) console.log(`  ${name}`);
+  if (stale.length > 12) console.log(`  ... and ${stale.length - 12} more`);
+  console.log("Delete them — they describe a pipeline this run no longer produces.");
 }
 
 /**
@@ -403,9 +654,9 @@ async function writeSuite(
     "  check_seq, scope, target_table, source_table, check_name, metric,",
     "  source_value, target_value, difference, status",
     "",
-    "PASS on every row means the hop ties out. REVIEW means the numbers differ and a filter or",
-    "aggregation has to explain it; FAIL means duplicate keys, null keys, or target rows no source",
-    "accounts for. The detail queries behind any count are at the foot of the same file, commented out.",
+    "Every row compares a source with a target. PASS means the hop ties out. REVIEW means the numbers",
+    "differ and a filter or aggregation has to explain it; FAIL means target rows no source accounts",
+    "for. The detail queries behind any count are at the foot of the same file, commented out.",
     "",
     "The layers/ folder beside this one reconciles the same pipeline column by column, one file per",
     "layer, with the reviewer model's reading of why each row might not tie out.",
@@ -424,6 +675,8 @@ async function writeSuite(
   console.log(`Wrote ${outRoot}`);
   for (const line of written) console.log(`  ${line}`);
   if (suite.notice) console.log(`\nNote: ${suite.notice}`);
+
+  await reportStale(outRoot, oneFile ? [suite.projectBundle.filename] : suite.hops.map((hop) => `${hop.folder}.sql`));
 }
 
 /** The governance half, shared by `scripts` and the tail of `run`. */
@@ -431,23 +684,35 @@ async function generateAndWriteSuite(
   args: Args,
   project: LocalProject,
   layers: LayerRef[],
+  session: PromptSession | null,
   suggestDocument = true
 ): Promise<void> {
+  // Asked before anything is written, since it decides what the SQL may contain rather than how it
+  // is presented — the model is told which engine it is writing for, and the derived checks pick the
+  // conversion that engine actually accepts.
+  const platform = await resolvePlatform(project, args, session);
+
   console.log("\nWriting the standard checks and, where configured, asking the reviewer model for the rest...");
 
   let suite: LocalReconciliationSuite;
   if (!args.useAi) {
-    suite = buildReconciliationSuite(project, layers, "Run with --no-ai — these are Recon's standard schema-derived checks only.");
+    suite = buildReconciliationSuite(
+      project,
+      layers,
+      "Run with --no-ai — these are Recon's standard schema-derived checks only.",
+      platform
+    );
   } else {
     try {
-      suite = await buildAiReconciliationSuite(project, layers);
+      suite = await buildAiReconciliationSuite(project, layers, platform);
     } catch (err) {
       if (err instanceof LlmConfigError) {
         suite = buildReconciliationSuite(
           project,
           layers,
           "Azure OpenAI isn't configured, so these are Recon's standard schema-derived checks rather than " +
-            "scripts written for this pipeline. Set AZURE_OPENAI_* in a .env file (see --env-file) and re-run."
+            "scripts written for this pipeline. Set AZURE_OPENAI_* in a .env file (see --env-file) and re-run.",
+          platform
         );
       } else {
         throw err;
@@ -456,7 +721,7 @@ async function generateAndWriteSuite(
   }
 
   await writeSuite(args.dir, args.out, suite, args.split, args.oneFile, false);
-  await writeLayerReconciliation(args, project, layers);
+  await writeLayerReconciliation(args, project, layers, platform);
 
   if (suggestDocument) {
     console.log("\nWrite this up as a document with: reconcile document");
@@ -474,10 +739,15 @@ async function generateAndWriteSuite(
  * the reason, and asking someone to remember a second command to get the reason is how the reason
  * stops being read.
  */
-async function writeLayerReconciliation(args: Args, project: LocalProject, layers: LayerRef[]): Promise<void> {
+async function writeLayerReconciliation(
+  args: Args,
+  project: LocalProject,
+  layers: LayerRef[],
+  platform: SqlPlatform
+): Promise<void> {
   console.log("\nReconciling each layer column by column, and asking the reviewer model to explain each row...");
 
-  const suite = await buildLayerReconciliation(project, layers, args.useAi);
+  const suite = await buildLayerReconciliation(project, layers, args.useAi, platform);
   const outRoot = path.join(args.dir, args.out, "layers");
   await mkdir(outRoot, { recursive: true });
 
@@ -495,8 +765,11 @@ async function writeLayerReconciliation(args: Args, project: LocalProject, layer
         `${script.commentedCount > 0 ? `, ${script.commentedCount} explained` : ""})`
     );
   }
+  await reportStale(outRoot, suite.scripts.map((script) => script.filename));
+
   console.log("");
-  console.log("  six columns: source_table, target_table, reconciled_column, join_type, result, comments");
+  console.log("  nine columns: source_table, target_table, source_column, target_column, type,");
+  console.log("                source_value, target_value, result, comments");
   if (suite.notice) console.log(`
   Note: comments is empty — ${suite.notice}`);
 }
@@ -504,9 +777,17 @@ async function writeLayerReconciliation(args: Args, project: LocalProject, layer
 async function runScripts(args: Args): Promise<void> {
   loadEnv(args.dir, args.envFile);
   const project = await scanProject(args);
-  const layers = resolveLayers(project.scan.schemas, args.layers);
-  printLayers(project.scan.schemas, layers);
-  await generateAndWriteSuite(args, project, layers);
+  const detected = await resolveLayers(project, args);
+  printLayers(detected);
+
+  // Opened only for the platform question and closed straight after: leaving readline attached ends
+  // stdin for anything that follows it.
+  const session = canPrompt(args.autoApprove) ? openPromptSession() : null;
+  try {
+    await generateAndWriteSuite(args, project, detected.layers, session);
+  } finally {
+    session?.close();
+  }
 }
 
 /**
@@ -526,8 +807,9 @@ async function runFull(args: Args): Promise<void> {
   const template = findTemplate(args.dir, args.template);
 
   const project = await scanProject(args);
-  const layers = resolveLayers(project.scan.schemas, args.layers);
-  printLayers(project.scan.schemas, layers);
+  const detected = await resolveLayers(project, args);
+  printLayers(detected);
+  const layers = detected.layers;
 
   const options: VerifyOptions = {
     dir: args.dir,
@@ -558,7 +840,7 @@ async function runFull(args: Args): Promise<void> {
       console.log(`  lineage-feedback.json  (${result.artifacts.feedback.length} round(s) of corrections)`);
     }
 
-    await generateAndWriteSuite(args, result.project, layers, args.document === false);
+    await generateAndWriteSuite(args, result.project, layers, session, args.document === false);
 
     if (!(await wantsDocument(args, session))) return;
 
@@ -704,8 +986,11 @@ async function writeDiagrams(args: Args, project: LocalProject, layers: LayerRef
 }
 
 async function runDiagrams(args: Args): Promise<void> {
-  // No `loadEnv` and no `--no-ai` handling: the shapes are derived from the graph, so this command has
-  // no LLM step to configure or to fall back from.
+  // The shapes are derived from the graph, so nothing here needs a model to draw them. The one thing
+  // that does is working out which layers the hops split on, when this folder has no approved run to
+  // take them from — hence `loadEnv`, and hence a missing .env costing detection quality rather than
+  // costing the command.
+  loadEnv(args.dir, args.envFile);
   const scanned = await scanProject(args);
 
   const lineage = await readLineageArtifacts(args.dir, args.lineageOut);
@@ -726,17 +1011,11 @@ async function runDiagrams(args: Args): Promise<void> {
     console.log(`No ${args.lineageOut}/lineage.json here, so the diagrams draw the lineage as extracted.`);
   }
 
-  // Same precedence as `document`: an approved layer order beats re-detection, an explicit --layers
-  // beats both. The hop split has to match the one the scripts were built for or the file names lie.
-  const layers = args.layers
-    ? resolveLayers(project.scan.schemas, args.layers)
-    : lineage?.layers.length
-      ? lineage.layers
-      : resolveLayers(project.scan.schemas, null);
-  printLayers(project.scan.schemas, layers);
+  const detected = await layersForExistingRun(project, args, lineage);
+  printLayers(detected);
 
   console.log("");
-  await writeDiagrams(args, project, layers);
+  await writeDiagrams(args, project, detected.layers);
 }
 
 async function runDocument(args: Args): Promise<void> {
@@ -763,24 +1042,20 @@ async function runDocument(args: Args): Promise<void> {
     console.log(`No ${args.lineageOut}/lineage.json here, so the document describes the lineage as extracted.`);
   }
 
-  // Layers approved in an earlier run beat re-detection, since the document is meant to describe the
-  // same pipeline the scripts were built for. An explicit --layers still wins over both.
-  const layers = args.layers
-    ? resolveLayers(project.scan.schemas, args.layers)
-    : lineage?.layers.length
-      ? lineage.layers
-      : resolveLayers(project.scan.schemas, null);
-  printLayers(project.scan.schemas, layers);
+  const detected = await layersForExistingRun(project, args, lineage);
+  printLayers(detected);
 
   console.log("");
-  await writeDocument(args, { project, layers, lineage, template });
+  await writeDocument(args, { project, layers: detected.layers, lineage, template });
 }
 
 async function runLayers(args: Args): Promise<void> {
+  loadEnv(args.dir, args.envFile);
   const project = await scanProject(args);
-  const layers = resolveLayers(project.scan.schemas, args.layers);
-  console.log(`\nSchemas found in this project's SQL: ${project.scan.schemas.join(", ") || "(none — every table is unqualified)"}`);
-  printLayers(project.scan.schemas, layers);
+  const schemas = project.scan.schemas.join(", ") || "(none — every table is unqualified)";
+  console.log("");
+  console.log(`Schemas found in this project's SQL: ${schemas}`);
+  printLayers(await resolveLayers(project, args));
 }
 
 async function main(): Promise<void> {

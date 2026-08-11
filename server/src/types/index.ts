@@ -175,10 +175,65 @@ export type LayerRole = "ingest" | "clean" | "transform" | "serve";
 export interface LayerRef {
   /** Human label for the layer — defaults to the schema's own name, e.g. "staged" or "bronze". */
   label: string;
-  /** Actual Unity Catalog schema name backing that layer. */
+  /**
+   * The schema backing that layer, and the layer's identity for a Databricks flow, where a layer is
+   * a Unity Catalog schema and can be nothing else. For a layer that came from a source folder this
+   * is the folder's name — a name, not a lookup — and `tables` is what says which tables are in it.
+   */
   schema: string;
+  /**
+   * The layer's tables, qualified and lowercased, when the layer is *not* a schema.
+   *
+   * A pipeline does not have to be staged by schema. A project that writes every derived table into
+   * one `refined` schema and separates its stages by source folder instead (`Prep/`, `Mart/`,
+   * `ARR/`) has three layers and one schema, and keying membership on the schema would collapse all
+   * three into a single hop. When this is set it is the definition of the layer and the schema is
+   * not consulted — see `layerHasTable` in `services/layers.ts`, which is the only place that
+   * decision is made.
+   */
+  tables?: string[];
   /** Inferred pipeline role, used only as a hint for heuristics and prompts. */
   role?: LayerRole;
+}
+
+/**
+ * Where a detected pipeline came from, so a run never presents a fallback as the real thing.
+ *
+ * `explicit` and `approved` only arise in the CLI, where the user can name the layers with
+ * `--layers` or have approved them in an earlier run; detection itself only ever returns the first
+ * three.
+ */
+export type LayerDetectionSource = "ai" | "keyword" | "lineage" | "explicit" | "approved";
+
+/**
+ * A detected pipeline plus everything needed to say how it was arrived at.
+ *
+ * The layers alone would be enough to generate from, but not enough to trust: a project whose schemas
+ * are named after its business (`arr`, `prep`) is exactly the case where the keyword heuristic and
+ * the model disagree, so the answer carries which one spoke, what it left out and why.
+ */
+/**
+ * What a pipeline's layers were grouped by. `schema` is the usual answer; `folder` is for a project
+ * that writes every stage into one schema and separates them by source folder instead.
+ */
+export type LayerGroupingKind = "schema" | "folder";
+
+export interface LayerDetectionReport {
+  /** Pipeline order, most-raw first. Empty when nothing could recognise a pipeline. */
+  layers: LayerRef[];
+  source: LayerDetectionSource;
+  /** Whether these layers are schemas or source folders. */
+  grouping: LayerGroupingKind;
+  /** One line per layer on why it is that stage, keyed by the layer's label. Empty when derived. */
+  reasons: Record<string, string>;
+  /** Groups deliberately left out — security, config, logging — each with the reason. */
+  excluded: { schema: string; reason: string }[];
+  /** Groups no layer claims and no exclusion explains, so a run can say what it passed over. */
+  unplaced: string[];
+  /** Why the model wasn't used, when it wasn't. Null when it was. */
+  notice: string | null;
+  /** Set when the SQL's own dependencies run against the proposed order. */
+  warning: string | null;
 }
 
 export interface SelectedNotebook {
@@ -687,7 +742,20 @@ export interface ProjectDocumentationProse {
   /** How the pipeline is laid out, in terms of its own layers. */
   architecture: string[];
   /** Keyed by the layer's label, exactly as it was given to the model. */
-  layers: { layer: string; purpose: string; contents: string }[];
+  layers: {
+    layer: string;
+    purpose: string;
+    contents: string;
+    /**
+     * What each table in the layer is *for*, keyed by the table name as it was given.
+     *
+     * The one thing a reader wants from a table list that no parse can supply: `trn_revenue` holding
+     * columns `date_key, customer_key, revenue` is a fact; that it is the monthly revenue line every
+     * downstream report is built from is a reading. Names not in the layer are dropped on the way in,
+     * so a table the model invents cannot appear in the document.
+     */
+    tables: { name: string; use: string }[];
+  }[];
   /** How data moves table to table. */
   lineage: string[];
   /** Things a reader should be sceptical about, in the pipeline or in this document. */

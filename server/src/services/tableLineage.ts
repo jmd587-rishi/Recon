@@ -130,6 +130,39 @@ const MERGE_INTO_RE = new RegExp(`merge\\s+into\\s+(${IDENT})`, "i");
 const FROM_JOIN_RE = new RegExp(`\\b(?:from|join|using)\\s+(${IDENT})`, "gi");
 const INTO_RE = new RegExp(`\\binto\\s+(${IDENT})`, "gi");
 
+/**
+ * Names that can follow `FROM` or `JOIN` without being tables: a table function, or the keyword
+ * that introduces one.
+ *
+ * Snowflake's `FROM TABLE(GENERATOR(ROWCOUNT => 60))` is the case that made this necessary — a
+ * generated calendar spine, read as a source table called `table`, drawn as a lineage edge, and then
+ * reported as a table whose columns the project fails to declare. The general shape is an identifier
+ * applied to an argument list, so the reliable test is a `(` straight after the name; the word list
+ * catches the same constructs written with a space, and every word in it is reserved enough that no
+ * real table is called it.
+ */
+const TABLE_FUNCTION_WORDS = new Set([
+  "table",
+  "values",
+  "lateral",
+  "unnest",
+  "explode",
+  "generator",
+  "flatten",
+  "openjson",
+  "openrowset",
+  "openquery",
+  "openxml",
+  "string_split",
+  "generate_series"
+]);
+
+/** Whether a `FROM`/`JOIN` name is a function call rather than a table. `next` is the char after it. */
+export function isTableFunction(name: string, next?: string): boolean {
+  if (next === "(") return true;
+  return TABLE_FUNCTION_WORDS.has((name.split(".").pop() ?? name).toLowerCase());
+}
+
 /** Drops `--` line comments and `/* *\/` block comments. Shared with `sqlColumns.ts`. */
 export function stripSqlComments(sql: string): string {
   return sql.replace(/--.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
@@ -260,7 +293,9 @@ function fallbackSplitTablesByOp(stripped: string): TableOpSplit {
   let m: RegExpExecArray | null;
   FROM_JOIN_RE.lastIndex = 0;
   while ((m = FROM_JOIN_RE.exec(stripped))) {
-    sourceTables.add(cleanIdentifier(m[1]));
+    const name = cleanIdentifier(m[1]);
+    if (isTableFunction(name, stripped[m.index + m[0].length])) continue;
+    sourceTables.add(name);
   }
   if (targetTable) sourceTables.delete(targetTable);
 
@@ -286,7 +321,11 @@ export function splitSqlTablesByOp(sql: string): TableOpSplit {
       ? split.targetTable
       : (findSelectIntoTarget(stripped) ?? split.targetTable);
   const ctes = collectCteNames(stripped);
-  const sourceTables = split.sourceTables.filter((t) => !ctes.has(t) && t !== targetTable);
+  // The table-function filter runs over both paths, not only the regex one: a dialect that *accepts*
+  // `FROM TABLE(...)` reports the function name in `tableList()` just as readily.
+  const sourceTables = split.sourceTables.filter(
+    (t) => !ctes.has(t) && t !== targetTable && !isTableFunction(t)
+  );
 
   return { sourceTables, targetTable };
 }

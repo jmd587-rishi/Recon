@@ -1,6 +1,7 @@
 import axios from "axios";
 import type {
   Catalog,
+  LayerDetectionReport,
   LevelAnalysisRequest,
   LevelAnalysisResponse,
   LevelFixReport,
@@ -100,6 +101,14 @@ export function getLevelFixes(payload: LevelFixRequest) {
 /** Uploads the SQL files located in a local folder and gets back lineage + discovered schemas. */
 export function scanLocalFolder(payload: LocalScanRequest) {
   return unwrap<LocalScanResult>(api.post("/local/scan", payload));
+}
+
+/**
+ * The uploaded folder's pipeline layers, read out of its SQL by the server rather than guessed from
+ * its schema names here. Falls back internally, so it answers whether or not a model is configured.
+ */
+export function detectLocalLayers() {
+  return unwrap<LayerDetectionReport>(api.post("/local/layers", {}));
 }
 
 export function getLocalGovernance(payload: LocalFixRequest) {

@@ -123,6 +123,9 @@ export function orderedSchemas(input: {
   const seen = new Set<string>();
   const ordered: string[] = [];
   for (const layer of input.layers) {
+    // A layer defined by its tables isn't a schema, so it has no place in a palette of schemas —
+    // adding its name here would reserve a colour no node ever uses.
+    if (layer.tables) continue;
     const key = layer.schema.toLowerCase();
     if (!seen.has(key)) {
       seen.add(key);

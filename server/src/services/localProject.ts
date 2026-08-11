@@ -10,6 +10,7 @@ import type {
   Table
 } from "../types/index.js";
 import { codeFileKind, readCodeFile } from "./codeFiles.js";
+import { layerHasTable } from "./layers.js";
 import { applySqlCorrections, correctedSqlFilename, type SqlStatement } from "./sqlFileParser.js";
 import {
   buildLineageGraph,
@@ -243,11 +244,10 @@ export function candidateKey(notebookPath: string, cellIndex: number): string {
   return `${notebookPath}#${cellIndex}`;
 }
 
-/** Whether a fact writes a table in `targetSchema`, ignoring case and unqualified/temp targets. */
-function writesSchema(fact: LineageFact, targetSchema: string): boolean {
+/** Whether a fact writes a table of `layer`, ignoring temp targets and statements that write nothing. */
+function writesLayer(fact: LineageFact, layer: LayerRef): boolean {
   if (!fact.targetTable || isTempTable(fact.targetTable)) return false;
-  const schema = splitQualifiedTable(fact.targetTable).schema;
-  return schema !== null && schema.toLowerCase() === targetSchema;
+  return layerHasTable(layer, fact.targetTable);
 }
 
 /**
@@ -261,20 +261,19 @@ function writesSchema(fact: LineageFact, targetSchema: string): boolean {
  * final `SELECT ... INTO` would hand the model the one statement where nothing much happens.
  */
 export function selectLocalCandidates(project: LocalProject, hop: LocalHop | null): LocalCandidateSelection {
-  const targetSchema = hop?.to.schema.toLowerCase() ?? null;
+  const target = hop?.to ?? null;
   const candidates: CodeCandidate[] = [];
   const partial = new Set<string>();
   let truncated = false;
   let totalChars = 0;
 
   for (const file of project.files) {
-    const buildsTargetLayer =
-      targetSchema !== null && file.facts.some((fact) => writesSchema(fact, targetSchema));
+    const buildsTargetLayer = target !== null && file.facts.some((fact) => writesLayer(fact, target));
 
     for (const fact of file.facts) {
-      if (targetSchema !== null) {
+      if (target !== null) {
         const staging = buildsTargetLayer && fact.targetTable !== null && isTempTable(fact.targetTable);
-        if (!writesSchema(fact, targetSchema) && !staging) continue;
+        if (!writesLayer(fact, target) && !staging) continue;
       }
       const snippet = fact.rawSql.slice(0, MAX_SNIPPET_CHARS);
       if (candidates.length >= MAX_TOTAL_SNIPPETS || totalChars + snippet.length > MAX_TOTAL_CHARS) {

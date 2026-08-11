@@ -36,7 +36,15 @@ import { distinctGrainCount, measureExpr, type ReconSource, type ReconTargetFact
  */
 
 /** Enough drill-downs to cover the pipeline's shapes without turning the document into a query dump. */
-const MAX_QUERIES = 24;
+const MAX_QUERIES = 18;
+/**
+ * And a per-table share of that budget, so the first two tables can't spend it all.
+ *
+ * `drillDownsFor` returns its queries most-diagnostic first, so a table's first three are the fan-out
+ * probe, the null-key probe and the one drift or grain check that applies — which is the order someone
+ * works in anyway. The fourth onwards repeat a shape already shown for a different source.
+ */
+const MAX_PER_TARGET = 3;
 
 /** What to suspect first when a check of each kind fails, and where to look. Canned by design. */
 export const FAILURE_GUIDE: Record<ReconCheckKind, { suspect: string; nextStep: string }> = {
@@ -111,6 +119,77 @@ export const FAILURE_GUIDE: Record<ReconCheckKind, { suspect: string; nextStep: 
       "than derived from the schema."
   }
 };
+
+/**
+ * Why a row of the *per-layer column report* can come back REVIEW — the same canned/generated split
+ * as above, applied to `layerReconciliation.ts`'s nine columns.
+ *
+ * That report is read a row at a time — `source_table | target_table | source_column | target_column |
+ * type | source_value | target_value | result | comments` — and every row is the same two questions: what is
+ * being compared, and
+ * how the code reaches the source. Both are printed on the row itself, so what a REVIEW *could* mean is
+ * decidable from the row without knowing the project, which is what makes it worth writing once here.
+ *
+ * What this cannot say is which of those causes applies to a given row: that needs the transformation
+ * SQL, and it is exactly what the report's own `comments` column carries, written by the reviewer model
+ * against the code. This table sends a reader to the right suspect; that column names it.
+ */
+export interface LayerReviewCause {
+  /** What the reader is looking at on the row — quoted from the report's own columns. */
+  signal: string;
+  /** What a REVIEW on such a row usually comes from, likeliest first. */
+  meaning: string;
+}
+
+export const LAYER_REVIEW_GUIDE: LayerReviewCause[] = [
+  {
+    signal: "A measure column — the row totals both sides",
+    meaning:
+      "Rows survived but the amounts did not: a WHERE that excluded some of them, a join that " +
+      "multiplied them, a CAST or TRY_CONVERT that truncated or nulled non-numeric values, or an " +
+      "ISNULL/COALESCE default that moved the total."
+  },
+  {
+    signal: "Any other column — the row counts distinct values on both sides",
+    meaning:
+      "Values were added or lost rather than rows: a CASE or a mapping collapsing several source " +
+      "values into one, a default literal the source never held, or a filter that removed the only " +
+      "rows carrying a value. Unmatched rows arriving as NULL also count as a value lost, since no " +
+      "distinct count counts NULL."
+  },
+  {
+    signal: "`source_column` and `target_column` holding different names",
+    meaning:
+      "The column was renamed or derived on the way in, so the comparison runs against the expression " +
+      "that builds it. Read that expression before suspecting the data."
+  },
+  {
+    signal: "`type` FROM",
+    meaning:
+      "This source drives the target's rows, so a difference is the transformation's own doing — its " +
+      "WHERE, its GROUP BY, or a dedupe. Check it against the filters listed for that table first."
+  },
+  {
+    signal: "`type` LEFT JOIN",
+    meaning:
+      "Source rows with no match are kept as NULL rather than dropped, so the target can hold fewer " +
+      "distinct values while holding the same rows. A duplicate key on this source instead multiplies " +
+      "every row and every total."
+  },
+  {
+    signal: "`type` INNER JOIN",
+    meaning:
+      "Rows with no match are dropped, so a count and a total can move together. Suspect this first " +
+      "when several columns of the same pair review at once."
+  },
+  {
+    signal: "`type` READ SEPARATELY",
+    meaning:
+      "The source is read by the transformation but its rows never reach the target — typically a " +
+      "lookup of a single value — so the two sides are not the same population and the row is context " +
+      "rather than a finding."
+  }
+];
 
 /** Human labels for the kinds, matching the titles the scripts use. */
 export const KIND_LABELS: Record<ReconCheckKind, string> = {
@@ -344,25 +423,149 @@ export function drillDownsFor(facts: ReconTargetFacts): DrillDown[] {
   ];
 }
 
+/** The five things a reconciliation can rest on that the project does not state outright. */
+export type ConcernKind = "no_key" | "no_columns" | "inferred_key" | "lookup" | "incidental";
+
+/**
+ * Something a table's reconciliation *rests on* rather than proves, and what to do about it.
+ *
+ * This is the gate on the drill-down queries. A document that prints six queries for every table is a
+ * query dump whatever it is titled, and a reader stops distinguishing the table with a guessed key
+ * from the one with a declared one. So the queries follow the concerns: a target with nothing to flag
+ * is counted and not written about, and a target with something gets the concern, the suggestion, and
+ * only then the SQL that would settle it.
+ *
+ * Decided from the same `ReconTargetFacts` the checks are — a declared key, a recoverable column list,
+ * a source's role in the join — so a concern is raised by what the code says, never by a judgement
+ * about the *data*, which Recon never sees.
+ */
+export interface TargetConcern {
+  kind: ConcernKind;
+  /** Lower sorts first: what a reader should look at before anything else. */
+  rank: number;
+  /** What is unproven, in one sentence. */
+  issue: string;
+  /** What settles it. */
+  suggestion: string;
+}
+
+/**
+ * The five things that can be assumed, written once each.
+ *
+ * Deliberately not parameterised by table. Fourteen tables reconciled on a guessed key is *one* fact
+ * about the project, and a findings table that states it fourteen times in fourteen near-identical
+ * sentences is one nobody reads to the bottom of — while the table-specific half (which columns the
+ * guessed key is, which source is the lookup) is already printed against each table in the hop and
+ * pair tables. So the text is per kind and the tables are listed beside it by `groupConcerns`.
+ */
+const CONCERNS: Record<ConcernKind, { rank: number; issue: string; suggestion: string }> = {
+  no_key: {
+    rank: 1,
+    issue:
+      "No join key could be found between the table and its sources, so the two sides are compared only " +
+      "in bulk — row counts and totals, never row by row.",
+    suggestion:
+      "Add the table's CREATE TABLE so its key is declared, or reconcile it on a key you know by hand."
+  },
+  no_columns: {
+    rank: 2,
+    issue:
+      "A table on one side has no recoverable column list — nothing in the project defines it with " +
+      "CREATE TABLE or builds it with a named select list — so its columns are not compared at all.",
+    suggestion: "Add that table's DDL to the folder and re-run; the column-level checks appear on their own."
+  },
+  inferred_key: {
+    rank: 3,
+    issue:
+      "The join key was inferred from column naming rather than declared by a primary key, so the " +
+      "row-level checks rest on a guess about the grain. Each table's inferred key is named in its stage " +
+      "section above.",
+    suggestion:
+      "Confirm the key is unique — the duplicate-key check in the same script proves or disproves it, " +
+      "and an inferred key that duplicates is usually the wrong key."
+  },
+  lookup: {
+    rank: 4,
+    issue:
+      "A source is joined in for its columns rather than its rows, so it is assumed to hold one row per " +
+      "key — nothing in the project enforces that, and a duplicate there inflates every count and total.",
+    suggestion:
+      "Run the fan-out probe for each of these before believing any count or total: one duplicated " +
+      "reference row fails every other check at once."
+  },
+  incidental: {
+    rank: 5,
+    issue:
+      "A table is read by the transformation without its rows reaching the target — typically a lookup " +
+      "of a single value — so nothing reconciles it.",
+    suggestion:
+      "Check it is the single-value read it appears to be, rather than a source the lineage failed to connect."
+  }
+};
+
+function concern(kind: ConcernKind): TargetConcern {
+  return { kind, ...CONCERNS[kind] };
+}
+
+/** Everything worth flagging about one target, worst first. Empty means nothing is assumed here. */
+export function concernsFor(facts: ReconTargetFacts): TargetConcern[] {
+  const kinds: ConcernKind[] = [];
+
+  if (facts.key.columns.length === 0) kinds.push("no_key");
+  if (facts.columnSources.some((source) => source.columnCount === 0)) kinds.push("no_columns");
+  if (facts.key.confidence === "inferred") kinds.push("inferred_key");
+  if (facts.perSource.some((entry) => entry.role === "lookup")) kinds.push("lookup");
+  if (facts.incidentalSources.length > 0) kinds.push("incidental");
+
+  return kinds.map(concern).sort((a, b) => a.rank - b.rank);
+}
+
+/** One row per kind, with the tables it applies to — the shape the findings table is read in. */
+export interface ConcernGroup {
+  kind: ConcernKind;
+  issue: string;
+  suggestion: string;
+  /** In the order the plan visits them, which is pipeline order. */
+  tables: string[];
+}
+
+export function groupConcerns(targets: TargetDrillDowns[]): ConcernGroup[] {
+  const byKind = new Map<ConcernKind, string[]>();
+  for (const entry of targets) {
+    for (const item of entry.concerns) {
+      byKind.set(item.kind, [...(byKind.get(item.kind) ?? []), entry.target]);
+    }
+  }
+
+  return Array.from(byKind.entries())
+    .map(([kind, tables]) => ({ kind, issue: CONCERNS[kind].issue, suggestion: CONCERNS[kind].suggestion, tables }))
+    .sort((a, b) => CONCERNS[a.kind].rank - CONCERNS[b.kind].rank);
+}
+
 export interface TargetDrillDowns {
   target: string;
   hopLabel: string;
+  /** Why this target is in the plan at all. Never empty — an empty one keeps the target out. */
+  concerns: TargetConcern[];
+  /** May be empty: a target with no recoverable join key has concerns but nothing to run. */
   queries: DrillDown[];
 }
 
 export interface TroubleshootingPlan {
-  /** Per target, in hop order — already capped. */
+  /** Per target, in hop order — only the ones with something flagged, already capped. */
   targets: TargetDrillDowns[];
   /** Queries that fit within the cap. */
   shown: number;
   /** Queries left out by it, so the document can say so rather than quietly truncating. */
   omitted: number;
-  /** Targets for which nothing could be built, and why — usually no recoverable join key. */
+  /** Flagged targets with no query to offer, and no way to build one — usually no join key. */
   withoutQueries: string[];
+  /** Targets nothing was flagged for. Counted rather than listed: this is the good news line. */
+  clean: number;
 }
 
 /**
- * The drill-downs for a whole project, capped.
+ * The issues in a project and the queries that settle them, capped.
  *
  * Capped rather than complete because the document is read start to finish and a warehouse with forty
  * targets would bury every other section under generated SQL. What is cut is said out loud, and the
@@ -371,33 +574,33 @@ export interface TroubleshootingPlan {
  */
 export function buildTroubleshootingPlan(
   hops: { label: string; targets: ReconTargetFacts[] }[],
-  maxQueries = MAX_QUERIES
+  maxQueries = MAX_QUERIES,
+  maxPerTarget = MAX_PER_TARGET
 ): TroubleshootingPlan {
   const targets: TargetDrillDowns[] = [];
   const withoutQueries: string[] = [];
   let shown = 0;
   let omitted = 0;
+  let clean = 0;
 
   for (const hop of hops) {
     for (const facts of hop.targets) {
+      const concerns = concernsFor(facts);
+      if (concerns.length === 0) {
+        clean++;
+        continue;
+      }
+
       const queries = drillDownsFor(facts);
-      if (queries.length === 0) {
-        withoutQueries.push(facts.target);
-        continue;
-      }
-
-      const room = Math.max(0, maxQueries - shown);
-      if (room === 0) {
-        omitted += queries.length;
-        continue;
-      }
-
+      const room = Math.min(Math.max(0, maxQueries - shown), maxPerTarget);
       const kept = queries.slice(0, room);
       omitted += queries.length - kept.length;
       shown += kept.length;
-      targets.push({ target: facts.target, hopLabel: hop.label, queries: kept });
+      if (queries.length === 0) withoutQueries.push(facts.target);
+
+      targets.push({ target: facts.target, hopLabel: hop.label, concerns, queries: kept });
     }
   }
 
-  return { targets, shown, omitted, withoutQueries };
+  return { targets, shown, omitted, withoutQueries, clean };
 }

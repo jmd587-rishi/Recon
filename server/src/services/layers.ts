@@ -66,8 +66,41 @@ export function detectLayers(schemaNames: string[]): LayerRef[] {
     .map(({ name, hit }) => ({ label: name, schema: name, role: hit.role }));
 }
 
-/** Schemas that aren't part of the detected pipeline, so the CLI can say what it left out. */
-export function unassignedSchemas(schemaNames: string[], layers: LayerRef[]): string[] {
-  const used = new Set(layers.map((l) => l.schema));
-  return schemaNames.filter((name) => !used.has(name));
+/**
+ * Whether `table` belongs to `layer` — the single place that question is answered for a local
+ * project, so the scripts, the layer reports, the diagrams and the document can never disagree about
+ * which hop a table sits in.
+ *
+ * A null layer means "no layer was detected", which every caller treats as one scope over the whole
+ * project rather than as an empty one. A layer with `tables` is exactly those tables; a layer without
+ * is its schema, matched case-insensitively because a project may qualify the same schema either way.
+ */
+export function layerHasTable(layer: LayerRef | null, table: string): boolean {
+  if (layer === null) return true;
+  const name = table.toLowerCase();
+  if (layer.tables) return layer.tables.some((t) => t.toLowerCase() === name);
+  const schema = name.split(".").filter((p) => p.length > 0).slice(-2, -1)[0];
+  return schema !== undefined && schema === layer.schema.toLowerCase();
+}
+
+/**
+ * Schemas no layer claims, so a run can say what it passed over.
+ *
+ * Takes the project's tables rather than its schema names because a layer is not always a schema: on
+ * a project staged by source folder, comparing layer names to schema names would report every schema
+ * as unclaimed while every table in them is in fact covered. A schema is unclaimed only when nothing
+ * in it belongs to any layer.
+ */
+export function unclaimedSchemas(
+  tables: { qualified: string; schema: string | null }[],
+  layers: LayerRef[]
+): string[] {
+  const claimed = new Set<string>();
+  const seen = new Set<string>();
+  for (const table of tables) {
+    if (!table.schema) continue;
+    seen.add(table.schema);
+    if (layers.some((layer) => layerHasTable(layer, table.qualified))) claimed.add(table.schema);
+  }
+  return Array.from(seen).filter((schema) => !claimed.has(schema));
 }

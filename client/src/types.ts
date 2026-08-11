@@ -132,7 +132,34 @@ export type LayerRole = "ingest" | "clean" | "transform" | "serve";
 export interface LayerRef {
   label: string;
   schema: string;
+  /**
+   * The layer's tables, qualified and lowercased, when the layer is a source folder rather than a
+   * schema — a project can write every stage into one schema and stage by folder instead. Mirrors the
+   * server's `LayerRef.tables`; when it is set, it is the definition of the layer.
+   */
+  tables?: string[];
   role?: LayerRole;
+}
+
+/** Mirrors the server's `LayerDetectionSource` — the last two only arise in the CLI. */
+export type LayerDetectionSource = "ai" | "keyword" | "lineage" | "explicit" | "approved";
+
+/** Mirrors the server's `LayerGroupingKind` — whether the layers are schemas or source folders. */
+export type LayerGroupingKind = "schema" | "folder";
+
+/** Mirrors the server's `LayerDetectionReport`: the layers, and how much to trust them. */
+export interface LayerDetectionReport {
+  layers: LayerRef[];
+  source: LayerDetectionSource;
+  grouping: LayerGroupingKind;
+  /** One line per layer on why it is that stage, keyed by the layer's label. Empty when derived. */
+  reasons: Record<string, string>;
+  /** Groups deliberately left out — security, config, logging — each with the reason. */
+  excluded: { schema: string; reason: string }[];
+  /** Groups no layer claims and no exclusion explains. */
+  unplaced: string[];
+  notice: string | null;
+  warning: string | null;
 }
 
 export interface SelectedNotebook {

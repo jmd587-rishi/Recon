@@ -7,6 +7,8 @@ import type {
   ReconKeyConfidence,
   ReconScript
 } from "../types/index.js";
+import { layerHasTable } from "./layers.js";
+import { measureCast, platformNote, type SqlPlatform } from "./sqlPlatform.js";
 import { type LocalProject, splitQualifiedTable } from "./localProject.js";
 import { buildHopBundle, buildProjectBundle } from "./reconciliationBundle.js";
 import {
@@ -152,10 +154,12 @@ function schemaOf(table: string): string | null {
   return splitQualifiedTable(table).schema;
 }
 
-function inSchema(table: string, schema: string | null): boolean {
-  if (schema === null) return true;
-  const own = schemaOf(table);
-  return own !== null && own.toLowerCase() === schema.toLowerCase();
+/**
+ * Whether a table belongs to a layer. Delegates to `layers.layerHasTable` rather than comparing
+ * schemas here, because a layer is not always a schema — see `LayerRef.tables`.
+ */
+function inLayer(table: string, layer: LayerRef | null): boolean {
+  return layerHasTable(layer, table);
 }
 
 function unique(values: string[]): string[] {
@@ -501,12 +505,12 @@ export const MEASURE_TYPE = "DECIMAL(38, 6)";
  * numbers — a staging table keeping amounts as text is the normal case, not an odd one — and reads
  * as NULL when it doesn't, which is the honest answer and costs nothing else in the file.
  */
-export function measureExpr(column: string, typed: boolean): string {
-  return typed ? column : `TRY_CAST(${column} AS ${MEASURE_TYPE})`;
+export function measureExpr(column: string, typed: boolean, platform: SqlPlatform = "portable"): string {
+  return typed ? column : measureCast(platform, column, MEASURE_TYPE);
 }
 
-function sumOf(table: string, column: string, typed: boolean): string {
-  return `(SELECT SUM(${measureExpr(column, typed)}) FROM ${table})`;
+function sumOf(table: string, column: string, typed: boolean, platform: SqlPlatform): string {
+  return `(SELECT SUM(${measureExpr(column, typed, platform)}) FROM ${table})`;
 }
 
 function quoted(text: string): string {
@@ -599,7 +603,8 @@ function rowCountCheck(target: string, perSource: ReconSource[]): ReconCheck | n
 function measureCheck(
   target: string,
   perSource: { source: string; measures: ColumnPair[] }[],
-  untyped: Set<string>
+  untyped: Set<string>,
+  platform: SqlPlatform
 ): ReconCheck | null {
   const blocks = perSource.flatMap(({ source, measures }) =>
     measures.map((measure) => {
@@ -608,11 +613,11 @@ function measureCheck(
       return (
         `SELECT ${quoted(label)} AS measure,\n` +
         `       ${quoted(source)} AS source_table,\n` +
-        `       ${sumOf(source, measure.source, typed)} AS source_total,\n` +
-        `       ${sumOf(target, measure.target, typed)} AS target_total,\n` +
+        `       ${sumOf(source, measure.source, typed, platform)} AS source_total,\n` +
+        `       ${sumOf(target, measure.target, typed, platform)} AS target_total,\n` +
         // An empty table sums to NULL, and `NULL - NULL` would read as "no difference" at a glance.
-        `       COALESCE(${sumOf(target, measure.target, typed)}, 0) - ` +
-        `COALESCE(${sumOf(source, measure.source, typed)}, 0) AS total_diff`
+        `       COALESCE(${sumOf(target, measure.target, typed, platform)}, 0) - ` +
+        `COALESCE(${sumOf(source, measure.source, typed, platform)}, 0) AS total_diff`
       );
     })
   );
@@ -765,6 +770,7 @@ function scriptText(params: {
   hopLabel: string;
   folderName: string;
   writtenBy: LocalReconciliationSuite["generatedBy"];
+  platform: SqlPlatform;
 }): string {
   const { script, hopLabel, folderName } = params;
   const rule = "=".repeat(76);
@@ -789,7 +795,7 @@ function scriptText(params: {
       "   "
     )
   );
-  lines.push("   Portable SQL — no TOP/LIMIT — so it runs unchanged on SQL Server and Databricks SQL.");
+  lines.push(`   ${platformNote(params.platform)}`);
   if (script.summary) {
     lines.push("");
     lines.push(...wrapNote(script.summary, "   "));
@@ -1010,16 +1016,30 @@ function sortedGroups(groups: Map<string, TargetGroup>): TargetGroup[] {
   return Array.from(groups.values()).sort((a, b) => a.target.localeCompare(b.target));
 }
 
-/** Groups the statements of a hop by the table they build, keeping only sources inside the hop. */
-function groupByTarget(facts: LineageFact[], fromSchema: string | null, toSchema: string | null): TargetGroup[] {
+/**
+ * Groups the statements of a hop by the table they build, keeping only sources inside the hop.
+ *
+ * `orphan` is the third kind of source that belongs here. A pipeline staged by source folder leaves
+ * every table it only *reads* outside all of its layers — a folder holds the files that build tables,
+ * and nothing builds an input that arrives from elsewhere. Such a table can never fall inside any hop
+ * by the first two rules, so the check against it would simply not be written; admitting it to the
+ * hop that reads it is the only place it could go. Narrow on purpose: a table some other layer claims
+ * is not an orphan, so this cannot pull a raw table into a hop three stages downstream.
+ */
+function groupByTarget(
+  facts: LineageFact[],
+  from: LayerRef | null,
+  to: LayerRef | null,
+  orphan: (table: string) => boolean
+): TargetGroup[] {
   return sortedGroups(
     groupWrites(
       facts,
-      (target) => inSchema(target, toSchema),
+      (target) => inLayer(target, to),
       // Sources from the layer feeding this hop, plus the target's own layer: a report built from a
       // fact table next to it is still a reconciliation the engineer has to do, and it belongs to the
       // hop that produces that layer rather than to no hop at all.
-      (source) => inSchema(source, fromSchema) || (toSchema !== null && inSchema(source, toSchema))
+      (source) => inLayer(source, from) || (to !== null && inLayer(source, to)) || orphan(source)
     )
   );
 }
@@ -1035,16 +1055,16 @@ function groupByTarget(facts: LineageFact[], fromSchema: string | null, toSchema
  * still a table of the layer, so it is kept with no sources: the quality checks apply to it, and its
  * being an entry point is a fact about the pipeline worth stating rather than an absence.
  */
-function groupByLayer(facts: LineageFact[], schema: string | null): TargetGroup[] {
+function groupByLayer(facts: LineageFact[], layer: LayerRef | null): TargetGroup[] {
   const groups = groupWrites(
     facts,
-    (target) => inSchema(target, schema),
+    (target) => inLayer(target, layer),
     () => true
   );
 
   for (const fact of facts) {
     for (const table of [fact.targetTable, ...fact.sourceTables]) {
-      if (!table || isTempTable(table) || !inSchema(table, schema) || groups.has(table)) continue;
+      if (!table || isTempTable(table) || !inLayer(table, layer) || groups.has(table)) continue;
       groups.set(table, { target: table, sources: [], facts: [] });
     }
   }
@@ -1295,14 +1315,15 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
  * This is the fallback path — `aiReconciliation.ts` is what normally writes the checks — so it stays
  * deliberately mechanical. Whatever it can't ground it skips and says so in `facts.notes`.
  */
-export function templateChecks(facts: ReconTargetFacts): ReconCheck[] {
+export function templateChecks(facts: ReconTargetFacts, platform: SqlPlatform = "portable"): ReconCheck[] {
   const rowCounts = rowCountCheck(facts.target, facts.perSource);
   const checks: ReconCheck[] = rowCounts ? [rowCounts] : [];
 
   const measures = measureCheck(
     facts.target,
     facts.perSource.map(({ source, measures: shared }) => ({ source, measures: shared })),
-    new Set(facts.untypedMeasures)
+    new Set(facts.untypedMeasures),
+    platform
   );
   if (measures) checks.push(measures);
 
@@ -1333,6 +1354,8 @@ export function assembleScript(params: {
   folderName: string;
   writtenBy?: LocalReconciliationSuite["generatedBy"];
   extraNotes?: string[];
+  /** The engine this file is written to run on — see `sqlPlatform.ts`. */
+  platform?: SqlPlatform;
 }): ReconScript {
   const { facts, checks, summary, hopLabel, folderName } = params;
   const body: Omit<ReconScript, "sql" | "filename"> = {
@@ -1354,7 +1377,13 @@ export function assembleScript(params: {
   return {
     ...body,
     filename: facts.filename,
-    sql: scriptText({ script: body, hopLabel, folderName, writtenBy: params.writtenBy ?? "rules" })
+    sql: scriptText({
+      script: body,
+      hopLabel,
+      folderName,
+      writtenBy: params.writtenBy ?? "rules",
+      platform: params.platform ?? "portable"
+    })
   };
 }
 
@@ -1400,9 +1429,18 @@ export function gatherReconciliationFacts(project: LocalProject, layers: LayerRe
   const hopSpecs: { from: LayerRef | null; to: LayerRef | null }[] =
     layers.length >= 2 ? layers.slice(0, -1).map((from, i) => ({ from, to: layers[i + 1] })) : [{ from: null, to: null }];
 
+  // A table no layer claims and no statement writes: an input from outside the pipeline. Computed
+  // once here rather than per hop, since it is a property of the project rather than of the hop.
+  const orphans = new Set(
+    project.scan.tables
+      .filter((table) => !table.written && !layers.some((layer) => layerHasTable(layer, table.qualified)))
+      .map((table) => table.qualified.toLowerCase())
+  );
+  const isOrphan = (table: string) => orphans.has(table.toLowerCase());
+
   const takenFolders = new Set<string>();
   const hops: ReconHopFacts[] = hopSpecs.map(({ from, to }) => {
-    const groups = groupByTarget(project.facts, from?.schema ?? null, to?.schema ?? null);
+    const groups = groupByTarget(project.facts, from, to, isOrphan);
 
     let folder = reconFolderName(from, to);
     for (let n = 2; takenFolders.has(folder); n++) folder = `${reconFolderName(from, to)}_${n}`;
@@ -1466,7 +1504,7 @@ export function gatherLayerFacts(project: LocalProject, layers: LayerRef[]): Rec
   const specs: (LayerRef | null)[] = layers.length > 0 ? layers : [null];
 
   const built = specs.map((layer, index) => {
-    const groups = groupByLayer(project.facts, layer?.schema ?? null);
+    const groups = groupByLayer(project.facts, layer);
     const stem = `${String(index + 1).padStart(2, "0")}_${slug(layer?.label ?? "all tables")}`;
 
     const takenNames = new Set<string>();
@@ -1493,13 +1531,18 @@ export function gatherLayerFacts(project: LocalProject, layers: LayerRef[]): Rec
 }
 
 /** Packs one hop's finished scripts, with the single query that covers all of them at once. */
-export function assembleHop(hop: ReconHopFacts, scripts: ReconScript[], folderName: string): ReconHopScripts {
+export function assembleHop(
+  hop: ReconHopFacts,
+  scripts: ReconScript[],
+  folderName: string,
+  platform: SqlPlatform = "portable"
+): ReconHopScripts {
   return {
     fromLayer: hop.from,
     toLayer: hop.to,
     folder: hop.folder,
     scripts,
-    bundle: buildHopBundle(hop, scripts, folderName),
+    bundle: buildHopBundle(hop, scripts, folderName, platform),
     notes: hop.notes
   };
 }
@@ -1513,14 +1556,16 @@ export function summarizeSuite(params: {
   columns: ColumnIndex;
   generatedBy: LocalReconciliationSuite["generatedBy"];
   notice: string | null;
+  platform: SqlPlatform;
 }): LocalReconciliationSuite {
-  const { folderName, hops, hopFacts, columns, generatedBy, notice } = params;
+  const { folderName, hops, hopFacts, columns, generatedBy, notice, platform } = params;
   const tablesInScope = unique(hops.flatMap((hop) => hop.scripts.flatMap((s) => [s.targetTable, ...s.sourceTables])));
 
   const byFolder = new Map(hops.map((hop) => [hop.folder, hop.scripts]));
   const projectBundle = buildProjectBundle(
     hopFacts.map((hop) => ({ hop, scripts: byFolder.get(hop.folder) ?? [] })),
-    folderName
+    folderName,
+    platform
   );
 
   return {
@@ -1549,7 +1594,8 @@ export function summarizeSuite(params: {
 export function buildReconciliationSuite(
   project: LocalProject,
   layers: LayerRef[],
-  notice: string | null = null
+  notice: string | null = null,
+  platform: SqlPlatform = "portable"
 ): LocalReconciliationSuite {
   const { hops, columns } = gatherReconciliationFacts(project, layers);
 
@@ -1559,13 +1605,15 @@ export function buildReconciliationSuite(
       hop.targets.map((facts) =>
         assembleScript({
           facts,
-          checks: templateChecks(facts),
+          checks: templateChecks(facts, platform),
           summary: "",
           hopLabel: hop.label,
-          folderName: project.folderName
+          folderName: project.folderName,
+          platform
         })
       ),
-      project.folderName
+      project.folderName,
+      platform
     )
   );
 
@@ -1575,6 +1623,7 @@ export function buildReconciliationSuite(
     hopFacts: hops,
     columns,
     generatedBy: "rules",
-    notice
+    notice,
+    platform
   });
 }

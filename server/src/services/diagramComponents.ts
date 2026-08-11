@@ -6,6 +6,7 @@ import {
   type DagEdge,
   type DagLayout
 } from "./dagLayout.js";
+import { layerHasTable } from "./layers.js";
 import { reconFolderName } from "./reconciliationScripts.js";
 import type { LayerRef, LineageEdge, LocalTableRef } from "../types/index.js";
 
@@ -63,10 +64,7 @@ export interface DiagramComponent {
   emptyReason: string | null;
 }
 
-function inSchema(table: string, schema: string | null): boolean {
-  if (schema === null) return true;
-  return schemaOf(table).toLowerCase() === schema.toLowerCase();
-}
+
 
 /** The adjacent pairs of `layers`, matching `gatherReconciliationFacts`'s `hopSpecs` exactly. */
 export function hopPairs(layers: LayerRef[]): { from: LayerRef; to: LayerRef }[] {
@@ -76,8 +74,8 @@ export function hopPairs(layers: LayerRef[]): { from: LayerRef; to: LayerRef }[]
 function edgesForHop(edges: LineageEdge[], from: LayerRef, to: LayerRef): LineageEdge[] {
   return edges.filter(
     (edge) =>
-      inSchema(edge.to, to.schema) &&
-      (inSchema(edge.from, from.schema) || inSchema(edge.from, to.schema)) &&
+      layerHasTable(to, edge.to) &&
+      (layerHasTable(from, edge.from) || layerHasTable(to, edge.from)) &&
       edge.from.toLowerCase() !== edge.to.toLowerCase()
   );
 }

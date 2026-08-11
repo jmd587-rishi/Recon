@@ -4,7 +4,9 @@ import type {
   CodeCandidate,
   CodeFixSeverity,
   HopBusinessContext,
+  LayerGroupingKind,
   LayerRef,
+  LayerRole,
   LevelFinding,
   LevelReport,
   LevelSeverity,
@@ -19,6 +21,8 @@ import type {
   ProjectStats,
   ReconCheckKind
 } from "../types/index.js";
+
+import { platformRule, type SqlPlatform } from "./sqlPlatform.js";
 
 export class LlmConfigError extends Error {}
 
@@ -857,7 +861,11 @@ const RECON_KINDS: readonly ReconCheckKind[] = [
 /** Upper bound on the pipeline-specific checks asked for per table, named in the prompt. */
 export const MAX_CUSTOM_CHECKS_PER_TARGET = envInt("RECON_CHECKS_PER_TARGET", 6, 1, 20);
 
-export function buildReconciliationMessages(hopLabel: string, targets: ReconTargetPrompt[]): ChatMessage[] {
+export function buildReconciliationMessages(
+  hopLabel: string,
+  targets: ReconTargetPrompt[],
+  platform: SqlPlatform = "portable"
+): ChatMessage[] {
   const block = targets
     .map((t) => {
       const lines = [
@@ -923,9 +931,10 @@ export function buildReconciliationMessages(hopLabel: string, targets: ReconTarg
         "query names more than one table — `i.invoice_date`, never `invoice_date`. Give every table in " +
         "a join an alias. An unqualified column that two of the joined tables both have is an ambiguous " +
         "column name and the check will not run. " +
-        "(2) Portable SQL only: no TOP, no LIMIT, no temp tables, no vendor-specific functions, nothing " +
-        "that runs on only one engine. It must run unchanged on SQL Server and on Databricks SQL. " +
-        "(2a) SQL Server has no boolean type, so a condition may never be an operand: " +
+        `(2) ${platformRule(platform)} ` +
+        // Kept whatever the platform: it is the rule most often broken, it costs nothing on the
+        // engines that do have booleans, and a check written this way runs everywhere.
+        "(2a) A condition may never be an operand — SQL Server has no boolean type, so " +
         "`(a IS NULL) <> (b IS NULL)` and `(x = y) = (p = q)` do not parse there however well they read. " +
         "Wrap each side instead — `CASE WHEN a IS NULL THEN 1 ELSE 0 END <> CASE WHEN b IS NULL THEN 1 " +
         "ELSE 0 END` — or write the condition out with AND/OR. " +
@@ -1014,10 +1023,11 @@ export function parseReconciliationResponse(raw: string): ReconLlmScript[] {
 export async function writeReconciliationScripts(
   hopLabel: string,
   targets: ReconTargetPrompt[],
+  platform: SqlPlatform = "portable",
   options: LlmCallOptions = {}
 ): Promise<ReconLlmScript[]> {
   if (targets.length === 0) return [];
-  const content = await callAzureOpenAi(buildReconciliationMessages(hopLabel, targets), {
+  const content = await callAzureOpenAi(buildReconciliationMessages(hopLabel, targets, platform), {
     label: `recon ${hopLabel} [${targets.map((t) => t.targetTable).join(", ")}]`,
     ...options
   });
@@ -1286,10 +1296,15 @@ export function buildDocumentationMessages(input: DocumentationLlmInput): ChatMe
         `${DOC_GROUNDING} ` +
         'Respond with ONLY compact JSON: {"introduction": ["<paragraph>", ...], ' +
         '"architecture": ["<paragraph>", ...], ' +
-        '"layers": [{"layer": "<the layer label, exactly as given>", "purpose": "<1-2 sentences on what this layer is for>", "contents": "<1-2 sentences on what actually sits in it, citing real tables>"}, ...], ' +
+        '"layers": [{"layer": "<the layer label, exactly as given>", "purpose": "<2-3 sentences on what this layer is for and what state the data is in by the time it sits here>", "contents": "<1-2 sentences on what actually sits in it, citing real tables>", ' +
+        '"tables": [{"name": "<table name, exactly as given>", "use": "<one sentence: what this table holds and what it is used for>"}, ...]}, ...], ' +
         '"lineage": ["<paragraph>", ...], "risks": ["<something a reader should be sceptical about>", ...]}. ' +
         "Two or three paragraphs each for introduction, architecture and lineage; one entry in `layers` " +
-        "for every layer you were given, in the same order. No text outside the JSON object."
+        "for every layer you were given, in the same order, and inside it one `tables` entry for every " +
+        "table of that layer, in the order given. Write the table `use` at the level a business reader " +
+        "needs — what it is for, not a restatement of its column list — in one sentence. Where a table's " +
+        "purpose is not evident from its name and its lineage, say what it holds rather than inventing a " +
+        "use for it. At most four `risks`, one sentence each. No text outside the JSON object."
     },
     {
       role: "user",
@@ -1305,6 +1320,20 @@ export function buildDocumentationMessages(input: DocumentationLlmInput): ChatMe
         concernBlock
     }
   ];
+}
+
+/** One line per table on what it is for. Entries with no name or no text are dropped, not defaulted. */
+function parseTableUses(value: unknown): { name: string; use: string }[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const rec = item as Record<string, unknown>;
+      const name = typeof rec.name === "string" ? rec.name.trim() : "";
+      const use = typeof rec.use === "string" ? rec.use.trim() : "";
+      return name && use ? [{ name, use }] : [];
+    })
+    .slice(0, 80);
 }
 
 export function parseDocumentationResponse(raw: string): ProjectDocumentationProse {
@@ -1328,7 +1357,8 @@ export function parseDocumentationResponse(raw: string): ProjectDocumentationPro
               {
                 layer,
                 purpose: typeof rec.purpose === "string" ? rec.purpose.trim() : "",
-                contents: typeof rec.contents === "string" ? rec.contents.trim() : ""
+                contents: typeof rec.contents === "string" ? rec.contents.trim() : "",
+                tables: parseTableUses(rec.tables)
               }
             ];
           })
@@ -1402,7 +1432,14 @@ export function buildHopContextMessages(input: HopContextLlmInput): ChatMessage[
         '"rules": [{"rule": "<a rule this stage applies, in business terms>", "evidence": "<the predicate, join or column from the SQL above that shows it>"}, ...], ' +
         '"expectedDifferences": ["<why the source and target row counts can legitimately differ here>", ...], ' +
         '"watchOuts": ["<how this stage could go wrong without anyone noticing>", ...]}. ' +
-        "Two or three paragraphs in `context`. Every `evidence` must quote the SQL you were given. " +
+        "Two or three paragraphs in `context`, of three or four sentences each, pitched at a reader who " +
+        "needs to know what this stage means for the data rather than how every column is computed. " +
+        "The three lists go into a report that is read, not into a specification: give at most four " +
+        "`rules`, at most three `expectedDifferences` and at most three `watchOuts`, each one sentence, " +
+        "and only the ones that would change what a reader does. Pick the rules that decide which rows " +
+        "or which values survive; leave out anything that merely restates a column list or renames a " +
+        "column. Every `evidence` must quote the SQL you were given, and must be the fragment itself — a " +
+        "predicate, a join condition, a GROUP BY, a CASE — never a whole statement. " +
         "No text outside the JSON object."
     },
     {
@@ -1462,13 +1499,18 @@ export async function describeHopContext(
  *
  * Deliberately the *whole* row of the emitted table rather than a summary of it: the model is being
  * asked to explain a specific line of output to the person reading that line, so it should be looking
- * at the same four facts they are — which two tables, which column, how the code relates them.
+ * at the same facts they are — which two tables, which column at each end, how the code relates them.
  */
 export interface ReconCommentInput {
   sourceTable: string;
   targetTable: string;
-  /** The column being reconciled, or null for a check on whole rows. */
-  column: string | null;
+  /**
+   * The column being reconciled, at each end of its lineage, or null for a check on whole rows. Two
+   * fields rather than one because the report prints two, and because a rename is often itself the
+   * answer — the model can only quote the expression behind it if it is told both names.
+   */
+  sourceColumn: string | null;
+  targetColumn: string | null;
   /** How the transformation reaches the source: `FROM`, `LEFT JOIN`, `INNER JOIN`, … */
   joinType: string;
   /** Exactly what the generated SQL compares, e.g. `SUM(revenue)` or `COUNT(DISTINCT status)`. */
@@ -1486,6 +1528,18 @@ export interface ReconCommentInput {
  * any pipeline. It is also why the answer may be wrong: it is a reading of the code, offered as a
  * first place to look, and the prompt says so rather than letting confident prose imply otherwise.
  */
+/**
+ * The column a row is about, in one line: the target's own name, and the source name it was built from
+ * where the transformation renamed it. Said this way rather than as two labels because a rename is a
+ * fact about one column, and it is the fact most likely to be the reason the two sides differ.
+ */
+function commentColumnLine(input: ReconCommentInput): string {
+  const target = input.targetColumn ?? input.sourceColumn;
+  const source = input.sourceColumn ?? input.targetColumn;
+  if (target === null || source === null) return "(whole rows — no single column)";
+  return source === target ? target : `${target}, renamed from ${source}`;
+}
+
 export function buildReconCommentMessages(
   scope: string,
   inputs: ReconCommentInput[],
@@ -1497,7 +1551,7 @@ export function buildReconCommentMessages(
         `[${i}] compare ${input.comparison}\n` +
         `     target: ${input.targetTable}\n` +
         `     source: ${input.sourceTable}  (reached by ${input.joinType})\n` +
-        `     column: ${input.column ?? "(whole rows — no single column)"}`
+        `     column: ${commentColumnLine(input)}`
     )
     .join("\n\n");
 
@@ -1581,4 +1635,227 @@ export async function explainReconciliationChecks(
     ...options
   });
   return parseReconCommentResponse(content, inputs.length);
+}
+
+// ---- Pipeline layer detection (reading the code, not the schema names) ----
+
+/**
+ * One candidate way of grouping the project into layers, with everything derived about it.
+ *
+ * Two are offered when the project supports both: its schema qualifiers, and its source folders.
+ * Which one is the pipeline is the first thing the model is asked, because on a project that writes
+ * every stage into one schema the schema grouping is a partition that separates nothing — and
+ * `concentration` is the number that says so.
+ */
+export interface LayerGroupingEvidence {
+  kind: LayerGroupingKind;
+  groups: {
+    name: string;
+    tableCount: number;
+    /** Table names, capped. The names carry most of the signal about what the group holds. */
+    tables: string[];
+    /** Tables read here that no statement in the project writes — inputs arriving from outside. */
+    externalTableCount: number;
+    readsFrom: { name: string; edges: number }[];
+    feeds: { name: string; edges: number }[];
+    /** Longest path from a group nothing feeds. 0 means this group is fed by nothing. */
+    depth: number;
+  }[];
+  /** The grouping's own ordering, most-raw first. */
+  derivedOrder: string[];
+  /** Lineage edges that cross groups, and those a layering at this grouping could not see. */
+  crossEdges: number;
+  innerEdges: number;
+  /** The largest group's share of the tables, 0..1. Near 1 means the grouping separates nothing. */
+  concentration: number;
+}
+
+export interface LayerDetectionInput {
+  projectName: string;
+  groupings: LayerGroupingEvidence[];
+  /** What the derived rules prefer, offered as the default rather than as the answer. */
+  preferred: LayerGroupingKind | null;
+  /** A statement or two per group, tagged with both groupings so they can be compared. */
+  samples: { schema: string; folder: string; path: string; builds: string; sql: string }[];
+}
+
+export interface DetectedLayer {
+  /** The group's name, exactly as it was given — a schema, or a folder. */
+  name: string;
+  role: LayerRole | null;
+  /** One line on why this group is that stage, in this project's own terms. */
+  reason: string;
+}
+
+export interface LayerDetectionAnswer {
+  /** Which candidate grouping the pipeline is staged by. */
+  grouping: LayerGroupingKind | null;
+  layers: DetectedLayer[];
+  /** Groups deliberately left out of the pipeline, each with the reason to print beside it. */
+  excluded: { name: string; reason: string }[];
+}
+
+const LAYER_ROLES: readonly LayerRole[] = ["ingest", "clean", "transform", "serve"];
+const GROUPING_KINDS: readonly LayerGroupingKind[] = ["schema", "folder"];
+
+/**
+ * The prompt behind AI layer detection: how is this project staged, and in what order.
+ *
+ * Two questions, and the first one is the one that used to be assumed. A pipeline is not always
+ * staged by schema — a project can write every derived table into a single `refined` schema and
+ * separate its stages by source folder — and assuming schemas there collapses six dependency levels
+ * into one hop. So both candidate groupings are shown with their own dependency graph, and the model
+ * picks before it orders.
+ *
+ * The model is *not* asked to invent an ordering from nothing: each grouping's derived order comes
+ * with it, and the rule is that the answer has to respect the direction data actually flows. What the
+ * model adds is the reading — that `prep` holds cleaned copies rather than reports, that `security`
+ * is not a stage at all, that fourteen tables in one schema are really three stages of work — which
+ * is a judgement about meaning rather than a fact the SQL states.
+ */
+export function buildLayerDetectionMessages(input: LayerDetectionInput): ChatMessage[] {
+  const groupingBlock = input.groupings
+    .map((grouping) => {
+      const groups = grouping.groups
+        .map((g) => {
+          const reads = g.readsFrom.length
+            ? g.readsFrom.map((r) => `${r.name} (${r.edges})`).join(", ")
+            : "nothing in this project";
+          const feeds = g.feeds.length ? g.feeds.map((f) => `${f.name} (${f.edges})`).join(", ") : "nothing in this project";
+          return (
+            `    ${g.name}: ${g.tableCount} table(s), dependency depth ${g.depth}\n` +
+            `      tables: ${g.tables.join(", ") || "(none named)"}\n` +
+            `      reads from: ${reads}\n` +
+            `      feeds: ${feeds}\n` +
+            `      tables arriving from outside this project (never written here): ${g.externalTableCount}`
+          );
+        })
+        .join("\n");
+      return (
+        `  GROUPING "${grouping.kind}" — ${grouping.groups.length} group(s)\n` +
+        `    derived order, most-raw first: ${grouping.derivedOrder.join(" -> ")}\n` +
+        `    lineage edges between groups: ${grouping.crossEdges}; edges hidden inside a group: ${grouping.innerEdges}\n` +
+        `    largest group holds ${Math.round(grouping.concentration * 100)}% of the tables\n` +
+        `${groups}`
+      );
+    })
+    .join("\n\n");
+
+  const sampleBlock = input.samples
+    .map((s) => `--- schema ${s.schema} | folder ${s.folder} | ${s.path} — builds ${s.builds} ---\n${s.sql}`)
+    .join("\n\n");
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior data engineer being shown a SQL project you have never seen, and asked to " +
+        "work out its pipeline layers. You are given one or more candidate ways of GROUPING the " +
+        "project — by the schema its tables are qualified with, and by the source folder the file " +
+        "that builds them lives in — each with its tables, its group-to-group dependency graph, and a " +
+        "sample of the SQL that builds them.\n\n" +
+        "Answer three things:\n" +
+        "1. Which GROUPING the pipeline is actually staged by.\n" +
+        "2. Within it, which groups are stages of ONE data pipeline, ordered from most-raw to " +
+        "most-refined.\n" +
+        "3. Which groups are not pipeline stages at all - security, configuration, logging, audit, " +
+        "metadata, a scratch area - and should be left out.\n\n" +
+        "Rules:\n" +
+        "a. Prefer the schema grouping. It is the convention and the one a reader expects. Choose the " +
+        "folder grouping only when the schemas do not separate the pipeline — the clearest sign is one " +
+        "schema holding most of the tables while the SQL inside it is a chain many levels deep, which " +
+        "shows up as a high largest-group percentage and a high hidden-edges count. In that case the " +
+        "folders are carrying the staging the schemas do not.\n" +
+        "b. Use ONLY the group names from the grouping you chose, spelled exactly as given. Never " +
+        "invent one, never merge two, never rename one, and never mix names from both groupings.\n" +
+        "c. The order must agree with that grouping's dependency graph: if A's tables are built by " +
+        "reading B, then B comes before A. The derived order already satisfies this - depart from it " +
+        "only when the code gives you a reason, and say what that reason was.\n" +
+        "d. Judge each group by what its tables ARE, not by whether its name resembles a convention. A " +
+        "group called arr or optum holding wide reporting tables built by joining and aggregating " +
+        "others is a serving layer. A group called prep holding one cleaned copy per input table is a " +
+        "cleaning layer. Say so in the project's own words.\n" +
+        "e. role is the stage the group plays, one of: ingest (data lands as it arrived), clean " +
+        "(typed, deduplicated, conformed copies), transform (joined, enriched, business logic " +
+        "applied), serve (facts, dimensions, marts, reports read by people or tools). Use null only if " +
+        "the code genuinely does not say.\n" +
+        "f. Several groups may share a role, and a role may be missing entirely. Do not force one " +
+        "group per role, and do not pad the pipeline out to four stages.\n" +
+        "g. reason is one sentence naming the actual evidence - a table, a group it reads, or what the " +
+        "SQL does to it. Under 25 words. No markdown.\n\n" +
+        'Respond with ONLY compact JSON: {"grouping": "schema" | "folder", "layers": [{"name": ' +
+        '"<exact group name>", "role": "ingest" | "clean" | "transform" | "serve" | null, "reason": ' +
+        '"<one sentence>"}, ...], "excluded": [{"name": "<exact group name>", "reason": "<why it is ' +
+        'not a pipeline stage>"}, ...]}. "layers" is in pipeline order, most-raw first. Every group of ' +
+        "the grouping you chose must appear in exactly one of the two lists. No text outside the JSON " +
+        "object."
+    },
+    {
+      role: "user",
+      content:
+        `Project folder: ${input.projectName}\n\n` +
+        `Candidate groupings:\n\n${groupingBlock}\n\n` +
+        `Grouping the derived rules prefer: ${input.preferred ?? "(none)"}\n\n` +
+        `Sample transformation SQL:\n\n${sampleBlock || "(no statements available)"}`
+    }
+  ];
+}
+
+/**
+ * Parses the answer into a grouping, its layers and its exclusions, keeping only what is
+ * structurally valid.
+ *
+ * Group names are *not* checked against the project here — this function doesn't know what the
+ * project's groups are. `layerDetection.ts` does that, because a hallucinated name has to be dropped
+ * against the real list rather than against the prompt.
+ */
+export function parseLayerDetectionResponse(raw: string): LayerDetectionAnswer {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "");
+
+  let parsed: { grouping?: unknown; layers?: unknown; excluded?: unknown };
+  try {
+    parsed = JSON.parse(cleaned) as { grouping?: unknown; layers?: unknown; excluded?: unknown };
+  } catch {
+    // Half a JSON document says nothing reliable about the pipeline's shape, and half an ordering is
+    // worse than none — the caller falls back to the derived grouping instead of guessing.
+    return { grouping: null, layers: [], excluded: [] };
+  }
+
+  const layers: DetectedLayer[] = [];
+  for (const entry of Array.isArray(parsed.layers) ? parsed.layers : []) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const rec = entry as Record<string, unknown>;
+    const name = typeof rec.name === "string" ? rec.name.trim() : "";
+    if (!name) continue;
+    layers.push({
+      name,
+      role: LAYER_ROLES.find((r) => r === rec.role) ?? null,
+      reason: typeof rec.reason === "string" ? rec.reason.trim() : ""
+    });
+  }
+
+  const excluded: { name: string; reason: string }[] = [];
+  for (const entry of Array.isArray(parsed.excluded) ? parsed.excluded : []) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const rec = entry as Record<string, unknown>;
+    const name = typeof rec.name === "string" ? rec.name.trim() : "";
+    if (!name) continue;
+    excluded.push({ name, reason: typeof rec.reason === "string" ? rec.reason.trim() : "" });
+  }
+
+  return { grouping: GROUPING_KINDS.find((k) => k === parsed.grouping) ?? null, layers, excluded };
+}
+
+export async function detectPipelineLayers(
+  input: LayerDetectionInput,
+  options: LlmCallOptions = {}
+): Promise<LayerDetectionAnswer> {
+  const content = await callAzureOpenAi(buildLayerDetectionMessages(input), {
+    label: `layer detection ${input.projectName}`,
+    ...options
+  });
+  return parseLayerDetectionResponse(content);
 }

@@ -34,6 +34,7 @@ import {
   stripStringLiterals,
   tableBindings
 } from "./sqlColumns.js";
+import type { SqlPlatform } from "./sqlPlatform.js";
 import { type LineageFact, stripSqlComments } from "./tableLineage.js";
 
 /**
@@ -1023,6 +1024,8 @@ interface ReconBatch {
   hopIndex: number;
   hopLabel: string;
   prompts: ReconTargetPrompt[];
+  /** Carried on the batch rather than passed down, so a split retry keeps it without plumbing. */
+  platform: SqlPlatform;
 }
 
 interface BatchResult {
@@ -1058,7 +1061,7 @@ async function runBatch(batch: ReconBatch, canSplit: boolean): Promise<BatchResu
     }
 
     try {
-      const scripts = await writeReconciliationScripts(batch.hopLabel, batch.prompts, {
+      const scripts = await writeReconciliationScripts(batch.hopLabel, batch.prompts, batch.platform, {
         timeoutMs: RECON_TIMEOUT_MS,
         maxOutputTokens: MAX_OUTPUT_TOKENS_PER_TARGET * batch.prompts.length
       });
@@ -1091,7 +1094,8 @@ async function runBatch(batch: ReconBatch, canSplit: boolean): Promise<BatchResu
  */
 export async function buildAiReconciliationSuite(
   project: LocalProject,
-  layers: LayerRef[]
+  layers: LayerRef[],
+  platform: SqlPlatform = "portable"
 ): Promise<LocalReconciliationSuite> {
   const { hops, columns, columnFacts } = gatherReconciliationFacts(project, layers);
 
@@ -1099,7 +1103,7 @@ export async function buildAiReconciliationSuite(
   // model returns is an addition to them. They also tell the model what not to write again.
   const baseChecks = new Map<ReconTargetFacts, ReconCheck[]>();
   for (const hop of hops) {
-    for (const facts of hop.targets) baseChecks.set(facts, templateChecks(facts));
+    for (const facts of hop.targets) baseChecks.set(facts, templateChecks(facts, platform));
   }
 
   const batches: ReconBatch[] = [];
@@ -1108,6 +1112,7 @@ export async function buildAiReconciliationSuite(
       batches.push({
         hopIndex,
         hopLabel: hop.label,
+        platform,
         prompts: hop.targets
           .slice(i, i + MAX_TARGETS_PER_CALL)
           .map((facts) => promptFor(facts, columnFacts, baseChecks.get(facts)!, project.facts))
@@ -1145,6 +1150,7 @@ export async function buildAiReconciliationSuite(
         hopLabel: hop.label,
         folderName: project.folderName,
         writtenBy: merged.aiCount > 0 ? "ai" : "rules",
+        platform,
         extraNotes: [
           ...merged.notes,
           ...(written === null && base.length > 0
@@ -1154,7 +1160,7 @@ export async function buildAiReconciliationSuite(
       });
     });
 
-    return assembleHop(hop, scripts, project.folderName);
+    return assembleHop(hop, scripts, project.folderName, platform);
   });
 
   return summarizeSuite({
@@ -1162,6 +1168,7 @@ export async function buildAiReconciliationSuite(
     hops: built,
     hopFacts: hops,
     columns,
+    platform,
     generatedBy: aiTables > 0 ? "ai" : "rules",
     notice: buildNotice(aiTables, plainTables, failures, hops)
   });
