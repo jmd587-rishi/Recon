@@ -1637,6 +1637,117 @@ export async function explainReconciliationChecks(
   return parseReconCommentResponse(content, inputs.length);
 }
 
+// ---- Business reconciliation comments (the report layer's own checks) ----
+
+/** One business check the model is asked to explain — see `businessReconciliation.ts`. */
+export interface BusinessCommentInput {
+  reportTable: string;
+  /** `roll-forward`, `stated identity`, `period continuity (12 periods)`, `measure trace`. */
+  checkName: string;
+  /** The measure or subtotal the check is about — `arr`, `nrr`. */
+  businessTerm: string;
+  sourceTable: string;
+  targetTable: string;
+  /** What the check asserts, in words. */
+  claim: string;
+  /** Exactly what the generated SQL compares. */
+  comparison: string;
+}
+
+/**
+ * The prompt behind a business check's `comments` column.
+ *
+ * Same framing as `buildReconCommentMessages` and a different question. There the two numbers come from
+ * two tables and the answer is usually a filter or a join; here they usually come from the *same* table
+ * and the answer is arithmetic — a movement bucket that double-counts, a `CASE` whose branches do not
+ * partition, a `LAG` over the wrong partition, a rolling window frame that includes a row it should
+ * not, a scaffold row that fills a gap with zero rather than carrying the balance forward. Being
+ * explicit about that is the difference between a comment that names the `CASE` and one that says
+ * "check the transformation logic".
+ *
+ * The instruction not to claim a difference exists matters more here than anywhere else: a
+ * roll-forward that does not balance is a famous problem, and a model asked about one will happily
+ * describe the failure it imagines rather than the code it was given.
+ */
+export function buildBusinessCommentMessages(
+  reportTable: string,
+  inputs: BusinessCommentInput[],
+  transformationSql: { path: string; builds: string; sql: string }[]
+): ChatMessage[] {
+  const checks = inputs
+    .map(
+      (input, i) =>
+        `[${i}] ${input.checkName} on ${input.businessTerm}\n` +
+        `     asserts: ${input.claim}\n` +
+        `     compares: ${input.comparison}\n` +
+        `     tables: ${input.sourceTable}${
+          input.targetTable === input.sourceTable ? " (both sides)" : ` -> ${input.targetTable}`
+        }`
+    )
+    .join("\n\n");
+
+  const code = transformationSql
+    .map((entry) => `--- ${entry.path} — builds ${entry.builds} ---\n${entry.sql}`)
+    .join("\n\n");
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are a senior analytics engineer reviewing the SQL behind a reporting table — a snowball, " +
+        "waterfall, bridge or movement report — for a colleague about to reconcile it. Each numbered " +
+        "item is one check that will run against the finished table: what it asserts, exactly what SQL " +
+        "it compares, and which tables it spans. You are also given the transformation SQL that builds " +
+        "them.\n\n" +
+        "For each item, write the comment that check should carry if it does NOT balance. Rules:\n" +
+        '1. Open with the cause, in the form "Because <what the code does> ...". Name and quote the ' +
+        "actual fragment responsible. On a reporting table that is usually arithmetic rather than a " +
+        "filter: the CASE branches that classify a movement and whether they can overlap or leave a " +
+        "gap, the LAG/LEAD and what it partitions and orders by, the window frame (ROWS BETWEEN ...), " +
+        "the scaffold or calendar join that invents rows, the ISNULL/COALESCE that turns a missing " +
+        "balance into zero, the sign a movement is stored with, the GROUP BY that sets the grain. " +
+        "Quote it exactly as written.\n" +
+        "2. Then one clause on what that does to this particular check.\n" +
+        "3. Then what the engineer should check or change first.\n" +
+        "4. Two or three sentences, under 120 words. Plain prose. No markdown, no bullets, no preamble. " +
+        "Do not use semicolons — the answer is embedded in a SQL string literal and a semicolon breaks " +
+        "it.\n" +
+        "5. You are reading code only and cannot see any data, so write what WOULD explain a " +
+        "difference. Never state that a difference exists, never say the report is wrong, and never " +
+        "quote a number.\n" +
+        "6. If nothing in the code would stop this check balancing, write one sentence that starts " +
+        '"Nothing in this transformation would unbalance this" and names the expressions you checked.\n' +
+        "7. Never name a table, column or expression that is not in the SQL you were given.\n\n" +
+        'Respond with ONLY compact JSON: {"comments": [{"index": <int from the list>, "comment": "<2-3 ' +
+        'sentences>"}, ...]}, exactly one entry per item. No text outside the JSON object.'
+    },
+    {
+      role: "user",
+      content:
+        `Reporting table: ${reportTable}\n\nChecks to comment on:\n\n${checks}\n\n` +
+        `Transformation SQL:\n\n${code || "(no SQL in this project builds this table)"}`
+    }
+  ];
+}
+
+/**
+ * One comment per check, in the same order. A check the model skipped comes back as an empty string
+ * rather than as a stand-in, exactly as `explainReconciliationChecks` does.
+ */
+export async function explainBusinessChecks(
+  reportTable: string,
+  inputs: BusinessCommentInput[],
+  transformationSql: { path: string; builds: string; sql: string }[],
+  options: LlmCallOptions = {}
+): Promise<string[]> {
+  if (inputs.length === 0) return [];
+  const content = await callAzureOpenAi(buildBusinessCommentMessages(reportTable, inputs, transformationSql), {
+    label: `business reconciliation comments ${reportTable}`,
+    ...options
+  });
+  return parseReconCommentResponse(content, inputs.length);
+}
+
 // ---- Pipeline layer detection (reading the code, not the schema names) ----
 
 /**
@@ -1668,6 +1779,11 @@ export interface LayerGroupingEvidence {
   innerEdges: number;
   /** The largest group's share of the tables, 0..1. Near 1 means the grouping separates nothing. */
   concentration: number;
+  /**
+   * The share of the project's tables this grouping places at all, 0..1. Low means it is a grouping
+   * of something other than the pipeline — the inputs, say — however evenly it splits what it sees.
+   */
+  coverage: number;
 }
 
 export interface LayerDetectionInput {

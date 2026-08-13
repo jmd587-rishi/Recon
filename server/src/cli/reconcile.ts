@@ -5,6 +5,12 @@ import { mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { buildAiReconciliationSuite } from "../services/aiReconciliation.js";
 import { buildDocumentation } from "../services/documentation.js";
+import { BUSINESS_RECON_DIR, HIGH_LEVEL_RECON_DIR, LOGICAL_RECON_DIR } from "../services/governanceLayout.js";
+import {
+  buildBusinessReconciliation,
+  noBusinessChecksFile,
+  summarizeBusinessReconciliation
+} from "../services/businessReconciliation.js";
 import {
   buildLayerReconciliation,
   summarizeLayerReconciliation
@@ -54,9 +60,21 @@ import type {
  * isn't configured — just reading straight off disk and writing straight back to disk instead of
  * going through the browser's upload/zip round trip.
  *
- * What lands on disk is one `.sql` per hop: `reconciliationBundle.ts`'s single query, which returns
- * the hop's whole reconciliation as one status table. The per-table scripts the same suite carries
- * are written only on `--split` — one file you can run beats a folder you have to work through.
+ * What lands on disk is one `.sql` per hop in `governance/High level recon/`: `reconciliationBundle.ts`'s
+ * single query, which returns the hop's whole reconciliation as one status table. The per-table scripts
+ * the same suite carries are written only on `--split` — one file you can run beats a folder you have to
+ * work through. Beside it, `governance/Logical recon/` holds the column reports — a folder per layer,
+ * in pipeline order, and inside it one query per table of that layer. And `governance/Business recon/`
+ * holds one query per *reporting* table. Three folders rather than one because they answer different
+ * questions and are read at different times: the hop queries say whether the pipeline ties out, the
+ * layer reports say which column of which table stopped agreeing with what built it, and the business
+ * checks say whether the table the business actually reads adds up on its own terms — its movements
+ * reaching its closing balance, the subtotals its own SQL declares, one period's close opening the
+ * next, and the measure it reports still being the one that entered the pipeline. That last folder
+ * exists because the first two have almost nothing to say about a report: `rpt_snowball`'s movement
+ * columns are eight readings of one upstream column and exist in no source table, so a
+ * source-versus-target reconciliation describes them entirely by what it could not check.
+ * `governanceLayout.ts` names all three.
  *
  * `reconcile run` puts a gate in front of that. The reconciliation scripts are only as good as the
  * lineage they're derived from, and that lineage is parsed out of the SQL by heuristics that a real
@@ -94,14 +112,19 @@ reconcile <command> [options]
 
 Commands:
   run         Layers, lineage, scripts and — if you say yes — the document, in one pass
-  scripts     Write one reconciliation query per hop into a governance/ folder
+  scripts     Write the hop queries, the per-layer column reports and the business
+              checks on the reporting tables, into governance/
   document    Write the whole pipeline up as a Word document and a Markdown file
   diagrams    Write the lineage as editable PowerPoint shapes and Office-ready SVGs
   layers      Work out and print the pipeline layers only — writes nothing
 
 Options:
   --dir <path>        Project folder to scan (default: current directory)
-  --out <name>         Output folder name, created under --dir (default: governance)
+  --out <name>         Output folder name, created under --dir (default: governance). Holds
+                       "High level recon" (a query per hop), "Logical recon" (a folder per
+                       layer, one query per table inside it) and "Business recon" (a query
+                       per reporting table: roll-forwards, stated subtotals, period
+                       continuity and the measure traced end to end)
   --lineage-out <name> Folder for the lineage diagram and data (default: lineage)
   --doc-out <name>    document: folder for the document (default: documentation)
   --diagrams-out <name> Folder for the deck and the SVGs (default: diagrams)
@@ -357,7 +380,47 @@ async function scanProject(args: Args): Promise<LocalProject> {
     console.error("None of the files contained a parsable SQL statement.");
     process.exit(1);
   }
+
+  printFileLineage(project);
   return project;
+}
+
+/**
+ * Says when the lineage was read off the file layout rather than out of the SQL, and what that means
+ * for the names in everything about to be generated.
+ *
+ * Worth a paragraph rather than a line: a dbt project's scripts name `stg_orders` where the warehouse
+ * holds `analytics_staging.stg_orders`, and someone who runs one without knowing why reads the
+ * resulting error as a bug in the tool. The reason is that dbt keeps the schema in a profile and a
+ * profile is not in the repository — Recon names each model the way the code does.
+ */
+function printFileLineage(project: LocalProject): void {
+  const lineage = project.fileLineage;
+  if (!lineage) return;
+
+  console.log("");
+  console.log(
+    `This is a dbt project: ${lineage.modelCount} model${lineage.modelCount === 1 ? "" : "s"} ` +
+      `(${lineage.jinjaFileCount} file${lineage.jinjaFileCount === 1 ? "" : "s"} using ref/source/config), ` +
+      `reading ${lineage.sourceCount} table${lineage.sourceCount === 1 ? "" : "s"} between them.`
+  );
+  console.log(
+    "Its lineage comes from the files rather than from the SQL: each model is the table its file names, " +
+      "and its ref() and source() calls are its sources."
+  );
+  console.log(
+    "Models are named unqualified — dbt decides the schema at run time from the profile's target, which " +
+      "isn't in the repo — so prefix them for your own warehouse before running the generated SQL."
+  );
+
+  if (lineage.unresolvedRefs.length > 0) {
+    const shown = lineage.unresolvedRefs.slice(0, 8).join(", ");
+    console.log(
+      `Warning: ${lineage.unresolvedRefs.length} ref() name${lineage.unresolvedRefs.length === 1 ? "" : "s"} ` +
+        `no model in this folder: ${shown}${lineage.unresolvedRefs.length > 8 ? ", ..." : ""}. They are ` +
+        "treated as tables arriving from outside — point --dir at the whole dbt project if they are part of it."
+    );
+  }
 }
 
 /**
@@ -586,6 +649,37 @@ async function reportStale(dir: string, written: string[]): Promise<void> {
 }
 
 /**
+ * Names what an earlier version of this tool left in the governance root.
+ *
+ * The hop queries used to sit directly in `governance/` and the layer reports in `governance/layers/`;
+ * they are now split into two named folders, so a folder that has been run before holds a full set of
+ * files under the old layout describing the same pipeline. They are not deleted for the same reason
+ * `reportStale` doesn't delete: these are files in the user's own project. But left unmentioned they
+ * are indistinguishable from what this run just wrote.
+ */
+async function reportOldLayout(governanceRoot: string): Promise<void> {
+  let present: string[];
+  try {
+    present = await readdir(governanceRoot);
+  } catch {
+    return;
+  }
+
+  const loose = present.filter((name) => name.toLowerCase().endsWith(".sql")).sort();
+  const oldLayerDir = present.includes("layers") && existsSync(path.join(governanceRoot, "layers"));
+  if (loose.length === 0 && !oldLayerDir) return;
+
+  console.log("");
+  console.log(`Note: ${governanceRoot} still holds output from an earlier version of Recon, which wrote`);
+  console.log(`the hop queries into the folder itself and the layer reports into layers/. They now go`);
+  console.log(`into ${HIGH_LEVEL_RECON_DIR}/ and ${LOGICAL_RECON_DIR}/:`);
+  for (const name of loose.slice(0, 12)) console.log(`  ${name}`);
+  if (loose.length > 12) console.log(`  ... and ${loose.length - 12} more`);
+  if (oldLayerDir) console.log("  layers/");
+  console.log("Delete them — this run has rewritten all of it under the two folders above.");
+}
+
+/**
  * One `.sql` per hop by default — the hop's whole reconciliation as a single query — and, with
  * `--split`, the per-table scripts behind it in a folder alongside.
  */
@@ -598,7 +692,7 @@ async function writeSuite(
   /** Off inside `run`, which asks about the document rather than telling you to go and run it. */
   suggestDocument: boolean
 ): Promise<void> {
-  const outRoot = path.join(dir, outName);
+  const outRoot = path.join(dir, outName, HIGH_LEVEL_RECON_DIR);
   await mkdir(outRoot, { recursive: true });
 
   const written: string[] = [];
@@ -652,14 +746,19 @@ async function writeSuite(
     "",
     "Each file is a single query returning one row per check, with these columns:",
     "  check_seq, scope, target_table, source_table, check_name, metric,",
-    "  source_value, target_value, difference, status",
+    "  source_value, target_value, difference, accuracy, status",
     "",
-    "Every row compares a source with a target. PASS means the hop ties out. REVIEW means the numbers",
-    "differ and a filter or aggregation has to explain it; FAIL means target rows no source accounts",
-    "for. The detail queries behind any count are at the foot of the same file, commented out.",
+    "Every row compares a source with a target, and status is graded from accuracy — the difference as",
+    "a percentage of what it was measured against. 100.00% passes, below 75% fails, anything between",
+    "reviews: the numbers differ and a filter or aggregation has to explain it. The percentage is what",
+    "makes two rows comparable, since 300 rows missing out of 320 and 300 out of three million are the",
+    "same difference and are not the same problem. It is floored rather than rounded, so only a check",
+    "that really tied out reads 100.00%. The detail queries behind any count are at the foot of the",
+    "same file, commented out.",
     "",
-    "The layers/ folder beside this one reconciles the same pipeline column by column, one file per",
-    "layer, with the reviewer model's reading of why each row might not tie out.",
+    `The ${LOGICAL_RECON_DIR}/ folder beside this one reconciles the same pipeline column by column: a`,
+    "folder per layer, and inside it one file per table of that layer, with the reviewer model's",
+    "reading of why each row might not tie out.",
     ...(split ? ["", "--split also wrote the per-table scripts, one folder per hop."] : []),
     ...(suite.notice ? ["", suite.notice] : []),
     "",
@@ -722,6 +821,8 @@ async function generateAndWriteSuite(
 
   await writeSuite(args.dir, args.out, suite, args.split, args.oneFile, false);
   await writeLayerReconciliation(args, project, layers, platform);
+  await writeBusinessReconciliation(args, project, layers, platform);
+  await reportOldLayout(path.join(args.dir, args.out));
 
   if (suggestDocument) {
     console.log("\nWrite this up as a document with: reconcile document");
@@ -748,11 +849,18 @@ async function writeLayerReconciliation(
   console.log("\nReconciling each layer column by column, and asking the reviewer model to explain each row...");
 
   const suite = await buildLayerReconciliation(project, layers, args.useAi, platform);
-  const outRoot = path.join(args.dir, args.out, "layers");
+  const outRoot = path.join(args.dir, args.out, LOGICAL_RECON_DIR);
   await mkdir(outRoot, { recursive: true });
 
+  // A folder per layer, in pipeline order, and a file per table inside it. Stale files are reported
+  // per layer folder rather than for the root: a table dropped from the SQL leaves its script behind
+  // in the folder it belonged to, and that is where someone would look for it.
   for (const script of suite.scripts) {
-    await writeFile(path.join(outRoot, script.filename), script.sql, "utf8");
+    const layerDir = path.join(outRoot, script.folder);
+    await mkdir(layerDir, { recursive: true });
+    for (const table of script.tables) {
+      await writeFile(path.join(layerDir, table.filename), table.sql, "utf8");
+    }
   }
   await writeFile(path.join(outRoot, "SUMMARY.txt"), summarizeLayerReconciliation(suite, new Date()), "utf8");
 
@@ -760,18 +868,103 @@ async function writeLayerReconciliation(
   console.log(`Wrote ${outRoot}`);
   for (const script of suite.scripts) {
     console.log(
-      `  ${script.filename}  (${script.pairCount} source/target pair${script.pairCount === 1 ? "" : "s"}, ` +
+      `  ${script.folder}/  (${script.tables.length} table${script.tables.length === 1 ? "" : "s"}, ` +
+        `${script.pairCount} source/target pair${script.pairCount === 1 ? "" : "s"}, ` +
         `${script.rowCount} column${script.rowCount === 1 ? "" : "s"}` +
         `${script.commentedCount > 0 ? `, ${script.commentedCount} explained` : ""})`
     );
+    for (const table of script.tables) {
+      console.log(
+        `    ${table.filename}${
+          table.rowCount === 0
+            ? "  (nothing to reconcile — the file says why)"
+            : `  (${table.rowCount} column${table.rowCount === 1 ? "" : "s"})`
+        }`
+      );
+    }
   }
-  await reportStale(outRoot, suite.scripts.map((script) => script.filename));
+
+  for (const script of suite.scripts) {
+    await reportStale(path.join(outRoot, script.folder), script.tables.map((table) => table.filename));
+  }
 
   console.log("");
-  console.log("  nine columns: source_table, target_table, source_column, target_column, type,");
-  console.log("                source_value, target_value, result, comments");
+  console.log("  ten columns: source_table, target_table, source_column, target_column, type,");
+  console.log("               source_value, target_value, accuracy, result, comments");
   if (suite.notice) console.log(`
   Note: comments is empty — ${suite.notice}`);
+}
+
+/**
+ * The per-report business checks, written straight after the layer reports and from the same project.
+ *
+ * The third folder exists because the third question is not a variant of the other two. The hop
+ * bundles ask whether a pair of layers ties out and the layer reports ask whether a column still agrees
+ * with what built it; both compare a table with its sources, and the last table of a data mart has
+ * hardly any. `rpt_snowball`'s movement columns exist in no source table — they are eight readings of
+ * one upstream column — so the first two folders describe the report almost entirely by what they could
+ * not check. What is checkable there is internal (the movements reach the closing balance, the
+ * subtotals the SQL declares still hold, one period's close opens the next) or end to end (the business
+ * measure the report shows is still the one that entered the pipeline), and that is what this writes.
+ */
+async function writeBusinessReconciliation(
+  args: Args,
+  project: LocalProject,
+  layers: LayerRef[],
+  platform: SqlPlatform
+): Promise<void> {
+  console.log(
+    "\nChecking the reporting tables on their own terms, and asking the reviewer model to explain each check..."
+  );
+
+  const suite = await buildBusinessReconciliation(project, layers, args.useAi, platform);
+  const outRoot = path.join(args.dir, args.out, BUSINESS_RECON_DIR);
+  await mkdir(outRoot, { recursive: true });
+
+  const written: string[] = [];
+  for (const script of suite.scripts) {
+    await writeFile(path.join(outRoot, script.filename), script.sql, "utf8");
+    written.push(script.filename);
+  }
+
+  // A folder holding one file that says why, rather than an absent folder: a folder missing from the
+  // listing is indistinguishable from a run that never got this far.
+  if (suite.scripts.length === 0) {
+    const empty = noBusinessChecksFile(suite, platform);
+    await writeFile(path.join(outRoot, empty.filename), empty.sql, "utf8");
+    written.push(empty.filename);
+  }
+
+  await writeFile(path.join(outRoot, "SUMMARY.txt"), summarizeBusinessReconciliation(suite, new Date()), "utf8");
+
+  console.log("");
+  console.log(`Wrote ${outRoot}`);
+  if (suite.scripts.length === 0) {
+    console.log("  no reporting table carries a business check derivable from its SQL —");
+    console.log(`  ${written[0]} lists every table this pipeline ends at and why`);
+  }
+  for (const script of suite.scripts) {
+    console.log(
+      `  ${script.filename}  (${script.table}: ${script.checkCount} check${script.checkCount === 1 ? "" : "s"} — ` +
+        `${script.walkCount} roll-forward, ${script.identityCount} stated identit` +
+        `${script.identityCount === 1 ? "y" : "ies"}, ${script.traceCount} measure trace` +
+        `${script.traceCount === 1 ? "" : "s"}` +
+        `${script.commentedCount > 0 ? `, ${script.commentedCount} explained` : ""})`
+    );
+  }
+  for (const entry of suite.skipped) {
+    console.log(`  (skipped ${entry.table} — nothing about it could be checked as a report)`);
+  }
+
+  await reportStale(outRoot, written);
+
+  if (suite.scripts.length > 0) {
+    console.log("");
+    console.log("  thirteen columns: check_seq, check_name, business_term, source_table, target_table,");
+    console.log("                    period_slice, period, source_value, target_value, difference,");
+    console.log("                    accuracy, status, comments");
+    if (suite.notice) console.log(`\n  Note: comments is empty — ${suite.notice}`);
+  }
 }
 
 async function runScripts(args: Args): Promise<void> {

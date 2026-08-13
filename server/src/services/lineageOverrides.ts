@@ -68,42 +68,72 @@ function factsWriting(facts: LineageFact[], override: LineageOverride): LineageF
   return exact.length > 0 ? exact : writing;
 }
 
-function applyOne(facts: LineageFact[], override: LineageOverride): { changed: LineageFact[]; why: string | null } {
-  const candidates = factsWriting(facts, override);
-  if (candidates.length === 0) {
+export interface OverridePreview {
+  /** Statements that write the override's target table — where the edge lives, or would. */
+  statements: LineageFact[];
+  /** Those of them that already read `override.from`: the edge as the code has it today. */
+  withSource: LineageFact[];
+  /** What applying it would change; "none" when the code already says what the correction asks. */
+  effect: "add" | "remove" | "none";
+  /** Set when `effect` is "none": why there is nothing to do. */
+  why: string | null;
+}
+
+/**
+ * What one correction would do to the code as it stands, worked out without changing anything.
+ *
+ * Split out because the CLI shows the user what the SQL currently says and asks them to confirm
+ * before a correction is applied. A preview derived separately from the application is a preview
+ * that can disagree with it, so `applyOne` decides through this too: what the question describes is
+ * exactly what answering yes does.
+ */
+export function previewOverride(facts: LineageFact[], override: LineageOverride): OverridePreview {
+  const statements = factsWriting(facts, override);
+  const withSource = statements.filter((fact) => fact.sourceTables.some((src) => sameTable(src, override.from)));
+  const base = { statements, withSource };
+
+  if (statements.length === 0) {
     return {
-      changed: facts,
+      ...base,
+      effect: "none",
       why: `no statement in this project writes ${override.to}, so there is nothing to attach "${override.from}" to`
     };
   }
 
-  const targeted = new Set(candidates);
-  let touched = false;
+  if (override.kind === "remove") {
+    if (withSource.length === 0) {
+      return {
+        ...base,
+        effect: "none",
+        why: `${override.from} -> ${override.to} was not in the extracted lineage, so there was nothing to remove`
+      };
+    }
+    return { ...base, effect: "remove", why: null };
+  }
+
+  if (withSource.length === statements.length) {
+    return { ...base, effect: "none", why: `${override.from} -> ${override.to} is already in the extracted lineage` };
+  }
+  return { ...base, effect: "add", why: null };
+}
+
+function applyOne(facts: LineageFact[], override: LineageOverride): { changed: LineageFact[]; why: string | null } {
+  const preview = previewOverride(facts, override);
+  if (preview.effect === "none") return { changed: facts, why: preview.why };
+
+  const targeted = new Set(preview.statements);
 
   const changed = facts.map((fact) => {
     if (!targeted.has(fact)) return fact;
 
     if (override.kind === "remove") {
       const kept = fact.sourceTables.filter((src) => !sameTable(src, override.from));
-      if (kept.length === fact.sourceTables.length) return fact;
-      touched = true;
-      return { ...fact, sourceTables: kept };
+      return kept.length === fact.sourceTables.length ? fact : { ...fact, sourceTables: kept };
     }
 
     if (fact.sourceTables.some((src) => sameTable(src, override.from))) return fact;
-    touched = true;
     return { ...fact, sourceTables: [...fact.sourceTables, normalize(override.from)] };
   });
-
-  if (!touched) {
-    return {
-      changed: facts,
-      why:
-        override.kind === "remove"
-          ? `${override.from} -> ${override.to} was not in the extracted lineage, so there was nothing to remove`
-          : `${override.from} -> ${override.to} is already in the extracted lineage`
-    };
-  }
 
   return { changed, why: null };
 }
@@ -144,7 +174,13 @@ export function applyLineageOverrides(project: LocalProject, overrides: LineageO
 
   const scan = buildScanResult(project.folderName, files, project.scan.skipped);
   return {
-    project: { folderName: project.folderName, files, facts: files.flatMap((f) => f.facts), scan },
+    project: {
+      folderName: project.folderName,
+      files,
+      facts: files.flatMap((f) => f.facts),
+      scan,
+      fileLineage: project.fileLineage
+    },
     applied,
     discarded
   };

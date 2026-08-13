@@ -7,12 +7,21 @@ import { buildDiagramComponents } from "../services/diagramComponents.js";
 import { buildLineageDiagram } from "../services/lineageDiagram.js";
 import { buildPptx } from "../services/pptxWriter.js";
 import { LlmConfigError, LlmTimeoutError, reviewLineage } from "../services/llmClient.js";
-import { applyLineageOverrides, diffEdges, validateOverrides } from "../services/lineageOverrides.js";
+import {
+  applyLineageOverrides,
+  diffEdges,
+  previewOverride,
+  validateOverrides,
+  type DiscardedOverride,
+  type OverridePreview
+} from "../services/lineageOverrides.js";
 import type { LocalProject } from "../services/localProject.js";
+import type { LineageFact } from "../services/tableLineage.js";
 import type {
   LayerRef,
   LineageArtifacts,
   LineageFeedbackRound,
+  LineageOverride,
   LineageReview
 } from "../types/index.js";
 
@@ -27,6 +36,11 @@ import type {
  * The model is only ever asked to *describe* the lineage and to *translate* a correction into edits
  * (`llmClient.reviewLineage` enforces that split). With Azure OpenAI unconfigured the loop still
  * runs: the diagram is drawn, the user can accept or reject it, only free-text correction is lost.
+ *
+ * Rejecting the lineage goes straight to "describe what's wrong" — there is nothing to ask about
+ * first, since saying no *is* the answer to "do you want to change this". The one question that does
+ * get asked comes after: a correction is a claim about the SQL, so before anything is rewritten the
+ * user is shown what the code says about each edge they're changing and asked to confirm against it.
  */
 
 const MAX_ROUNDS = 3;
@@ -270,14 +284,33 @@ function wrap(text: string, width: number): string[] {
   return lines;
 }
 
-/** Turns one free-text instruction into applied corrections, reporting exactly what it did. */
-async function applyInstruction(
+interface ProposedChange {
+  override: LineageOverride;
+  preview: OverridePreview;
+}
+
+/**
+ * One instruction, translated into corrections and measured against the code — but not yet applied.
+ *
+ * The split into `changes` and `inert` is what the confirmation question needs: a correction the code
+ * already agrees with is nothing to confirm, and asking about it would make "yes" mean nothing.
+ */
+interface Proposal {
+  /** Corrections that would actually change the lineage — what the user is asked about. */
+  changes: ProposedChange[];
+  /** Corrections that land on a real table but leave the lineage as it is, with the reason. */
+  inert: ProposedChange[];
+  /** Corrections dropped for naming a table this project's SQL never mentions. */
+  dropped: DiscardedOverride[];
+}
+
+/** Turns one free-text instruction into corrections, checked against the project but not applied. */
+async function proposeCorrections(
   project: LocalProject,
   layers: LayerRef[],
   instruction: string,
-  round: number,
   priorOverrides: LineageFeedbackRound[]
-): Promise<{ project: LocalProject; round: LineageFeedbackRound }> {
+): Promise<Proposal> {
   process.stdout.write("Working out what that changes... ");
   const review = await reviewLineage({
     projectName: project.folderName,
@@ -292,7 +325,70 @@ async function applyInstruction(
   // Two guards, in order: the model may not name a table this project has never heard of, and it may
   // not claim an edit that doesn't correspond to a real statement.
   const { kept, dropped } = validateOverrides(review.proposed, project.scan.tables);
-  const outcome = applyLineageOverrides(project, kept);
+  const previewed = kept.map((override) => ({ override, preview: previewOverride(project.facts, override) }));
+
+  return {
+    changes: previewed.filter((c) => c.preview.effect !== "none"),
+    inert: previewed.filter((c) => c.preview.effect === "none"),
+    dropped
+  };
+}
+
+/** How many of a table's statements are worth printing before the rest become a count. */
+const MAX_SHOWN_STATEMENTS = 4;
+
+function statementLine(fact: LineageFact): string {
+  const reads = fact.sourceTables.length > 0 ? fact.sourceTables.join(", ") : "nothing this parser could see";
+  return `      ${fact.notebookPath} (statement ${fact.cellIndex + 1}): ${fact.targetTable} <- ${reads}`;
+}
+
+/**
+ * Shows what the SQL says about each edge the correction touches, so the confirmation is against the
+ * code rather than against the sentence the user just typed.
+ *
+ * Corrections that change nothing are reported here and kept out of the question — they are the
+ * answer to "did that land", not something to approve.
+ */
+function printProposal(proposal: Proposal): void {
+  for (const { override, why } of proposal.dropped) {
+    console.log(`  ! ignored  ${override.kind} ${override.from} -> ${override.to}: ${why}`);
+  }
+  for (const { override, preview } of proposal.inert) {
+    console.log(`  ! no change  ${override.from} -> ${override.to}: ${preview.why}`);
+  }
+  if (proposal.changes.length === 0) return;
+
+  console.log("\nIn the code, the lineage is defined like this:");
+  for (const { override, preview } of proposal.changes) {
+    console.log("");
+    if (preview.effect === "remove") {
+      console.log(`  - remove  ${override.from} -> ${override.to}`);
+      console.log("      The code has this edge:");
+    } else {
+      console.log(`  + add     ${override.from} -> ${override.to}`);
+      console.log(`      The code doesn't have this edge. What builds ${override.to} today:`);
+    }
+    const shown = preview.effect === "remove" ? preview.withSource : preview.statements;
+    for (const fact of shown.slice(0, MAX_SHOWN_STATEMENTS)) console.log(statementLine(fact));
+    const extra = shown.length - MAX_SHOWN_STATEMENTS;
+    if (extra > 0) console.log(`      … and ${extra} more statement${extra === 1 ? "" : "s"}`);
+    if (override.reason) {
+      for (const line of wrap(`Because: ${override.reason}`, 62)) console.log(`      ${line}`);
+    }
+  }
+}
+
+/** Applies a confirmed proposal, reporting exactly what it did to the graph. */
+function applyProposal(
+  project: LocalProject,
+  proposal: Proposal,
+  instruction: string,
+  round: number
+): { project: LocalProject; round: LineageFeedbackRound } {
+  const outcome = applyLineageOverrides(
+    project,
+    proposal.changes.map((c) => c.override)
+  );
   const diff = diffEdges(project.scan.lineage, outcome.project.scan.lineage);
 
   if (outcome.applied.length === 0) {
@@ -301,7 +397,7 @@ async function applyInstruction(
     for (const edge of diff.removed) console.log(`  - removed  ${edge.from} -> ${edge.to}`);
     for (const edge of diff.added) console.log(`  + added    ${edge.from} -> ${edge.to}`);
   }
-  for (const d of [...dropped, ...outcome.discarded]) {
+  for (const d of outcome.discarded) {
     console.log(`  ! ignored  ${d.override.kind} ${d.override.from} -> ${d.override.to}: ${d.why}`);
   }
 
@@ -311,7 +407,11 @@ async function applyInstruction(
       round,
       instruction,
       applied: outcome.applied,
-      discarded: [...dropped, ...outcome.discarded].map((d) => d.override)
+      discarded: [
+        ...proposal.dropped.map((d) => d.override),
+        ...proposal.inert.map((c) => c.override),
+        ...outcome.discarded.map((d) => d.override)
+      ]
     }
   };
 }
@@ -395,26 +495,33 @@ async function verifyLoop(
   feedback: LineageFeedbackRound[],
   ask: Asker
 ): Promise<VerifyResult> {
-  for (let round = 1; ; round++) {
+  // Every "stop" exit reports the same thing — the lineage as it stands, unapproved. The closure
+  // reads the current round's values, so it can't go stale as the loop corrects the project.
+  const stopped = (): VerifyResult => {
+    console.log("Stopped. No reconciliation scripts were written.");
+    return {
+      approved: false,
+      project,
+      artifacts: buildArtifacts(project, layers, review, feedback, false),
+      htmlPath
+    };
+  };
+
+  // Rounds are counted in corrections *applied*, not in trips round the loop: declining the
+  // confirmation leaves the lineage exactly as it was, and shouldn't spend one of the three.
+  for (;;) {
+    const round = feedback.length + 1;
     printSummary(project, layers, review, htmlPath);
 
     const verdict = await askChoice(ask, "\nIs this lineage correct? [yes] / no / exit: ");
 
-    if (verdict === "exit") {
-      console.log("Stopped. No reconciliation scripts were written.");
-      return {
-        approved: false,
-        project,
-        artifacts: buildArtifacts(project, layers, review, feedback, false),
-        htmlPath
-      };
-    }
+    if (verdict === "exit") return stopped();
 
     if (verdict === "yes") {
       return { approved: true, project, artifacts: buildArtifacts(project, layers, review, feedback, true), htmlPath };
     }
 
-    if (round >= MAX_ROUNDS) {
+    if (feedback.length >= MAX_ROUNDS) {
       console.log(`\nThat's ${MAX_ROUNDS} rounds of corrections — stopping here so this doesn't loop.`);
       console.log("Re-run once the SQL or the --layers are adjusted.");
       return {
@@ -425,40 +532,32 @@ async function verifyLoop(
       };
     }
 
-    const wantsToExplain = await askChoice(ask, "Do you want to give more information? [yes] / no / exit: ");
-    if (wantsToExplain === "exit") {
-      console.log("Stopped. No reconciliation scripts were written.");
-      return {
-        approved: false,
-        project,
-        artifacts: buildArtifacts(project, layers, review, feedback, false),
-        htmlPath
-      };
-    }
-    if (wantsToExplain === "no") {
-      console.log("Nothing to change, then — showing the same lineage again.");
-      continue;
-    }
-
     if (!options.useAi) {
       console.log("\nCorrections need the reviewer model, which is off (--no-ai). Re-run without it to");
       console.log("describe changes in words, or adjust the SQL / --layers directly.");
       continue;
     }
 
+    // Saying the lineage is wrong is already the answer to "do you want to change it", so what's
+    // wrong is asked for straight away rather than from behind a second yes/no.
     console.log("\nDescribe what's wrong — e.g. \"bronze.payments also feeds silver.invoices\",");
     console.log('or "silver.audit_log is not a source for anything".');
+    console.log('Press Enter on an empty line to leave it as it is, or type "exit" to stop.');
     const typed = await ask("> ");
-    const instruction = (typed ?? "").trim();
+    if (typed === null) {
+      console.log("\nInput ended before this was answered — stopping without approving.");
+      return stopped();
+    }
+    const instruction = typed.trim();
     if (instruction.length === 0) {
       console.log("Nothing entered — showing the same lineage again.");
       continue;
     }
+    if (instruction.toLowerCase() === "exit" || instruction.toLowerCase() === "quit") return stopped();
 
+    let proposal: Proposal;
     try {
-      const applied = await applyInstruction(project, layers, instruction, round, feedback);
-      project = applied.project;
-      feedback.push(applied.round);
+      proposal = await proposeCorrections(project, layers, instruction, feedback);
     } catch (err) {
       if (err instanceof LlmConfigError) {
         console.log("\nAzure OpenAI isn't configured, so free-text corrections aren't available.");
@@ -466,10 +565,29 @@ async function verifyLoop(
       } else if (err instanceof LlmTimeoutError) {
         console.log("\nThe model didn't answer in time. Nothing was changed — try a shorter instruction.");
       } else {
-        console.log(`\nCouldn't apply that: ${err instanceof Error ? err.message : String(err)}`);
+        console.log(`\nCouldn't work that out: ${err instanceof Error ? err.message : String(err)}`);
       }
       continue;
     }
+
+    printProposal(proposal);
+    if (proposal.changes.length === 0) {
+      console.log("\nThat leaves the lineage as it is — showing it again.");
+      continue;
+    }
+
+    // The confirmation is against the code printed above, not against the sentence just typed:
+    // nothing is rewritten until the user has seen what the SQL says today and changed it anyway.
+    const confirmed = await askChoice(ask, "\nAre you sure you want to change the lineage? [yes] / no / exit: ");
+    if (confirmed === "exit") return stopped();
+    if (confirmed === "no") {
+      console.log("Nothing changed — showing the same lineage again.");
+      continue;
+    }
+
+    const applied = applyProposal(project, proposal, instruction, round);
+    project = applied.project;
+    feedback.push(applied.round);
 
     // Re-describe the corrected graph so the narrative and notes match what is now on screen.
     review = await describe(project, layers, options.useAi);

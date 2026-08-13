@@ -13,6 +13,9 @@ import { Resvg } from "@resvg/resvg-js";
 import { mapWithConcurrency } from "./concurrency.js";
 import { buildDiagramComponents, type DiagramGraph } from "./diagramComponents.js";
 import { withTableOfContents, type DocBlock, type DocDocument } from "./docModel.js";
+import { BUSINESS_RECON_DIR, HIGH_LEVEL_RECON_DIR, LOGICAL_RECON_DIR } from "./governanceLayout.js";
+import { gatherBusinessFacts } from "./businessMeasures.js";
+import { describeBusinessChecks } from "./businessReconciliation.js";
 import { joinLabel } from "./layerReconciliation.js";
 import { layerHasTable, unclaimedSchemas } from "./layers.js";
 import {
@@ -36,6 +39,7 @@ import {
   FAILURE_GUIDE,
   groupConcerns,
   KIND_LABELS,
+  BUSINESS_CHECK_GUIDE,
   LAYER_REVIEW_GUIDE,
   type TroubleshootingPlan
 } from "./troubleshooting.js";
@@ -162,7 +166,7 @@ export interface DocReconPair {
 }
 
 /**
- * What `governance/layers/<layer>.sql` covers, per layer.
+ * What `governance/Logical recon/<layer>.sql` covers, per layer.
  *
  * The document has to describe *both* reconciliation artifacts or it describes half the run: the hop
  * bundles say whether a pair of layers ties out, and these say, column by column, which source each
@@ -173,11 +177,40 @@ export interface DocReconPair {
 export interface DocLayerReconFacts {
   layer: LayerRef | null;
   label: string;
-  /** The file `reconcile scripts` writes for it, so the document can name it. */
-  filename: string;
+  /** The folder `reconcile scripts` writes for it — one file per table — so the document can name it. */
+  folder: string;
   targetCount: number;
   pairs: DocReconPair[];
   columnCount: number;
+  notes: string[];
+}
+
+/**
+ * What `governance/Business recon/<report>.sql` covers, per reporting table.
+ *
+ * The third artifact and the third question. The hop bundles and the per-layer reports both compare a
+ * table with the tables that built it, which the last table of a mart has hardly any of — `bop_arr`,
+ * `customer_churn` and `eop_arr` are readings of one upstream column and exist in no source table at
+ * all — so a document describing only those two describes the report the business actually reads
+ * entirely by what could not be checked about it.
+ *
+ * Derived from the same `gatherBusinessFacts` the scripts are written from, so what the document says a
+ * check asserts is the sentence the script's own header carries.
+ */
+export interface DocBusinessReconFacts {
+  table: string;
+  layer: string;
+  /** The file `reconcile scripts` writes for it, so the document can name it. */
+  filename: string;
+  /** What each check asserts, in the same words the script's header uses. */
+  claims: string[];
+  walkCount: number;
+  identityCount: number;
+  traceCount: number;
+  checkCount: number;
+  /** The column the report is cut by and the values its SQL writes into it, when it has one. */
+  slice: { column: string; values: string[] } | null;
+  periodColumn: string | null;
   notes: string[];
 }
 
@@ -187,7 +220,14 @@ export interface DocFacts {
   layers: DocLayerFacts[];
   /** Schemas the SQL uses that no layer claims — named in the document rather than quietly dropped. */
   unassignedSchemas: string[];
-  /** Tables the SQL never qualifies with a schema, so no layer can hold them. */
+  /**
+   * Tables the SQL never qualifies with a schema *and* that no layer claims by name.
+   *
+   * Not simply the unqualified ones: a folder layer carries its own table list, so a project staged by
+   * folder — every dbt project, since its models are named `stg_orders` rather than
+   * `staging.stg_orders` — places tables a schema never could. Listing those under "outside the
+   * pipeline" would put the whole pipeline there.
+   */
   unqualifiedTables: string[];
   edges: LineageEdge[];
   /** Read here but built somewhere else: this project's inputs. */
@@ -195,8 +235,12 @@ export interface DocFacts {
   /** Built here and never read again: this project's outputs. */
   terminalTables: string[];
   hops: DocHopFacts[];
-  /** The other half of what was generated: one column-level report per layer. */
+  /** The second of the three: one column-level report per layer. */
   layerReconciliation: DocLayerReconFacts[];
+  /** The third: one business check per reporting table, and the tables that had none. */
+  businessReconciliation: DocBusinessReconFacts[];
+  /** Tables the pipeline ends at that carry no derivable business check, with the reason. */
+  reportsWithoutChecks: { table: string; layer: string; reasons: string[] }[];
   files: LocalFileSummary[];
   skipped: LocalSkippedFile[];
   inventory: DocTableFacts[];
@@ -210,6 +254,8 @@ export interface DocFacts {
     checkCount: number;
     /** Rows the per-layer reports carry between them — one per column reconciled. */
     reconciledColumnCount: number;
+    /** Checks the per-report business files carry between them. */
+    businessCheckCount: number;
     inferredKeyCount: number;
     tablesWithoutColumns: number;
   };
@@ -302,13 +348,39 @@ export function gatherDocumentationFacts(
     return {
       layer: facts.layer,
       label: facts.label,
-      filename: facts.filename,
+      folder: facts.folder,
       targetCount: facts.targets.length,
       pairs,
       columnCount: pairs.reduce((n, pair) => n + pair.columnCount, 0),
       notes: facts.notes
     };
   });
+
+  // The third artifact. Driven off the same `gatherLayerFacts` the layer reports are, so a report
+  // described here and reconciled there is the same reading of the same table.
+  const businessFacts = gatherBusinessFacts(gatherLayerFacts(project, layers).layers);
+  const businessRecon: DocBusinessReconFacts[] = [];
+  const reportsWithoutChecks: DocFacts["reportsWithoutChecks"] = [];
+  for (const report of businessFacts) {
+    const checks = describeBusinessChecks(report);
+    if (checks.length === 0) {
+      reportsWithoutChecks.push({ table: report.table, layer: report.layer, reasons: report.notes });
+      continue;
+    }
+    businessRecon.push({
+      table: report.table,
+      layer: report.layer,
+      filename: report.filename,
+      claims: Array.from(new Set(checks.map((check) => check.claim))),
+      walkCount: report.walks.length,
+      identityCount: report.identities.length,
+      traceCount: report.traces.length,
+      checkCount: checks.length,
+      slice: report.slice ? { column: report.slice.column, values: report.slice.values } : null,
+      periodColumn: report.periodColumn,
+      notes: report.notes
+    });
+  }
 
   const allTargets = docHops.flatMap((hop) => hop.targets);
 
@@ -317,12 +389,16 @@ export function gatherDocumentationFacts(
     scanRoot,
     layers: layerFacts,
     unassignedSchemas: unclaimedSchemas(project.scan.tables, layers),
-    unqualifiedTables: inventory.filter((t) => qualifiedSchema(t.qualified) === null).map((t) => t.qualified),
+    unqualifiedTables: inventory
+      .filter((t) => qualifiedSchema(t.qualified) === null && !layers.some((layer) => layerHasTable(layer, t.qualified)))
+      .map((t) => t.qualified),
     edges: project.scan.lineage,
     externalInputs: inventory.filter((t) => t.read && !t.written).map((t) => t.qualified),
     terminalTables: inventory.filter((t) => t.written && !t.read).map((t) => t.qualified),
     hops: docHops,
     layerReconciliation: layerRecon,
+    businessReconciliation: businessRecon,
+    reportsWithoutChecks,
     files: project.scan.files,
     skipped: project.scan.skipped,
     inventory,
@@ -335,6 +411,7 @@ export function gatherDocumentationFacts(
       layerCount: layers.length,
       checkCount: docHops.reduce((n, hop) => n + hop.checkCount, 0),
       reconciledColumnCount: layerRecon.reduce((n, layer) => n + layer.columnCount, 0),
+      businessCheckCount: businessRecon.reduce((n, report) => n + report.checkCount, 0),
       inferredKeyCount: allTargets.filter((t) => t.key.confidence === "inferred").length,
       tablesWithoutColumns: allTargets.filter((t) =>
         t.columnSources.some((c) => c.table === t.target && c.columnCount === 0)
@@ -1097,8 +1174,9 @@ function hopSection(facts: DocFacts, prose: DocProse): DocBlock[] {
  *
  * Two artifacts, described in the order they are used: the per-hop query that answers *does this stage
  * tie out*, and the per-layer report that answers *which column of which table disagrees with what it
- * was built from*. The document used to describe only the first, which left the six-column reports on
- * disk unexplained and the reader with no idea what the `type` or `comments` columns were for.
+ * was built from*. The document used to describe only the first, which left the per-layer column
+ * reports on disk unexplained and the reader with no idea what the `type` or `comments` columns were
+ * for.
  */
 function reconciliationSection(facts: DocFacts, governanceFiles: string[]): DocBlock[] {
   const blocks: DocBlock[] = [{ kind: "heading", level: 1, text: "The reconciliation performed" }];
@@ -1108,12 +1186,19 @@ function reconciliationSection(facts: DocFacts, governanceFiles: string[]): DocB
   blocks.push({
     kind: "para",
     text:
-      "The pipeline is reconciled in two passes, and both are generated from the lineage described above " +
-      `rather than written by hand. The first asks whether each stage ties out: ${plural(facts.stats.checkCount, "check")} ` +
+      `The pipeline is reconciled in ${facts.businessReconciliation.length > 0 ? "three" : "two"} passes, ` +
+      "and each is generated from the lineage described above rather than written by hand. The first " +
+      `asks whether each stage ties out: ${plural(facts.stats.checkCount, "check")} ` +
       `${facts.hops.length === 1 ? "in one scope" : `across ${plural(facts.hops.length, "hop")}`}. The second ` +
       `asks the same question column by column: ${plural(facts.stats.reconciledColumnCount, "column")} ` +
       `reconciled against the source ${agree(facts.stats.reconciledColumnCount, "it was", "they were")} ` +
-      `built from, ${facts.layerReconciliation.length === 1 ? "in one report" : `across ${plural(layersWithRows.length, "layer report")}`}.`
+      `built from, ${facts.layerReconciliation.length === 1 ? "in one report" : `across ${plural(layersWithRows.length, "layer report")}`}.` +
+      (facts.businessReconciliation.length > 0
+        ? ` The third asks a question neither of those can: whether the ${plural(facts.businessReconciliation.length, "table")} ` +
+          `the business reads ${agree(facts.businessReconciliation.length, "adds", "add")} up as a report — ` +
+          `${plural(facts.stats.businessCheckCount, "check")} on ${agree(facts.businessReconciliation.length, "its", "their")} ` +
+          "own movements, subtotals and history."
+        : "")
   });
 
   blocks.push({ kind: "heading", level: 2, text: "Stage by stage: does the hop tie out" });
@@ -1121,12 +1206,23 @@ function reconciliationSection(facts: DocFacts, governanceFiles: string[]): DocB
     kind: "para",
     text:
       "Each hop's checks are written out as a single query that returns one row per check, so the hop is " +
-      "run once and read down its status column: PASS where the numbers tie out, REVIEW where they " +
-      "differ and a filter or an aggregation has to explain it, FAIL for duplicate keys, null keys, or " +
-      "target rows no source accounts for. The columns are the same in every file — check_seq, scope, " +
-      "target_table, source_table, check_name, metric, source_value, target_value, difference and " +
-      "status — and the row-listing queries behind any count are at the foot of the same file, commented " +
-      "out, for when a number needs chasing down."
+      "run once and read down its status column: PASS where the numbers tie out exactly, FAIL where a " +
+      "quarter or more of what was measured never arrived, and REVIEW in between — the numbers differ, " +
+      "and a filter or an aggregation has to explain it. The columns are the same in every file — check_seq, scope, " +
+      "target_table, source_table, check_name, metric, source_value, target_value, difference, accuracy " +
+      "and status — and the row-listing queries behind any count are at the foot of the same file, " +
+      "commented out, for when a number needs chasing down."
+  });
+
+  blocks.push({
+    kind: "para",
+    text:
+      "accuracy is that same difference as a percentage of what it was measured against — the source's " +
+      "own value where two values are compared, the rows the check looked at where it counts the ones " +
+      "that failed — and it is what the status is graded from. It is what makes two rows comparable: " +
+      "300 rows missing out of 320 and 300 out of three million are the same difference and are not the " +
+      "same problem. The percentage is floored rather than rounded, so 100.00% means the check tied " +
+      "out and nothing looser: three keys missing out of four million reads 99.99% and reviews."
   });
 
   blocks.push({
@@ -1158,7 +1254,7 @@ function reconciliationSection(facts: DocFacts, governanceFiles: string[]): DocB
       hop.from && hop.to ? `${hop.from.label} → ${hop.to.label}` : "Whole project",
       String(hop.targets.length),
       String(hop.checkCount),
-      `governance/${hop.folder}.sql`
+      `governance/${HIGH_LEVEL_RECON_DIR}/${hop.folder}.sql`
     ])
   });
 
@@ -1181,7 +1277,7 @@ function reconciliationSection(facts: DocFacts, governanceFiles: string[]): DocB
   return blocks;
 }
 
-/** The per-layer six-column report: what it holds, what it covers, and where each column comes from. */
+/** The per-layer column report: what it holds, what it covers, and where each column comes from. */
 function columnReconciliationBlocks(facts: DocFacts, layersWithRows: DocLayerReconFacts[]): DocBlock[] {
   const blocks: DocBlock[] = [
     { kind: "heading", level: 2, text: "Column by column: what each column was reconciled against" }
@@ -1201,10 +1297,13 @@ function columnReconciliationBlocks(facts: DocFacts, layersWithRows: DocLayerRec
   blocks.push({
     kind: "para",
     text:
-      "Beside each hop query is one report per layer, answering the question an engineer reconciles by " +
-      "hand: for every table in this layer, does each column still agree with the table it came from? " +
-      "Each returns nine columns and nothing else — source_table, target_table, source_column, " +
-      "target_column, type, source_value, target_value, result, comments — one row per column reconciled."
+      "Beside the hop queries is a folder per layer, and inside it one script per table of that layer, " +
+      "answering the question an engineer reconciles by hand: does each column of this table still " +
+      "agree with the table it came from? Each returns ten columns and nothing else — source_table, " +
+      "target_table, source_column, target_column, type, source_value, target_value, accuracy, result, " +
+      "comments — one row per column reconciled. A table that reconciles nothing still gets a file, " +
+      "which says why: a folder holding three scripts for a five-table layer would say nothing at all " +
+      "about the other two."
   });
 
   blocks.push({
@@ -1233,10 +1332,25 @@ function columnReconciliationBlocks(facts: DocFacts, layersWithRows: DocLayerRec
           "for everything joined in. This is what makes a difference interpretable rather than just visible."
       ],
       [
+        "source_value, target_value",
+        "The two numbers the row is about, each measured once and rounded to two decimal places before " +
+          "anything compares them. Two places because that is what a reader acts on — a total is quoted " +
+          "to the cent and a distinct count has no fraction at all — and rounding before the comparison " +
+          "rather than on the way to the page is what stops a row printing two identical numbers beside " +
+          "a REVIEW. A difference under half a cent therefore reads as agreement."
+      ],
+      [
+        "accuracy",
+        "How much of the source's own value the target still carries, as a percentage. A measure is " +
+          "compared by its total, every other column by how many distinct values it holds — the " +
+          "comparison that still means something once the transformation has grouped or joined."
+      ],
+      [
         "result",
-        "Computed when the script runs. PASS where the two sides agree, REVIEW where they do not. A " +
-          "measure is compared by its total, every other column by how many distinct values it holds — " +
-          "the comparison that still means something once the transformation has grouped or joined."
+        "Graded from the percentage when the script runs: 100.00% is PASS, below 75% is FAIL, anything " +
+          "between is REVIEW. A yes-or-no verdict was not enough on its own — a column two values short " +
+          "of its source's four hundred and a column built from the wrong table both fail to agree, and " +
+          "only one of them is a morning's work."
       ],
       [
         "comments",
@@ -1254,14 +1368,14 @@ function columnReconciliationBlocks(facts: DocFacts, layersWithRows: DocLayerRec
       { header: "Tables", widthPct: 10 },
       { header: "Source/target pairs", widthPct: 16 },
       { header: "Columns reconciled", widthPct: 16 },
-      { header: "Report", mono: true, widthPct: 38 }
+      { header: "Scripts", mono: true, widthPct: 38 }
     ],
     rows: facts.layerReconciliation.map((layer) => [
       layer.label,
       String(layer.targetCount),
       String(layer.pairs.length),
       String(layer.columnCount),
-      `governance/layers/${layer.filename}`
+      `governance/${LOGICAL_RECON_DIR}/${layer.folder}/`
     ])
   });
 
@@ -1309,6 +1423,117 @@ function columnReconciliationBlocks(facts: DocFacts, layersWithRows: DocLayerRec
         text: `${layer.pairs.length - MAX_PAIR_ROWS} further pair(s) in this layer are reconciled by the same report.`
       });
     }
+  }
+
+  blocks.push(...businessReconBlocks(facts));
+
+  return blocks;
+}
+
+/**
+ * The report layer, checked on its own terms.
+ *
+ * Its own section rather than a paragraph under the layer reports, because the question differs in
+ * kind. Everything above compares a table with the tables that built it, and a mart's last table has
+ * hardly any — a snowball's movement columns are several readings of one upstream column and exist in
+ * no source table — so the two sections above describe it almost entirely by what they could not check.
+ * What is checkable there is either internal (the movements reach the closing balance, the subtotals
+ * the SQL itself declares still hold, one period's close opens the next) or end to end (the measure the
+ * report shows is still the one that entered the pipeline), and that is what this describes.
+ *
+ * The claims are the script headers' own sentences (`describeBusinessChecks`), so a reader holding both
+ * the document and the file is reading one description rather than two of them.
+ */
+function businessReconBlocks(facts: DocFacts): DocBlock[] {
+  if (facts.businessReconciliation.length === 0 && facts.reportsWithoutChecks.length === 0) return [];
+
+  const blocks: DocBlock[] = [
+    { kind: "heading", level: 2, text: "The reporting tables: does the report add up on its own terms" }
+  ];
+
+  if (facts.businessReconciliation.length === 0) {
+    blocks.push({
+      kind: "para",
+      text:
+        `This pipeline ends at ${plural(facts.reportsWithoutChecks.length, "table")}, and none of ` +
+        `${agree(facts.reportsWithoutChecks.length, "it", "them")} carries a business check that could be ` +
+        "derived from its SQL: no roll-forward, no column declared to be the sum of other columns, and no " +
+        `measure that can be followed back through more than one table. ` +
+        `${list(facts.reportsWithoutChecks.map((entry) => entry.table), 6)} ` +
+        `${agree(facts.reportsWithoutChecks.length, "is", "are")} listed with the reason in ` +
+        `governance/${BUSINESS_RECON_DIR}/.`
+    });
+    return blocks;
+  }
+
+  blocks.push({
+    kind: "para",
+    text:
+      "A reporting table is one the pipeline ends at: nothing else in the project reads it, so it is what " +
+      "a dashboard is pointed at. Four kinds of check apply to one, and none of them compares it with a " +
+      "source table. A roll-forward asserts that an opening balance plus every movement reaches the " +
+      "closing balance, one period at a time — the rule a snowball, waterfall or bridge exists to satisfy " +
+      "and the one nobody writes down. A stated identity takes a column the SQL declares to be the sum of " +
+      "other columns and checks that it still is, which is not a reading of the code but the code " +
+      "restated. Period continuity asserts that one period's closing balance is a later period's opening " +
+      "balance, so the history joins up. And a measure trace totals one business term at every table it " +
+      "passes through, from the raw feed to the report, so the hop where a total stopped agreeing is " +
+      "named rather than searched for."
+  });
+
+  blocks.push({
+    kind: "table",
+    columns: [
+      { header: "Reporting table", mono: true, widthPct: 26 },
+      { header: "Layer", widthPct: 12 },
+      { header: "Roll-forwards", widthPct: 11 },
+      { header: "Stated identities", widthPct: 12 },
+      { header: "Measure traces", widthPct: 11 },
+      { header: "Script", mono: true, widthPct: 28 }
+    ],
+    rows: facts.businessReconciliation.map((report) => [
+      report.table,
+      report.layer,
+      String(report.walkCount),
+      String(report.identityCount),
+      String(report.traceCount),
+      `governance/${BUSINESS_RECON_DIR}/${report.filename}`
+    ])
+  });
+
+  // What each report actually asserts, which is the part a reviewer checks: a wrong claim here is a
+  // wrong claim in every row of the script it produces.
+  for (const report of facts.businessReconciliation) {
+    blocks.push({ kind: "heading", level: 3, text: `${report.table}: what is asserted` });
+    for (const claim of report.claims) blocks.push({ kind: "bullet", level: 1, text: `${claim}.` });
+
+    if (report.slice) {
+      blocks.push({
+        kind: "para",
+        text:
+          `Every check is cut by ${report.slice.column}, which this project's SQL writes as ` +
+          `${list(report.slice.values.map((value) => `'${value}'`), 6)}` +
+          `${report.periodColumn ? `, and grouped by ${report.periodColumn}` : ""}. A report holding more ` +
+          "than one kind of period row holds each entity more than once, so a total taken across the whole " +
+          "of it adds two different questions together."
+      });
+    }
+
+    if (report.notes.length > 0) {
+      blocks.push({ kind: "para", text: `Not checked here: ${oneLine(report.notes[0], CONCERN_CHARS)}` });
+    }
+  }
+
+  if (facts.reportsWithoutChecks.length > 0) {
+    blocks.push({
+      kind: "para",
+      text:
+        `${list(facts.reportsWithoutChecks.map((entry) => entry.table), 6)} also ` +
+        `${agree(facts.reportsWithoutChecks.length, "ends", "end")} the pipeline and ` +
+        `${agree(facts.reportsWithoutChecks.length, "carries", "carry")} no business check derivable from ` +
+        "its SQL — a dimension is a perfectly good terminal table with no roll-forward in it. Each is " +
+        `listed with its reason in governance/${BUSINESS_RECON_DIR}/.`
+    });
   }
 
   return blocks;
@@ -1403,6 +1628,29 @@ function troubleshootingSection(plan: TroubleshootingPlan): DocBlock[] {
       "that reviews under an aggregating transformation is a value that changed, not a row that was " +
       "collapsed."
   });
+
+  // Only where there is a business file to read it against: a project with no reporting table would
+  // otherwise get a page of advice about a report it has not got.
+  if (plan.hasBusinessChecks) {
+    blocks.push({ kind: "heading", level: 2, text: "Why a business check does not balance" });
+    blocks.push({
+      kind: "para",
+      text:
+        "The business checks are not alike the way the other two reports' rows are — a roll-forward that " +
+        "does not balance and a measure trace that does not are two different investigations — so this " +
+        "table is keyed on the check, which every row prints in its check_name column. As above, it names " +
+        "the suspect; the file's own comments column names the fragment of your SQL."
+    });
+    blocks.push({
+      kind: "table",
+      columns: [
+        { header: "Check", widthPct: 16 },
+        { header: "What it asserts", widthPct: 28 },
+        { header: "What a difference usually comes from", widthPct: 56 }
+      ],
+      rows: BUSINESS_CHECK_GUIDE.map((cause) => [cause.check, cause.asserts, cause.meaning])
+    });
+  }
 
   blocks.push({ kind: "heading", level: 2, text: "Points to check in this pipeline" });
 
@@ -1654,7 +1902,10 @@ export function buildDocumentationModel(
   // Derived from the same target facts the checks are, so a drill-down can only name a column the
   // project defines — and needs no model, so it is one section that cannot arrive empty.
   const troubleshooting = buildTroubleshootingPlan(
-    facts.hops.map((hop) => ({ label: hop.label, targets: hop.targets }))
+    facts.hops.map((hop) => ({ label: hop.label, targets: hop.targets })),
+    undefined,
+    undefined,
+    facts.businessReconciliation.length > 0
   );
 
   const blocks: DocBlock[] = [

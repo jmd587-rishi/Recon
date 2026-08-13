@@ -55,6 +55,13 @@ const MAX_FOLDER_GROUPS = 12;
  * pipeline the schemas ran together.
  */
 const CONCENTRATION_MARGIN = 0.1;
+/**
+ * How much more of the project a grouping has to place before its coverage alone decides. Well under
+ * the gap the case this exists for produces — a dbt project, where the models are named bare and the
+ * only schemas in the SQL are the source ones, so grouping by schema places the pipeline's *inputs*
+ * and nothing else — and well over the ordinary difference between two real layerings.
+ */
+const COVERAGE_MARGIN = 0.2;
 
 /** The schema a table sits in, lowercased, or null for temp tables and unqualified names. */
 function schemaOf(ref: string): string | null {
@@ -163,6 +170,21 @@ export interface LayerGrouping {
    * separates nothing, and every check derived from it lands in one hop.
    */
   concentration: number;
+  /**
+   * The share of the tables this project *builds* that the grouping places, 0..1.
+   *
+   * Evenness on its own can be measured over almost nothing and still look ideal, so this asks the
+   * more basic question first: is the grouping a layering of the pipeline at all? Built tables rather
+   * than all tables, because a stage is something the project makes — a group holding only tables that
+   * arrive from outside is context, not a stage.
+   *
+   * A dbt project is the case that makes this necessary. Its models are named `stg_orders`, not
+   * `staging.stg_orders`, so the only schema qualifiers in its SQL belong to the `source()`s: grouping
+   * by schema partitions the project's *inputs* perfectly, scores as well as anything on evenness, and
+   * places not one of the models it was supposed to layer. Its coverage is zero, which says exactly
+   * that.
+   */
+  coverage: number;
 }
 
 /** Which group each table belongs to, for a grouping already built. */
@@ -197,6 +219,8 @@ function buildGrouping(
 
   const groupOf = (table: string) => groupOfTable.get(table.toLowerCase()) ?? null;
   const names = Array.from(groups.keys());
+  const built = project.scan.tables.filter((table) => table.written);
+  const builtPlaced = built.filter((table) => groupOfTable.has(table.qualified.toLowerCase())).length;
   const edges = groupEdges(project.facts, groupOf);
   const depth = groupDepths(names, edges);
   const placed = Array.from(groups.values()).reduce((n, g) => n + g.tables.length, 0);
@@ -209,7 +233,10 @@ function buildGrouping(
     derivedOrder: [...names].sort((a, b) => (depth.get(a) ?? 0) - (depth.get(b) ?? 0) || a.localeCompare(b)),
     crossEdges: edges.reduce((n, e) => n + e.edges, 0),
     innerEdges: innerEdgeCount(project.facts, groupOf),
-    concentration: placed === 0 ? 1 : Math.max(...Array.from(groups.values(), (g) => g.tables.length)) / placed
+    concentration: placed === 0 ? 1 : Math.max(...Array.from(groups.values(), (g) => g.tables.length)) / placed,
+    // A project that builds nothing has no pipeline to cover, so coverage says nothing and must not
+    // be the thing that decides: 1 leaves the choice to evenness, as it was before this existed.
+    coverage: built.length === 0 ? 1 : builtPlaced / built.length
   };
 }
 
@@ -286,13 +313,18 @@ export function buildLayerEvidence(project: LocalProject): LayerEvidence {
 }
 
 /**
- * The grouping to use when nobody is reading the code — the most even one.
+ * The grouping to use when nobody is reading the code — the one that covers the project, and then the
+ * most even one.
  *
- * Evenness rather than edge counts, because edge counts reward the wrong thing here: folding a whole
- * chain into one group *removes* cross-group edges, so the most lopsided grouping can also be the one
- * with the cleanest-looking graph. What actually disqualifies a grouping is that one group holds
- * nearly everything, and `concentration` is exactly that. Schemas win ties, and near-ties, because
- * they are the conventional answer and the one a reader expects.
+ * Coverage comes first because it is the more basic question: a grouping that places a fifth of the
+ * tables is not a layering of this project however evenly it places them, and evenness measured over
+ * that fifth says nothing about the rest. Between two groupings that both cover the project it is
+ * evenness that decides, and evenness rather than edge counts, because edge counts reward the wrong
+ * thing here: folding a whole chain into one group *removes* cross-group edges, so the most lopsided
+ * grouping can also be the one with the cleanest-looking graph. What actually disqualifies a grouping
+ * is that one group holds nearly everything, and `concentration` is exactly that. Schemas win ties,
+ * and near-ties, on both measures, because they are the conventional answer and the one a reader
+ * expects.
  */
 export function preferredGrouping(groupings: LayerGrouping[]): LayerGrouping | null {
   const schema = groupings.find((g) => g.kind === "schema") ?? null;
@@ -301,6 +333,11 @@ export function preferredGrouping(groupings: LayerGrouping[]): LayerGrouping | n
 
   for (const candidate of groupings) {
     if (candidate === best) continue;
+    if (candidate.coverage > best.coverage + COVERAGE_MARGIN) {
+      best = candidate;
+      continue;
+    }
+    if (best.coverage > candidate.coverage + COVERAGE_MARGIN) continue;
     if (candidate.concentration < best.concentration - CONCENTRATION_MARGIN) best = candidate;
   }
   return best;
@@ -363,6 +400,7 @@ function groupingEvidence(grouping: LayerGrouping): LayerGroupingEvidence {
     crossEdges: grouping.crossEdges,
     innerEdges: grouping.innerEdges,
     concentration: grouping.concentration,
+    coverage: grouping.coverage,
     groups: grouping.groups.map((group) => ({
       name: group.name,
       tableCount: group.tables.length,

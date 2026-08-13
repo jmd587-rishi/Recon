@@ -85,7 +85,14 @@ const MEASURE_WORDS = new Set([
   "amount", "amt", "revenue", "arr", "mrr", "acv", "tcv", "qty", "quantity", "count", "total",
   "sum", "price", "cost", "value", "balance", "sales", "spend", "fee", "fees", "tax", "discount",
   "margin", "profit", "net", "gross", "volume", "units", "hours", "days", "weight",
-  "grr", "nrr"
+  "grr", "nrr",
+  // The movements of a snowball or waterfall report. `customer_churn` and `downsell` are amounts of
+  // the measure that moved — nothing in their names says so, and without these words they read as
+  // "other" and are left out of every total, on exactly the tables whose totals are the point. A flag
+  // spelled with one of them is still caught first: `is_churned` by the `is_` rule, `churn_flag` and
+  // `churn_reason` by their own head nouns.
+  "churn", "upsell", "downsell", "sell", "expansion", "contraction", "attrition", "retention",
+  "renewal", "bookings", "acquisition"
 ]);
 
 /**
@@ -387,7 +394,7 @@ export interface ColumnPair {
  * different source column; comparing the two `product_family`s compares things that were never meant
  * to match, and the difference it reports is an artefact of the naming rather than a finding.
  */
-function counterpart(column: ColumnInfo, sourceByName: Map<string, ColumnInfo>): ColumnInfo | undefined {
+export function counterpart(column: ColumnInfo, sourceByName: Map<string, ColumnInfo>): ColumnInfo | undefined {
   const origin = column.kindRef && column.kindRef !== column.name ? sourceByName.get(column.kindRef) : undefined;
   return origin ?? sourceByName.get(column.name);
 }
@@ -886,6 +893,15 @@ export interface ReconTargetFacts {
   target: string;
   sources: string[];
   facts: LineageFact[];
+  /**
+   * The target's own columns, as the project's SQL declares or builds them.
+   *
+   * Carried on the facts rather than looked up again by whoever wants them, for the reason `fields` and
+   * `joinKind` are: `businessMeasures.ts` reads a report table's columns for what they say about the
+   * business — the balances, the movements, the arithmetic one is declared to be — and a second lookup
+   * could see a different list from the one every check on this table was written against.
+   */
+  columns: TableColumns | undefined;
   key: KeyChoice;
   perSource: ReconSource[];
   measureColumns: string[];
@@ -1288,6 +1304,7 @@ function targetFacts(group: TargetGroup, columns: ColumnIndex, filename: string)
     sources: reconciled,
     incidentalSources,
     facts: group.facts,
+    columns: targetColumns,
     key,
     perSource,
     measureColumns,
@@ -1475,8 +1492,11 @@ export interface ReconLayerFacts {
   layer: LayerRef | null;
   /** `transformation`, or `whole project` when there are no layers. */
   label: string;
-  /** `03_transformation.sql` — position first, so the files list in pipeline order. */
-  filename: string;
+  /**
+   * `03_transformation` — the folder the layer's per-table scripts go in, position first so the
+   * layers list in pipeline order. One file per table inside it, named by `ReconTargetFacts.filename`.
+   */
+  folder: string;
   targets: ReconTargetFacts[];
   notes: string[];
 }
@@ -1524,7 +1544,7 @@ export function gatherLayerFacts(project: LocalProject, layers: LayerRef[]): Rec
       );
     }
 
-    return { layer, label: layer?.label ?? "whole project", filename: `${stem}.sql`, targets, notes };
+    return { layer, label: layer?.label ?? "whole project", folder: stem, targets, notes };
   });
 
   return { layers: built, columns, columnFacts };

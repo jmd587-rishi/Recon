@@ -10,8 +10,19 @@ import type {
   Table
 } from "../types/index.js";
 import { codeFileKind, readCodeFile } from "./codeFiles.js";
+import {
+  detectDbtProject,
+  summarizeDbtProject,
+  type DbtModelFile,
+  type FileLineageSummary
+} from "./dbtProject.js";
 import { layerHasTable } from "./layers.js";
-import { applySqlCorrections, correctedSqlFilename, type SqlStatement } from "./sqlFileParser.js";
+import {
+  applySqlCorrections,
+  correctedSqlFilename,
+  splitSqlStatements,
+  type SqlStatement
+} from "./sqlFileParser.js";
 import {
   buildLineageGraph,
   isTempTable,
@@ -33,7 +44,12 @@ const MAX_TOTAL_CHARS = 80000;
 export interface ParsedLocalFile {
   /** Path relative to the uploaded folder. */
   path: string;
-  /** The file exactly as uploaded — corrections are spliced back into this. */
+  /**
+   * The file's SQL, and what the statement spans below index — the text exactly as uploaded, except
+   * on a dbt model, where it is the file with its jinja resolved (`dbtProject.ts`). The raw text of a
+   * model is not SQL, so there is nothing a reader could do with it; such a file is never
+   * `spliceable`, so nothing here is ever handed back to the user as their own file.
+   */
   content: string;
   statements: SqlStatement[];
   /** One fact per statement, `cellIndex` being the statement's ordinal in the file. */
@@ -51,6 +67,11 @@ export interface LocalProject {
   facts: LineageFact[];
   /** Precomputed so a re-render can ask for the scan again without re-parsing. */
   scan: LocalScanResult;
+  /**
+   * Set when the lineage came from the project's *file layout* rather than from the table names in
+   * its SQL — a dbt project, where the model is the file. Null for everything else.
+   */
+  fileLineage: FileLineageSummary | null;
 }
 
 export interface LocalHop {
@@ -103,12 +124,34 @@ function qualifyTargetByPath(fact: LineageFact, knownSchemas: Set<string>): Line
  * uses, but its `tableIndex` is derived from the SQL itself rather than from Unity Catalog — there
  * is no catalog to consult here, so the set of tables the code mentions is the only definition of
  * "tables in this project" available.
+ *
+ * Which *reading* produces those facts is decided once, up front, for the whole folder. Nearly every
+ * project states its lineage in its SQL and is split statement by statement below. A dbt project
+ * states it in its file layout instead — the model is the file, its dependencies are its `ref()`s —
+ * and is read by `dbtProject.ts` before any of that. The two are alternatives rather than layers:
+ * running a model file through the statement path yields a bare `SELECT` that writes nothing, which
+ * is not partly right, so the choice is made per file and made here (see `dbtProject.ts` for why).
  */
 export function parseLocalProject(folderName: string, inputs: LocalSqlFileInput[]): LocalProject {
   const files: ParsedLocalFile[] = [];
   const skipped: LocalSkippedFile[] = [];
+  const dbt = detectDbtProject(inputs);
 
   for (const input of inputs) {
+    const model = dbt?.models.get(input.path);
+    if (model) {
+      const parsed = parseModelFile(model);
+      if (parsed) files.push(parsed);
+      else skipped.push({ path: input.path, reason: "dbt model with no SQL left once its jinja resolved" });
+      continue;
+    }
+
+    const ignored = dbt?.ignored.get(input.path);
+    if (ignored) {
+      skipped.push({ path: input.path, reason: ignored });
+      continue;
+    }
+
     const kind = codeFileKind(input.path);
     if (!kind) {
       skipped.push({ path: input.path, reason: "not a code file Recon can read" });
@@ -155,10 +198,49 @@ export function parseLocalProject(folderName: string, inputs: LocalSqlFileInput[
       })
   );
   for (const file of files) {
+    // A dbt model is left alone: its table is named the way dbt names it, and the folder it sits in is
+    // a stage rather than a schema. Qualifying it here would rename the target without renaming the
+    // `ref()`s that resolve to it, which is one table split into two.
+    if (dbt?.models.has(file.path)) continue;
     file.facts = file.facts.map((fact) => qualifyTargetByPath(fact, knownSchemas));
   }
 
-  return { folderName, files, facts: files.flatMap((f) => f.facts), scan: buildScanResult(folderName, files, skipped) };
+  return {
+    folderName,
+    files,
+    facts: files.flatMap((f) => f.facts),
+    scan: buildScanResult(folderName, files, skipped),
+    fileLineage: dbt ? summarizeDbtProject(dbt) : null
+  };
+}
+
+/**
+ * One dbt model as a parsed file: its rendered SQL, and the single fact that the file *is* the table.
+ *
+ * The fact covers the whole file rather than one statement of it, because that is what a model is —
+ * dbt runs the file as one query. `spliceable` is false because `content` is the rendered SQL rather
+ * than the file on disk: a correction written back by these offsets would land in the wrong place,
+ * and would overwrite the jinja that makes the model a model.
+ */
+function parseModelFile(model: DbtModelFile): ParsedLocalFile | null {
+  const statements = splitSqlStatements(model.rendered);
+  if (statements.length === 0) return null;
+
+  return {
+    path: model.path,
+    content: model.rendered,
+    statements,
+    facts: [
+      {
+        notebookPath: model.path,
+        cellIndex: statements[0].index,
+        sourceTables: model.sources,
+        targetTable: model.table,
+        rawSql: model.rendered.trim()
+      }
+    ],
+    spliceable: false
+  };
 }
 
 /**

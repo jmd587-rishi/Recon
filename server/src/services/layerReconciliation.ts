@@ -7,7 +7,15 @@ import {
   type ReconCommentInput
 } from "./llmClient.js";
 import type { LocalProject } from "./localProject.js";
-import { RULE, wrap } from "./reconciliationBundle.js";
+import {
+  accuracyExpr,
+  FAIL_BELOW_PERCENT,
+  gradeExpr,
+  percentText,
+  RULE,
+  VALUE_TYPE,
+  wrap
+} from "./reconciliationBundle.js";
 import { platformNote, type SqlPlatform } from "./sqlPlatform.js";
 import {
   gatherLayerFacts,
@@ -24,10 +32,10 @@ import type { LineageFact } from "./tableLineage.js";
  * One SQL script per pipeline layer, answering the question a data engineer reconciles by hand:
  * *for every table in this layer, does each column still agree with the table it came from?*
  *
- * The script returns nine columns and nothing else, because nine is what the question needs:
+ * The script returns ten columns and nothing else, because ten is what the question needs:
  *
  *     source_table | target_table | source_column | target_column | type
- *     source_value | target_value | result | comments
+ *     source_value | target_value | accuracy | result | comments
  *
  * The first five are read out of the project's lineage rather than chosen. `source_table` and
  * `target_table` are a pair the code actually relates; `source_column` and `target_column` are the two
@@ -47,9 +55,18 @@ import type { LineageFact } from "./tableLineage.js";
  * interpretable.
  *
  * `source_value` and `target_value` are the two numbers the row is about — a measure's total, or a
- * distinct-value count for everything else — and `result` is computed from those same two expressions
- * rather than from a second copy of them, so a row can never print two equal numbers beside a REVIEW.
- * PASS when they agree, REVIEW when they don't.
+ * distinct-value count for everything else. Each is measured once, in a derived table the row selects
+ * from, and everything that depends on them reads them from there by name.
+ *
+ * `accuracy` is how much of the source's own value the target still carries, as a percentage, and it
+ * is what `result` is graded from: `100.00%` and PASS, below 75% and FAIL, anything between and
+ * REVIEW. A yes/no verdict was not enough on its own, because the rows under it are not alike — a
+ * column two values short of its source's four hundred and a column built from the wrong table were
+ * both REVIEW, and only one of them is a morning's work.
+ *
+ * PASS means the two numbers are equal and nothing looser. The percentage is floored rather than
+ * rounded for exactly that reason: a column three values short of four million works out at 99.9999%,
+ * and a row that did not tie out must not print as one that did.
  *
  * `comments` is the reason, and it is **written by the reviewer model**, not by this file. Recon reads
  * code and never reads data, so no amount of static analysis can say why two numbers differ — but the
@@ -92,7 +109,15 @@ const UPSTREAM_HOPS = envInt("RECON_COMMENT_UPSTREAM_HOPS", 2, 0, 8);
 /** Longest comment written into the SQL before it is cut back to its last whole sentence. */
 const MAX_COMMENT_CHARS = 1000;
 
-const VALUE_TYPE = "DECIMAL(38, 6)";
+/** Line break in generated SQL, named so template literals that build SQL stay readable. */
+const NEWLINE = "\n";
+
+/**
+ * The file a layer with no tables of its own gets, in place of the per-table ones it has none of.
+ *
+ * Uppercase and prefixed, so it can never collide with a real table's file and sorts away from them.
+ */
+const LAYER_NOT_RECONCILED = "_LAYER_NOT_RECONCILED.sql";
 
 // ---- small SQL helpers ----
 
@@ -143,8 +168,9 @@ function tidy(text: string): string {
 /**
  * A single reconciliation: one column of one target, against the source it came from.
  *
- * `compare` is a boolean SQL expression that is true when the two sides agree — the one place the row
- * says what "right" means, so `result` and `comments` are both written from it and cannot disagree.
+ * There is no condition on the row saying when it passes: every row passes when its two numbers are
+ * equal, and both are named by `AGREE` once for the whole file. `result`, `accuracy` and `comments`
+ * are all written from that one condition and so cannot disagree with each other.
  */
 interface ReconRow {
   sourceTable: string;
@@ -158,10 +184,10 @@ interface ReconRow {
   joinType: string;
   /** What is actually compared, e.g. `SUM(revenue)` — shown to the model, not to the reader. */
   comparison: string;
-  compare: string;
   /**
-   * The two numbers the row is about, as SQL. Printed as their own columns *and* used to build
-   * `compare`, so what the reader sees and what decides PASS can never be two different measurements.
+   * The two numbers the row is about, as SQL. Measured once each in the row's own derived table and
+   * read from there by every column that depends on them, so what the reader sees and what decides
+   * PASS can never be two different measurements.
    */
   sourceValue: string;
   targetValue: string;
@@ -199,29 +225,25 @@ function comparisonFor(
   target: string,
   source: string,
   platform: SqlPlatform
-): { comparison: string; compare: string; sourceValue: string; targetValue: string } {
+): { comparison: string; sourceValue: string; targetValue: string } {
   if (field.role === "measure") {
     const typed = !field.untyped;
     // An empty table sums to NULL, and NULL = NULL is unknown rather than true, so both sides are
-    // defaulted — two empty tables do agree. The same defaulted expressions are what the value
-    // columns print, so a reader can never see two numbers that look equal beside a REVIEW.
+    // defaulted — two empty tables do agree. The defaulting happens here, on the one expression the
+    // row measures with, so the printed value, the verdict and the percentage all see the same 0.
     const targetValue = `COALESCE(${scalar(target, `SUM(${measureExpr(field.target, typed, platform)})`)}, 0)`;
     const sourceValue = `COALESCE(${scalar(source, `SUM(${measureExpr(field.source, typed, platform)})`)}, 0)`;
     return {
       comparison: `SUM(${field.target}) against SUM(${field.source})`,
-      compare: `${targetValue} = ${sourceValue}`,
       sourceValue,
       targetValue
     };
   }
 
-  const targetValue = scalar(target, `COUNT(DISTINCT ${field.target})`);
-  const sourceValue = scalar(source, `COUNT(DISTINCT ${field.source})`);
   return {
     comparison: `COUNT(DISTINCT ${field.target}) against COUNT(DISTINCT ${field.source})`,
-    compare: `${targetValue} = ${sourceValue}`,
-    sourceValue,
-    targetValue
+    sourceValue: scalar(source, `COUNT(DISTINCT ${field.source})`),
+    targetValue: scalar(target, `COUNT(DISTINCT ${field.target})`)
   };
 }
 
@@ -238,7 +260,7 @@ function layerRows(facts: ReconLayerFacts, platform: SqlPlatform): ReconRow[] {
   for (const target of facts.targets) {
     for (const entry of target.perSource) {
       for (const field of entry.fields) {
-        const { comparison, compare, sourceValue, targetValue } = comparisonFor(
+        const { comparison, sourceValue, targetValue } = comparisonFor(
           field,
           target.target,
           entry.source,
@@ -251,7 +273,6 @@ function layerRows(facts: ReconLayerFacts, platform: SqlPlatform): ReconRow[] {
           targetColumn: field.target,
           joinType: joinLabel(entry),
           comparison,
-          compare,
           sourceValue,
           targetValue,
           comment: ""
@@ -349,16 +370,38 @@ async function runBatch(
 
 // ---- the file ----
 
+/**
+ * One table of a layer, as the file that reconciles it.
+ *
+ * A file per table rather than one per layer because that is the unit the work is picked up in: a
+ * layer report for a fourteen-table stage is a query nobody runs whole, and the row that matters is
+ * found by scrolling. Split, the file *is* the answer to "does this table still agree with what built
+ * it", and it can be handed to whoever owns that table on its own.
+ */
+export interface LayerTableScript {
+  /** The table this file reconciles, as the project's SQL names it. */
+  table: string;
+  /** `customer.sql` — inside the layer's folder, so the layer is not repeated in every name. */
+  filename: string;
+  sql: string;
+  /** Distinct sources this table is reconciled against. */
+  pairCount: number;
+  rowCount: number;
+  /** Of those rows, how many carry a model-written comment. */
+  commentedCount: number;
+}
+
 export interface LayerReconciliationScript {
   /** Null only when no layers could be inferred and the whole project is one scope. */
   layer: LayerRef | null;
   label: string;
-  filename: string;
-  sql: string;
-  /** Distinct source/target pairs the script reconciles. */
+  /** `03_transformation` — the folder these files go in, position first so layers list in order. */
+  folder: string;
+  /** One per table in the layer, including any that reconciles nothing and says why. */
+  tables: LayerTableScript[];
+  /** Distinct source/target pairs the layer reconciles, across every table. */
   pairCount: number;
   rowCount: number;
-  /** Of those rows, how many carry a model-written comment. */
   commentedCount: number;
   notes: string[];
 }
@@ -379,9 +422,68 @@ const COLUMNS = [
   "type",
   "source_value",
   "target_value",
+  "accuracy",
   "result",
   "comments"
 ];
+
+/**
+ * When a row reconciles, in terms of the two numbers it prints.
+ *
+ * One condition for the whole file, because there is only one question: are these two numbers the
+ * same? `result`, `accuracy` and `comments` are each written from it, so a PASS can never appear
+ * beside two numbers that differ, and a REVIEW never beside `100.00%` or an empty comment.
+ */
+const AGREE = "v.target_value = v.source_value";
+
+/**
+ * `accuracy`: 100 where the two sides agree, and otherwise how much of the source's own value the
+ * target still carries — `100 * (|source| - |target - source|) / |source|`.
+ *
+ * The middle branch is the floor under the answer. A target holding three times its source's total is
+ * not -200% accurate, it is 0, and a source of 0 against a target that has rows would otherwise divide
+ * by zero; both are caught by the same test, since a gap can only reach the whole it is measured
+ * against when that whole is small enough for the answer to be nothing.
+ *
+ * `FLOOR(… * 10000) / 100` rather than `ROUND(…, 2)` because the percentage decides the verdict: a
+ * column three values short of four million rounds to 100.00 and must not, since `result` reads PASS
+ * only on `100.00%`. Rounding down is also the honest direction for an accuracy figure — it never
+ * claims more agreement than there is.
+ *
+ * The formula itself is `reconciliationBundle.accuracyExpr`, shared with the hop bundles exactly as
+ * `gradeExpr` is: a percentage graded one way in one generated file and another way in the next is two
+ * tools. What is local is the rest of the row — `AGREE` restated against the inner derived table's
+ * alias, since that is where the two values are named.
+ */
+const ACCURACY = accuracyExpr(
+  AGREE.replace(/\bv\./g, "m."),
+  "ABS(m.target_value - m.source_value)",
+  "ABS(m.source_value)"
+);
+
+/**
+ * Where the row's numbers are worked out: the two values in the inner derived table, the percentage
+ * over them in the outer one, and nothing computed twice.
+ *
+ * Each side is scanned once per row rather than once per column that mentions it — the row prints two
+ * values, grades a result from the percentage and works the percentage out from those same two values,
+ * and every reference above is to a name rather than to a repeated expression. It is also the only way
+ * the printed percentage and the verdict beside it can be guaranteed to be the same measurement.
+ *
+ * The cast belongs in the inner table, before any arithmetic sees the numbers, for two reasons: the
+ * column carries both a measure's total, which has a scale, and a distinct count, which has not — and
+ * on SQL Server a percentage worked out from two integers is integer division, which returns 0 or 1
+ * and never a percentage.
+ */
+function measured(row: ReconRow): string {
+  return (
+    `FROM (SELECT m.source_value,\n` +
+    `             m.target_value,\n` +
+    `             ${ACCURACY} AS accuracy_pct\n` +
+    `      FROM (SELECT ${cast(row.sourceValue)} AS source_value,\n` +
+    `                   ${cast(row.targetValue)} AS target_value) m) v`
+  );
+}
 
 function renderRow(row: ReconRow, first: boolean): string {
   const values = [
@@ -392,23 +494,32 @@ function renderRow(row: ReconRow, first: boolean): string {
     quoted(row.sourceColumn),
     quoted(row.targetColumn),
     quoted(row.joinType),
-    // Cast to one type because the column carries both kinds of number: a measure's total, which has
-    // a scale, and a distinct count, which does not.
-    cast(row.sourceValue),
-    cast(row.targetValue),
-    `CASE WHEN ${row.compare} THEN 'PASS' ELSE 'REVIEW' END`,
-    // Same condition, opposite sense: a row that reconciles has nothing to explain. Written from the
-    // one comparison rather than from a second copy of it, so the two columns cannot disagree.
-    row.comment === "" ? "''" : `CASE WHEN ${row.compare} THEN '' ELSE ${quoted(tidy(row.comment))} END`
+    // Named, not measured: all three were worked out once by `measured` below.
+    "v.source_value",
+    "v.target_value",
+    percentText("v.accuracy_pct"),
+    gradeExpr(AGREE, "v.accuracy_pct"),
+    // Same condition, opposite sense: a row that reconciles has nothing to explain.
+    row.comment === "" ? "''" : `CASE WHEN ${AGREE} THEN '' ELSE ${quoted(tidy(row.comment))} END`
   ];
 
-  return values
+  const select = values
     .map((value, i) => `${i === 0 ? "SELECT " : "       "}${value}${first ? ` AS ${COLUMNS[i]}` : ""}`)
     .join(",\n");
+
+  return `${select}\n${measured(row)}`;
 }
 
+/**
+ * The preamble on one table's file.
+ *
+ * Repeated in full on every file rather than written once per layer, because a file opened on its own
+ * — which is the point of splitting them — has to explain its own columns and its own grading. What is
+ * *scoped* to the table is the top and the tail: what this file covers, and what it is built from.
+ */
 function header(
   facts: ReconLayerFacts,
+  target: ReconTargetFacts,
   rows: ReconRow[],
   commented: number,
   folderName: string,
@@ -419,16 +530,17 @@ function header(
 
   const lines = [
     `/* ${RULE}`,
-    `   Reconciliation — ${facts.label} layer`,
+    `   Reconciliation — ${target.target}   (${facts.label} layer)`,
     "",
     ...wrap(
-      `One query. It returns ${rows.length} row${rows.length === 1 ? "" : "s"} — one per column reconciled — ` +
-        `across ${pairs.size} source/target pair${pairs.size === 1 ? "" : "s"} in this layer:`,
+      `One query. It returns ${rows.length} row${rows.length === 1 ? "" : "s"} — one per column of ` +
+        `${target.target} reconciled — across the ${pairs.size} source${pairs.size === 1 ? "" : "s"} it ` +
+        "is built from:",
       "   "
     ),
     "",
     "     source_table | target_table | source_column | target_column | type |",
-    "     source_value | target_value | result | comments",
+    "     source_value | target_value | accuracy | result | comments",
     "",
     ...wrap(
       "The first five columns come from this project's lineage, not from a guess. `source_column` and " +
@@ -441,11 +553,21 @@ function header(
     ),
     "",
     ...wrap(
-      "`result` is PASS when the two sides agree and REVIEW when they do not. A measure is compared by its " +
-        "total, everything else by how many distinct values it holds — the comparison that still means " +
-        "something once the transformation has grouped, joined or filtered.",
+      "A measure is compared by its total, everything else by how many distinct values it holds — the " +
+        "comparison that still means something once the transformation has grouped, joined or " +
+        "filtered. `accuracy` is how much of the source's own value the target still carries, and " +
+        "`result` is graded from it:",
       "   "
     ),
+    "",
+    "     PASS    100.00% — the two numbers are equal. Nothing looser: the percentage",
+    "             is floored, so a column three values short of four million reads",
+    "             99.99% and reviews.",
+    `     REVIEW  ${FAIL_BELOW_PERCENT}% or more, but not all of it. Something in the transformation`,
+    "             has to explain the gap — a filter, a join, a CASE, a cast.",
+    `     FAIL    below ${FAIL_BELOW_PERCENT}%: a quarter or more of the source's value never reached the`,
+    "             target. That is structural rather than incidental — the wrong source,",
+    "             a join matching nothing, or a column that is not what its name says.",
     "",
     ...(notice
       ? wrap(`\`comments\` is empty on every row: ${notice}`, "   ")
@@ -466,25 +588,21 @@ function header(
     ""
   ];
 
-  const silent: string[] = [];
-  for (const target of facts.targets) {
-    const mine = rows.filter((row) => row.targetTable === target.target);
-    if (mine.length === 0) {
-      // Listed rather than skipped. A layer report that quietly covers three of a layer's five tables
-      // reads as a clean bill of health for all five, and the two it dropped are exactly the ones
-      // worth knowing about — a table with no lineage, or one whose source this project never
-      // defines, is where an unnoticed gap lives.
-      silent.push(`   ${target.target}  —  ${noRowReason(target)}`);
-      continue;
-    }
-    lines.push(`   ${target.target}  <-  ${target.perSource.map((e) => `${e.source} [${joinLabel(e)}]`).join(", ")}`);
-    lines.push(`     ${mine.length} column${mine.length === 1 ? "" : "s"} reconciled${
-      commented > 0 ? `, ${mine.filter((row) => row.comment !== "").length} commented` : ""
-    }`);
-  }
+  lines.push(`   ${target.target}  <-  ${target.perSource.map((e) => `${e.source} [${joinLabel(e)}]`).join(", ")}`);
+  lines.push(
+    `     ${rows.length} column${rows.length === 1 ? "" : "s"} reconciled${
+      commented > 0 ? `, ${rows.filter((row) => row.comment !== "").length} commented` : ""
+    }`
+  );
 
-  if (silent.length > 0) {
-    lines.push("", `   Not reconciled here (${silent.length} of ${facts.targets.length} table(s) in this layer):`, ...silent);
+  // The rest of the layer is named rather than left to the folder listing. A reader who opened one
+  // file needs to know how much of the stage it is, and a table that reconciles nothing — no lineage,
+  // or sources this project never declares — is where an unnoticed gap lives, so it is listed here
+  // exactly like the others and its own file says why.
+  const others = facts.targets.filter((other) => other.target !== target.target);
+  if (others.length > 0) {
+    lines.push("", `   The rest of the ${facts.label} layer, one file each in this folder:`);
+    for (const other of others) lines.push(`     ${other.filename}   ${other.target}`);
   }
 
   lines.push("", `   ${RULE} */`, "");
@@ -550,31 +668,78 @@ function noRowReason(target: ReconTargetFacts): string {
   );
 }
 
+/** A `SELECT` that returns the reason instead of a reconciliation, so an empty file is never silent. */
+function noScopeSql(title: string, note: string): string {
+  return [
+    `/* ${RULE}`,
+    `   Reconciliation — ${title}`,
+    "",
+    ...wrap(note, "   "),
+    `   ${RULE} */`,
+    "",
+    "SELECT 'NO SCOPE' AS result,",
+    `       ${quoted(note)} AS comments;`,
+    ""
+  ].join(NEWLINE);
+}
+
+/**
+ * The file written for a table that reconciles nothing — and the one written for a whole layer that
+ * has no table at all.
+ *
+ * A table with no row still gets its own file, for the same reason it used to get its own line in the
+ * layer report: three of a layer's five tables silently reconciled reads as five that passed, and the
+ * two that were dropped are the ones worth knowing about. A folder with three files where the layer
+ * has five tables says nothing at all about the other two.
+ */
+function noScopeTable(target: ReconTargetFacts, facts: ReconLayerFacts): LayerTableScript {
+  return {
+    table: target.target,
+    filename: target.filename,
+    pairCount: 0,
+    rowCount: 0,
+    commentedCount: 0,
+    sql: noScopeSql(
+      `${target.target}   (${facts.label} layer)`,
+      `${target.target} is not reconciled here: ${noRowReason(target)}.`
+    )
+  };
+}
+
 function emptyScript(facts: ReconLayerFacts, folderName: string): LayerReconciliationScript {
   const note = emptyReason(facts);
 
   return {
     layer: facts.layer,
     label: facts.label,
-    filename: facts.filename,
+    folder: facts.folder,
     pairCount: 0,
     rowCount: 0,
     commentedCount: 0,
     notes: facts.notes,
-    sql: [
-      `/* ${RULE}`,
-      `   Reconciliation — ${facts.label} layer`,
-      "",
-      ...wrap(note, "   "),
-      `   ${RULE} */`,
-      "",
-      "SELECT 'NO SCOPE' AS result,",
-      `       ${quoted(note)} AS comments;`,
-      ""
-    ].join("\n")
+    // A folder holding one file that says why, rather than an absent folder: a layer that is missing
+    // from the listing is indistinguishable from one the run never got to.
+    tables: [
+      {
+        table: "",
+        filename: LAYER_NOT_RECONCILED,
+        pairCount: 0,
+        rowCount: 0,
+        commentedCount: 0,
+        sql: noScopeSql(`${facts.label} layer`, note)
+      }
+    ]
   };
 }
 
+/**
+ * One layer, as a folder of one file per table.
+ *
+ * The rows are the layer's, so the split happens here rather than upstream: the reviewer model is
+ * asked about a whole layer at a time (`batchesFor` batches per target within it) and every table's
+ * comments come back together. Splitting after that means the files are exactly the layer report the
+ * model was asked about, cut along the line a reader picks the work up on.
+ */
 function assemble(
   facts: ReconLayerFacts,
   rows: ReconRow[],
@@ -582,23 +747,37 @@ function assemble(
   notice: string | null,
   platform: SqlPlatform
 ): LayerReconciliationScript {
-  if (rows.length === 0) return emptyScript(facts, folderName);
+  if (facts.targets.length === 0) return emptyScript(facts, folderName);
 
-  const commented = rows.filter((row) => row.comment !== "").length;
-  const body =
-    `${rows.map((row, i) => renderRow(row, i === 0)).join("\nUNION ALL\n")}\n` +
-    // Grouped the way it is read: everything about one pair together, columns in lineage order.
-    "ORDER BY target_table, source_table;\n";
+  const tables = facts.targets.map((target) => {
+    const mine = rows.filter((row) => row.targetTable === target.target);
+    if (mine.length === 0) return noScopeTable(target, facts);
+
+    const commented = mine.filter((row) => row.comment !== "").length;
+    const body =
+      `${mine.map((row, i) => renderRow(row, i === 0)).join(`${NEWLINE}UNION ALL${NEWLINE}`)}${NEWLINE}` +
+      // Grouped the way it is read: everything about one source together, columns in lineage order.
+      `ORDER BY source_table;${NEWLINE}`;
+
+    return {
+      table: target.target,
+      filename: target.filename,
+      pairCount: new Set(mine.map((row) => row.sourceTable)).size,
+      rowCount: mine.length,
+      commentedCount: commented,
+      sql: `${header(facts, target, mine, commented, folderName, notice, platform)}${body}`
+    };
+  });
 
   return {
     layer: facts.layer,
     label: facts.label,
-    filename: facts.filename,
+    folder: facts.folder,
+    tables,
     pairCount: new Set(rows.map((row) => `${row.sourceTable} -> ${row.targetTable}`)).size,
     rowCount: rows.length,
-    commentedCount: commented,
-    notes: facts.notes,
-    sql: `${header(facts, rows, commented, folderName, notice, platform)}${body}`
+    commentedCount: rows.filter((row) => row.comment !== "").length,
+    notes: facts.notes
   };
 }
 
@@ -675,14 +854,21 @@ export function summarizeLayerReconciliation(suite: LayerReconciliationSuite, ge
     `${suite.stats.layerCount} layer(s), ${suite.stats.rowCount} column reconciliation(s), ` +
       `${suite.stats.commentedCount} with a reviewer-model comment.`,
     "",
-    "One .sql per layer. Each returns nine columns:",
+    "One folder per layer, in pipeline order, and inside it one .sql per table of that layer.",
+    "Each returns ten columns:",
     "  source_table, target_table, source_column, target_column, type,",
-    "  source_value, target_value, result, comments",
+    "  source_value, target_value, accuracy, result, comments",
+    "",
+    "source_value and target_value are rounded to two decimal places before they are compared, so a",
+    "difference under half a cent reads as agreement rather than printing two identical numbers next",
+    "to a REVIEW.",
     "",
     "source_column and target_column are the same column at both ends of its lineage — the same name",
     "wherever the transformation renamed nothing, and where they differ, that difference is the rename.",
     "",
-    "source_value and target_value are the two numbers compared. result is PASS or REVIEW. On REVIEW,",
+    "source_value and target_value are the two numbers compared. accuracy is how much of the source's",
+    "value the target still carries, and result is graded from it: 100.00% passes, below 75% fails,",
+    "anything between reviews. On anything but a PASS,",
     "comments says what in your own transformation SQL would",
     "explain it — the filter, the join, the CASE, the cast. It is a reading of the code rather than a",
     "measurement, so it is a first place to look rather than a verdict.",
@@ -692,9 +878,19 @@ export function summarizeLayerReconciliation(suite: LayerReconciliationSuite, ge
 
   for (const script of suite.scripts) {
     lines.push(
-      `${script.filename} (${script.label}): ${script.pairCount} pair(s), ${script.rowCount} column(s)` +
-        `${script.rowCount === 0 ? " — nothing to reconcile in this layer" : ""}`
+      "",
+      `${script.folder}/ (${script.label}): ${script.tables.length} table(s), ${script.pairCount} pair(s), ` +
+        `${script.rowCount} column(s)${script.rowCount === 0 ? " — nothing to reconcile in this layer" : ""}`
     );
+    for (const table of script.tables) {
+      lines.push(
+        `  ${script.folder}/${table.filename}: ` +
+          (table.rowCount === 0
+            ? "nothing to reconcile — the file says why"
+            : `${table.pairCount} source(s), ${table.rowCount} column(s)` +
+              `${table.commentedCount > 0 ? `, ${table.commentedCount} commented` : ""}`)
+      );
+    }
   }
 
   return `${lines.join("\n")}\n`;

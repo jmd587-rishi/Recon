@@ -122,13 +122,13 @@ export const FAILURE_GUIDE: Record<ReconCheckKind, { suspect: string; nextStep: 
 
 /**
  * Why a row of the *per-layer column report* can come back REVIEW — the same canned/generated split
- * as above, applied to `layerReconciliation.ts`'s nine columns.
+ * as above, applied to `layerReconciliation.ts`'s ten columns.
  *
  * That report is read a row at a time — `source_table | target_table | source_column | target_column |
- * type | source_value | target_value | result | comments` — and every row is the same two questions: what is
- * being compared, and
- * how the code reaches the source. Both are printed on the row itself, so what a REVIEW *could* mean is
- * decidable from the row without knowing the project, which is what makes it worth writing once here.
+ * type | source_value | target_value | accuracy | result | comments` — and every row is the same three
+ * questions: what is being compared, how the code reaches the source, and how far apart the two sides
+ * are. All three are printed on the row itself, so what a REVIEW *could* mean is decidable from the row
+ * without knowing the project, which is what makes it worth writing once here.
  *
  * What this cannot say is which of those causes applies to a given row: that needs the transformation
  * SQL, and it is exactly what the report's own `comments` column carries, written by the reviewer model
@@ -140,6 +140,72 @@ export interface LayerReviewCause {
   /** What a REVIEW on such a row usually comes from, likeliest first. */
   meaning: string;
 }
+
+/**
+ * The same idea again, applied to `businessReconciliation.ts`'s four checks.
+ *
+ * Keyed on the check rather than on what a row shows, because unlike the other two reports this one's
+ * rows are not alike: a roll-forward that does not balance and a measure trace that does not are two
+ * different investigations, and which one the reader is looking at is printed in `check_name`.
+ *
+ * The causes here are properties of the *kind* of report — every snowball that stops balancing stops
+ * for one of a short list of reasons, and that list is the same for every project — which is why they
+ * are written once here rather than asked of a model. What needs a model is which of them applies to
+ * this project's SQL, and that is what the file's own `comments` column carries.
+ */
+export interface BusinessCheckCause {
+  /** As `check_name` prints it. */
+  check: string;
+  /** What the check asserts, in one clause, so the table reads without the script beside it. */
+  asserts: string;
+  /** What a difference usually comes from, likeliest first. */
+  meaning: string;
+}
+
+export const BUSINESS_CHECK_GUIDE: BusinessCheckCause[] = [
+  {
+    check: "roll-forward",
+    asserts: "the opening balance plus every movement equals the closing balance, within one period",
+    meaning:
+      "The movement buckets do not partition the change: two CASE branches that can both be true for " +
+      "one row count it twice, and a set of branches with a gap between them loses it entirely — the " +
+      "classic pair being a customer-churn and a product-churn rule that overlap on the month a " +
+      "customer's last product ends. After that: a movement stored with the opposite sign to the one " +
+      "the walk adds it with, a scaffold or calendar join that invents rows the movements were never " +
+      "computed for, and an ISNULL(x, 0) that turns a missing prior balance into zero rather than " +
+      "carrying it forward."
+  },
+  {
+    check: "stated identity",
+    asserts: "a column the SQL declares to be the sum of other columns still equals them",
+    meaning:
+      "This one is arithmetic the code itself wrote, so a difference is rarely the logic: it is the " +
+      "table not being what the code produces. A partial or incremental load that refreshed some " +
+      "columns and not others, a second script building the same table with a different definition, or " +
+      "a manual correction applied to the total and not to its parts. Check when the table was last " +
+      "rebuilt whole before reading the transformation."
+  },
+  {
+    check: "period continuity",
+    asserts: "one period's closing balance is a later period's opening balance",
+    meaning:
+      "The opening balance is computed over the wrong window or the wrong partition: a LAG partitioned " +
+      "by a key the report is not grouped by, an ORDER BY that is not the period column, or a rolling " +
+      "frame whose length does not match the slice it is written for. A gap in the calendar also shows " +
+      "up here — the check pairs each period with the one really before it, so a missing month makes " +
+      "two real periods adjacent."
+  },
+  {
+    check: "measure trace",
+    asserts: "a business measure's total is the same at both ends of one hop of the pipeline",
+    meaning:
+      "The hop it names is where the measure changed, which narrows it to one statement. A WHERE that " +
+      "drops rows, a join that multiplies them, a TRY_CAST that nulls values the column's type could " +
+      "not hold — that last one is the usual answer at the raw-to-stage hop, where amounts arrive as " +
+      "text. A trace whose first hops pass and whose last one does not is a report-level filter, not a " +
+      "pipeline problem."
+  }
+];
 
 export const LAYER_REVIEW_GUIDE: LayerReviewCause[] = [
   {
@@ -156,6 +222,22 @@ export const LAYER_REVIEW_GUIDE: LayerReviewCause[] = [
       "values into one, a default literal the source never held, or a filter that removed the only " +
       "rows carrying a value. Unmatched rows arriving as NULL also count as a value lost, since no " +
       "distinct count counts NULL."
+  },
+  {
+    signal: "REVIEW with `accuracy` near 100 — the two numbers are close",
+    meaning:
+      "A handful of rows or values rather than a structural difference: a filter with a narrow effect, " +
+      "a few unmatched keys arriving as NULL, or a cast that lost the odd non-numeric value. Read it " +
+      "beside the filters listed for that table — a small gap the transformation explains is the " +
+      "transformation working. Note that the percentage is floored, so 99.99% can be one row in a " +
+      "million rather than one in ten thousand."
+  },
+  {
+    signal: "FAIL — under 75%, so a quarter or more of the source's value never arrived",
+    meaning:
+      "Something structural: the wrong source, a join matching nothing, a predicate that excluded " +
+      "nearly every row, or a column that is not what its name says it is. Take these before the " +
+      "reviews — they are usually one cause showing up on every column of the same pair at once."
   },
   {
     signal: "`source_column` and `target_column` holding different names",
@@ -562,6 +644,13 @@ export interface TroubleshootingPlan {
   withoutQueries: string[];
   /** Targets nothing was flagged for. Counted rather than listed: this is the good news line. */
   clean: number;
+  /**
+   * Whether this project has a business reconciliation file at all.
+   *
+   * The guide for those checks is printed only when there is one to read it against — a project with no
+   * reporting table would otherwise get a page of advice about a report it has not got.
+   */
+  hasBusinessChecks: boolean;
 }
 
 /**
@@ -575,7 +664,8 @@ export interface TroubleshootingPlan {
 export function buildTroubleshootingPlan(
   hops: { label: string; targets: ReconTargetFacts[] }[],
   maxQueries = MAX_QUERIES,
-  maxPerTarget = MAX_PER_TARGET
+  maxPerTarget = MAX_PER_TARGET,
+  hasBusinessChecks = false
 ): TroubleshootingPlan {
   const targets: TargetDrillDowns[] = [];
   const withoutQueries: string[] = [];
@@ -602,5 +692,5 @@ export function buildTroubleshootingPlan(
     }
   }
 
-  return { targets, shown, omitted, withoutQueries, clean };
+  return { targets, shown, omitted, withoutQueries, clean, hasBusinessChecks };
 }

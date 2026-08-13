@@ -241,6 +241,7 @@ export function buildLocalProject(collected: CollectResult): LocalProject {
     folderName: collected.folderName,
     files,
     facts: files.flatMap((f) => f.facts),
-    scan: buildScanResult(collected.folderName, files, skipped)
+    scan: buildScanResult(collected.folderName, files, skipped),
+    fileLineage: sqlProject.fileLineage
   };
 }

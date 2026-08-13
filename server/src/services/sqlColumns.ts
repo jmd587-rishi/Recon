@@ -53,6 +53,36 @@ export interface ColumnInfo {
    * written against such a column can only ever confirm the placeholder.
    */
   constant?: string;
+  /**
+   * Every distinct literal any branch of the writing statement assigns this column.
+   *
+   * A report table that unions its period windows together writes `'LM' AS period_type` in one branch
+   * and `'LTM' AS period_type` in the next, so reading the first branch alone reports the column as
+   * hardcoded when it is in fact the column the whole table is sliced by. Collecting them is what tells
+   * those two apart — one literal is a placeholder, several are a slice — and `constant` is set only
+   * when they agree.
+   */
+  literals?: string[];
+  /**
+   * The other columns this one is the sum of, with their signs, when the expression is nothing but
+   * additions and subtractions of plain column references.
+   *
+   * `bop_arr + customer_churn + product_churn + downsell AS grr` is an identity the project *states*:
+   * whatever `grr` means to the business, the code says it equals those four columns added up, and a
+   * total that no longer does is a defect in the table rather than a matter of interpretation. It is
+   * the one business rule that needs no reading at all, which is why it is derived here rather than
+   * asked of a model.
+   *
+   * Undefined for anything else. A `CASE`, a product, a window function or a concatenation is not an
+   * identity, and a half-understood expression turned into a check is a check that can only ever fail.
+   */
+  terms?: ColumnTerm[];
+}
+
+/** One signed term of a column built by adding and subtracting other columns of the same table. */
+export interface ColumnTerm {
+  column: string;
+  sign: 1 | -1;
 }
 
 /** Which of the three extraction paths produced a table's columns. */
@@ -722,24 +752,183 @@ function constantThroughCtes(expression: string, cteColumns: Map<string, string[
   return null;
 }
 
+/**
+ * Functions that add nothing to a sum, so a term wrapped in one is still that term.
+ *
+ * `ISNULL(arr, 0) - ISNULL(lm_arr, 0)` is the same identity as `arr - lm_arr` for any check that
+ * totals it: `SUM` skips nulls, and defaulting them to zero changes neither total. Only the two-argument
+ * form defaulting to `0` is unwrapped — `ISNULL(arr, base_arr)` substitutes a different column and is a
+ * `CASE` in disguise.
+ */
+const ADDITIVE_NEUTRAL = new Set(["isnull", "coalesce", "ifnull", "nvl"]);
+
+/**
+ * The column one term of an additive expression names, or null when the term is anything else.
+ *
+ * Deliberately strict. Everything the caller does with the answer treats it as "this column is exactly
+ * those columns added up", so a term that is only nearly a column reference — a product, a `CASE`, a
+ * window function — has to disqualify the whole expression rather than be approximated.
+ */
+function additiveTerm(text: string, depth = 0): string | null {
+  const trimmed = text.trim();
+  if (depth > 3 || trimmed.length === 0) return null;
+  if (PLAIN_REF_RE.test(trimmed)) {
+    const bare = trimmed.split(".").pop()!.toLowerCase();
+    return NILADIC_KINDS[bare] ? null : bare;
+  }
+
+  const call = /^([A-Za-z_]\w*)\s*\(/.exec(trimmed);
+  if (!call || !ADDITIVE_NEUTRAL.has(call[1].toLowerCase())) return null;
+  const group = parenContent(trimmed, call.index + call[0].length - 1);
+  // Anything after the closing paren is another operator, so the call is not the whole term.
+  if (!group || group.end !== trimmed.length) return null;
+
+  const args = splitTopLevel(group.content, ",");
+  if (args.length !== 2 || args[1].trim() !== "0") return null;
+  return additiveTerm(args[0], depth + 1);
+}
+
+/**
+ * Splits an expression at its top-level `+` and `-`, keeping each part's sign.
+ *
+ * The sign is read from the operator, and a leading one applies to the first part — `-a + b` is two
+ * terms, not a subtraction of nothing. An operator with no left-hand side other than at the very start
+ * means the expression is not additive at all (`a * -1`), so it is refused: the `-` there belongs to the
+ * literal, and reading it as a term would decompose a product into two columns it never had.
+ */
+function additiveParts(text: string): { text: string; sign: 1 | -1 }[] | null {
+  const parts: { text: string; sign: 1 | -1 }[] = [];
+  let depth = 0;
+  let start = 0;
+  let sign: 1 | -1 = 1;
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (QUOTE_CLOSERS[ch]) {
+      i = skipQuoted(text, i);
+      continue;
+    }
+    if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if ((ch === "+" || ch === "-") && depth === 0) {
+      const left = text.slice(start, i).trim();
+      if (left.length === 0) {
+        // A sign with nothing on its left is a unary one, and only legal before the first term.
+        if (parts.length > 0 || start > 0) return null;
+        if (ch === "-") sign = -1;
+      } else {
+        parts.push({ text: left, sign });
+        sign = ch === "-" ? -1 : 1;
+      }
+      start = i + 1;
+    }
+    i++;
+  }
+
+  const last = text.slice(start).trim();
+  if (last.length > 0) parts.push({ text: last, sign });
+  return parts;
+}
+
+/**
+ * The columns an expression adds and subtracts, when that is all it does.
+ *
+ * Two terms at least: one term is a copy or a negation, which `kindRef` already records and which says
+ * nothing a reconciliation could check.
+ */
+export function additiveTerms(expression: string): ColumnTerm[] | null {
+  const parts = additiveParts(expression.replace(/\s+/g, " ").trim());
+  if (!parts || parts.length < 2) return null;
+
+  const terms: ColumnTerm[] = [];
+  for (const part of parts) {
+    const column = additiveTerm(part.text);
+    if (column === null) return null;
+    terms.push({ column, sign: part.sign });
+  }
+  return terms;
+}
+
+/**
+ * The additive decomposition of a column, following a plain reference back through the statement's CTEs.
+ *
+ * Same shape as `kindThroughCtes` and for the same reason: the statement that writes the table usually
+ * selects a name that was computed a CTE or two earlier, and the outer list on its own says only that
+ * the column exists.
+ */
+function termsThroughCtes(expression: string, cteColumns: Map<string, string[]>, depth = 0): ColumnTerm[] | null {
+  const direct = additiveTerms(expression);
+  if (direct) return direct;
+  if (depth >= MAX_STAR_DEPTH) return null;
+
+  const text = expression.replace(/\s+/g, " ").trim();
+  if (!PLAIN_REF_RE.test(text)) return null;
+  const bare = text.split(".").pop()!.toLowerCase();
+
+  for (const candidate of cteColumns.get(bare) ?? []) {
+    if (candidate.replace(/\s+/g, " ").trim().toLowerCase() === bare) continue;
+    const deeper = termsThroughCtes(candidate, cteColumns, depth + 1);
+    if (deeper) return deeper;
+  }
+  return null;
+}
+
+const LITERAL_ALIAS_RE = /('(?:''|[^'])*')\s+as\s+([A-Za-z_][\w$#]*)/gi;
+
+/**
+ * Every literal the statement assigns to a column name, wherever in it that happens.
+ *
+ * A statement's select list is read one branch deep — the write's own — which is right for the column
+ * list and wrong for a table whose branches are its slices. `SELECT 'LM' AS period_type ... UNION ALL
+ * SELECT 'LTM' AS period_type ...` produces a column with two values, and reading branch one alone
+ * calls it hardcoded to `'LM'`.
+ *
+ * Scanned rather than parsed, and deliberately over-inclusive: it collects from every select in the
+ * statement, including ones whose rows never reach the table. Both things it feeds are safe under that.
+ * Suppressing a "this column is hardcoded" claim on a column that turns out to have one value costs a
+ * note; making the claim wrongly costs the reader's trust in every other note in the file.
+ */
+export function branchLiterals(sql: string): Map<string, string[]> {
+  const found = new Map<string, Set<string>>();
+  LITERAL_ALIAS_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = LITERAL_ALIAS_RE.exec(sql))) {
+    const name = match[2].toLowerCase();
+    const values = found.get(name) ?? new Set<string>();
+    values.add(match[1]);
+    found.set(name, values);
+  }
+
+  return new Map(Array.from(found, ([name, values]) => [name, Array.from(values).sort()]));
+}
+
 function named(
   names: string[],
   expressions?: Map<string, string>,
-  cteColumns: Map<string, string[]> = new Map()
+  cteColumns: Map<string, string[]> = new Map(),
+  literals: Map<string, string[]> = new Map()
 ): ColumnInfo[] {
   return names.map((name) => {
     const expression = expressions?.get(name);
     const inferred = expression
       ? kindThroughCtes(expression, cteColumns)
       : { kind: "other" as const, ref: null };
-    const constant = expression ? constantThroughCtes(expression, cteColumns) : null;
+    const seen = literals.get(name) ?? [];
+    // One branch says `'LM' AS period_type` and the next says `'LTM'`, so the column read on its own is
+    // a placeholder and read across the statement is the slice. Several literals settle it either way.
+    const constant = seen.length > 1 ? null : expression ? constantThroughCtes(expression, cteColumns) : null;
+    const terms = expression ? termsThroughCtes(expression, cteColumns) : null;
     return {
       name,
       dataType: null,
       kind: inferred.kind,
       isDeclaredKey: false,
       ...(inferred.ref ? { kindRef: inferred.ref } : {}),
-      ...(constant ? { constant } : {})
+      ...(constant ? { constant } : {}),
+      ...(seen.length > 0 ? { literals: seen } : {}),
+      ...(terms ? { terms } : {})
     };
   });
 }
@@ -823,7 +1012,7 @@ export function extractStatementColumns(sql: string, targetTable: string | null)
   if (selected.names.length > 0) {
     return {
       table,
-      columns: named(selected.names, selected.expressions, cteColumnExpressions(ctes)),
+      columns: named(selected.names, selected.expressions, cteColumnExpressions(ctes), branchLiterals(stripped)),
       origin: "select",
       incomplete: selected.incomplete,
       pending: selected.pending,
@@ -858,11 +1047,23 @@ const ORIGIN_RANK: Record<ColumnOrigin, number> = { ddl: 3, select: 2, insert: 1
  * One column as two readings agree on it. Where they disagree about its type neither is authoritative,
  * so the answer is "unknown" — which stops the check comparing it, rather than comparing it wrongly.
  */
+function sameTerms(a: ColumnTerm[] | undefined, b: ColumnTerm[] | undefined): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((term, i) => term.column === b[i].column && term.sign === b[i].sign);
+}
+
 function mergeColumn(a: ColumnInfo, b: ColumnInfo): ColumnInfo {
-  if (a.kind === b.kind) return a;
-  if (a.kind === "other") return { ...a, kind: b.kind, kindRef: b.kindRef };
-  if (b.kind === "other") return a;
-  return { ...a, kind: "other", kindRef: undefined };
+  // An identity only one of the two readings states is an identity of one of two scripts, and which of
+  // them is deployed is exactly what `better` cannot tell. Kept only where both say the same thing:
+  // a check derived from the losing script's arithmetic can never tie out against the table that ran.
+  const terms = sameTerms(a.terms, b.terms) ? a.terms : undefined;
+  const agreed = { ...a, ...(terms ? { terms } : {}) };
+  if (!terms) delete agreed.terms;
+
+  if (a.kind === b.kind) return agreed;
+  if (a.kind === "other") return { ...agreed, kind: b.kind, kindRef: b.kindRef };
+  if (b.kind === "other") return agreed;
+  return { ...agreed, kind: "other", kindRef: undefined };
 }
 
 function better(a: TableColumns, b: TableColumns): TableColumns {

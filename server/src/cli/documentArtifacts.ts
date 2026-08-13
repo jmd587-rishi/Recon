@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderMarkdown, type DocDocument } from "../services/docModel.js";
 import { buildDocx } from "../services/docxWriter.js";
+import { BUSINESS_RECON_DIR, HIGH_LEVEL_RECON_DIR, LOGICAL_RECON_DIR } from "../services/governanceLayout.js";
 import { applyLineageOverrides, validateOverrides } from "../services/lineageOverrides.js";
 import type { LocalProject } from "../services/localProject.js";
 import type { LineageArtifacts } from "../types/index.js";
@@ -76,17 +77,39 @@ export function findTemplate(dir: string, explicit: string | null): string | nul
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
-/** The reconciliation scripts already generated in this folder, so the document can point at them. */
+/**
+ * The reconciliation scripts already generated in this folder, so the document can point at them.
+ *
+ * Both folders `reconcile scripts` writes are read — the hop queries and the layer reports — because
+ * the report describes both artifacts, and a reader told about a column report has to be told where
+ * it is. A nested folder is named as a folder rather than expanded: the layer reports are a file per
+ * table, and twenty paths in a sentence is a list nobody reads where four folder names are a place to
+ * go. The same goes for the per-hop folders `--split` writes.
+ *
+ * Loose `.sql` sitting in the governance root is deliberately not listed: since the split into two
+ * named folders, anything there is left over from an earlier run (see `reportOldLayout`), and a
+ * document is worse for pointing at files describing a pipeline this run no longer produces.
+ */
 export async function listGovernanceFiles(dir: string, governanceOut: string): Promise<string[]> {
-  try {
-    const entries = await readdir(path.join(dir, governanceOut), { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".sql"))
-      .map((entry) => `${governanceOut}/${entry.name}`)
-      .sort();
-  } catch {
-    return [];
+  const found: string[] = [];
+
+  for (const subfolder of [HIGH_LEVEL_RECON_DIR, LOGICAL_RECON_DIR, BUSINESS_RECON_DIR]) {
+    let entries;
+    try {
+      entries = await readdir(path.join(dir, governanceOut, subfolder), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.toLowerCase().endsWith(".sql")) {
+        found.push(`${governanceOut}/${subfolder}/${entry.name}`);
+      } else if (entry.isDirectory()) {
+        found.push(`${governanceOut}/${subfolder}/${entry.name}/`);
+      }
+    }
   }
+
+  return found.sort();
 }
 
 export interface CorrectionOutcome {

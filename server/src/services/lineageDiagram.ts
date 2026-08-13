@@ -228,10 +228,14 @@ function componentBlock(component: DiagramComponent, index: number, notes: Linea
    tables, never one whose name merely looks like it should.
 
    Files are counted, not all listed: a 300-file project drawn in full is a wall nobody reads, so each
-   folder shows a few of its files and says how many it kept back. */
+   folder shows a few of its files and says how many it kept back. The ones held back are written into
+   the page collapsed rather than left out, so "… N more files" can open them — a count of files you
+   cannot then look at is the one thing worse than the wall. They cost no vertical space until asked
+   for, which is why they are charged to their own budget and not to MAX_TREE_LINES. */
 
 const MAX_FILES_PER_DIR = 6;
 const MAX_TREE_LINES = 260;
+const MAX_HIDDEN_FILES = 600;
 
 interface StructureFile {
   name: string;
@@ -377,7 +381,7 @@ function renderDir(
   layers: LayerRef[],
   colours: number[],
   out: string[],
-  budget: { left: number; cut: boolean }
+  budget: { left: number; cut: boolean; hiddenLeft: number }
 ): void {
   const dirs = Array.from(dir.dirs.values()).sort((a, b) => a.name.localeCompare(b.name));
   const files = dir.files.slice().sort((a, b) => a.name.localeCompare(b.name));
@@ -419,26 +423,82 @@ function renderDir(
     budget.left--;
     seen++;
     const last = seen === entries;
-    const attrs =
-      (file.focusId ? ` data-focus="${escapeHtml(file.focusId)}"` : "") +
-      (file.writes.length > 0 ? ` title="builds ${escapeHtml(file.writes.join(", "))}"` : "");
-    out.push(
-      treeLine(
-        `${prefix}${last ? "└── " : "├── "}`,
-        file.name,
-        file.layer,
-        file.layer === null ? null : colours[file.layer],
-        file.focusId ? "file link" : "file",
-        file.writes.length > 0 ? file.writes[0] : "",
-        attrs
-      )
-    );
+    out.push(fileLine(file, `${prefix}${last ? "└── " : "├── "}`, colours, "", ""));
   }
 
   if (hidden > 0 && budget.left > 0) {
     budget.left--;
-    out.push(treeLine(`${prefix}└── `, `… ${hidden} more file${hidden === 1 ? "" : "s"}`, null, null, "more", ""));
+    // Only worth making a toggle of if every file behind it fits: a control that reveals some of
+    // what it counted would misreport the folder twice over.
+    const extras = budget.hiddenLeft >= hidden ? files.slice(MAX_FILES_PER_DIR) : [];
+    budget.hiddenLeft -= extras.length;
+    out.push(...moreLines(extras, hidden, prefix, colours, out.length));
   }
+}
+
+/** One file's line — the same whether it is one of the first few or one of the revealed extras. */
+function fileLine(
+  file: StructureFile,
+  prefix: string,
+  colours: number[],
+  extraClass: string,
+  extraAttrs: string
+): string {
+  return treeLine(
+    prefix,
+    file.name,
+    file.layer,
+    file.layer === null ? null : colours[file.layer],
+    `${file.focusId ? "file link" : "file"}${extraClass}`,
+    file.writes.length > 0 ? file.writes[0] : "",
+    (file.focusId ? ` data-focus="${escapeHtml(file.focusId)}"` : "") +
+      (file.writes.length > 0 ? ` title="builds ${escapeHtml(file.writes.join(", "))}"` : "") +
+      extraAttrs
+  );
+}
+
+/**
+ * The "… N more files" line and, behind it, the files themselves — collapsed, in the page, ready.
+ *
+ * Both prefixes are carried on the line because expanding it stops it being the last entry in its
+ * folder: the branch character has to become "├──" or the tree draws a corner with lines below it.
+ * The script swaps them, which is cheaper than re-rendering and keeps the closed page correct with
+ * no script at all.
+ *
+ * With `extras` empty (the hidden budget spent) the count is emitted exactly as it always was: a
+ * plain, unclickable note, rather than a control that would open onto nothing.
+ */
+function moreLines(
+  extras: StructureFile[],
+  hidden: number,
+  prefix: string,
+  colours: number[],
+  index: number
+): string[] {
+  const plural = hidden === 1 ? "" : "s";
+  const show = `… ${hidden} more file${plural}`;
+  if (extras.length === 0) return [treeLine(`${prefix}└── `, show, null, null, "more", "")];
+
+  const id = `more${index}`;
+  const closed = `${prefix}└── `;
+  const open = `${prefix}├── `;
+  const attrs =
+    ` role="button" tabindex="0" aria-expanded="false" data-more="${id}"` +
+    ` data-show="${escapeHtml(show)}" data-hide="${escapeHtml(`… hide ${hidden} file${plural}`)}"` +
+    ` data-pre-closed="${escapeHtml(closed)}" data-pre-open="${escapeHtml(open)}"`;
+
+  return [
+    treeLine(closed, show, null, null, "more toggle", "", attrs),
+    ...extras.map((file, i) =>
+      fileLine(
+        file,
+        `${prefix}${i === extras.length - 1 ? "└── " : "├── "}`,
+        colours,
+        " extra",
+        ` data-more-of="${id}" hidden`
+      )
+    )
+  ];
 }
 
 /**
@@ -490,10 +550,13 @@ function structureSection(
   const fileCounts = input.layers.map((_, i) => placed.filter((file) => file.layer === i).length);
 
   const lines: string[] = [];
-  const budget = { left: MAX_TREE_LINES, cut: false };
+  const budget = { left: MAX_TREE_LINES, cut: false, hiddenLeft: MAX_HIDDEN_FILES };
   renderDir(tree, "", input.layers, colours, lines, budget);
 
   const unplaced = placed.filter((file) => file.layer === null).length;
+  // Whether any folder held files back *and* had room to write them in collapsed, which is the only
+  // case where there is a control to tell the reader about.
+  const expandable = budget.hiddenLeft < MAX_HIDDEN_FILES;
 
   return `  <h2>Project structure</h2>
   <p class="hint">Where each stage lives on disk. A folder takes the colour of the layer its SQL
@@ -501,7 +564,11 @@ function structureSection(
   the boxes on the left and the folders on the right are the same pipeline seen two ways.
   <strong>Click a layer</strong> to pick out its folders${
     nodeIds.size > 0 ? ", or a file to light up the table it builds in the diagram above" : ""
-  }.</p>
+  }.${
+    expandable
+      ? ' A folder with more files than fit ends in <strong>… N more files</strong> — click that to see them.'
+      : ""
+  }</p>
   <div class="structure" id="structure">
     <div>
       <h3 class="colhead">Layers</h3>
@@ -713,6 +780,11 @@ export function buildLineageDiagram(input: LineageDiagramInput): LineageDiagram 
   .tline.dir .tname { font-weight:700; color:var(--nc,var(--fg)); }
   .tline.file .tname { color:var(--nc,var(--fg)); }
   .tline.more .tname, .tline.more .tpre { color:var(--dim); font-style:italic; }
+  /* The count is a control when the files behind it are in the page — see moreLines(). */
+  .tline.more.toggle { cursor:pointer; }
+  .tline.more.toggle:hover .tname { color:var(--sel); text-decoration:underline; }
+  .tline.more.toggle:focus-visible { outline:2px solid var(--sel); outline-offset:-2px; }
+  .tline.extra[hidden] { display:none; }
   .tmeta { color:var(--dim); font-size:11.5px; margin-left:.6rem; }
   .tline.link { cursor:pointer; }
   .tline.link:hover { background:color-mix(in srgb, var(--sel) 14%, transparent); }
@@ -1087,11 +1159,32 @@ ${components.map((component, i) => componentBlock(component, i, input.notes)).jo
       });
     });
 
+    // "… N more files" stands for lines that are already here, collapsed, so opening it is a hidden
+    // flag and two label swaps — no re-render, and nothing to fetch.
+    function toggleMore(line) {
+      var open = line.getAttribute("aria-expanded") === "true";
+      var extras = structure.querySelectorAll('.tline.extra[data-more-of="' + line.getAttribute("data-more") + '"]');
+      Array.prototype.forEach.call(extras, function (extra) { extra.hidden = open; });
+      line.setAttribute("aria-expanded", open ? "false" : "true");
+      line.querySelector(".tname").textContent = line.getAttribute(open ? "data-show" : "data-hide");
+      line.querySelector(".tpre").textContent = line.getAttribute(open ? "data-pre-closed" : "data-pre-open");
+    }
+
     structure.addEventListener("click", function (e) {
+      var more = e.target.closest ? e.target.closest(".tline.more.toggle") : null;
+      if (more) { toggleMore(more); return; }
       var line = e.target.closest ? e.target.closest(".tline.link") : null;
       if (!line) return;
       focus(line.getAttribute("data-focus"));
       stage.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+
+    structure.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      var more = e.target.closest ? e.target.closest(".tline.more.toggle") : null;
+      if (!more) return;
+      e.preventDefault();
+      toggleMore(more);
     });
   }
 

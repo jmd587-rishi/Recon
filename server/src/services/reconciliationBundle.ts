@@ -23,6 +23,12 @@ import { splitSqlTablesByOp, stripSqlComments } from "./tableLineage.js";
  * cross-joins those single rows into comparisons. Nothing is scanned twice for two different checks,
  * unlike the per-table scripts, where every `(SELECT COUNT(*) FROM t)` is its own scan.
  *
+ * Every row carries `accuracy` beside `difference`: the same gap as a percentage of the quantity it
+ * was measured against, and `100.00%` wherever the check passes. A raw difference is not comparable
+ * down a column — 4,000 rows missing out of 4,100 and 4,000 out of four million are the same number
+ * and not the same problem — so the percentage is what makes the result readable row against row, and
+ * it is what grades the row: `status` is PASS, REVIEW or FAIL by the bands in `gradeExpr` below.
+ *
  * Two things do not survive the fold, and both are kept rather than dropped:
  *   - A check that lists rows (*which* keys went missing) cannot be a row of a status table, so it
  *     becomes a count here and its full query is written into the appendix at the foot of the file.
@@ -33,8 +39,33 @@ import { splitSqlTablesByOp, stripSqlComments } from "./tableLineage.js";
  * The SQL stays portable — no TOP/LIMIT, no vendor functions — like everything else this folder emits.
  */
 
-/** Every value column is cast to this, so a COUNT branch and a SUM branch can share a UNION column. */
-const VALUE_TYPE = "DECIMAL(38, 6)";
+/**
+ * Every value column is cast to this, so a COUNT branch and a SUM branch can share a UNION column —
+ * and so every measured number is rounded to two decimal places before anything looks at it.
+ *
+ * Two places because that is what a reader can act on: a currency total is quoted to the cent, and a
+ * distinct count has no fraction at all, so the sixth decimal of either is floating-point residue
+ * rather than a difference in the data.
+ *
+ * The rounding happens **here**, in the cast the comparison itself reads, and not on the way to the
+ * page. Rounding only the display would print two identical numbers beside a REVIEW whenever the
+ * values differed in the seventh decimal, which is precisely the disagreement between what a row shows
+ * and what it says that everything else in these files is arranged to prevent. The cost is the honest
+ * one: a difference under half a cent now reads as agreement.
+ *
+ * Exported and shared with `layerReconciliation.ts` for the same reason `gradeExpr` and `RULE` are —
+ * two generated files quoting the same total to different precision would be two tools.
+ */
+export const VALUE_TYPE = "DECIMAL(38, 2)";
+/** `accuracy` is a percentage and can never leave [0, 100], so it is given a type that says so. */
+const PCT_TYPE = "DECIMAL(5, 2)";
+/**
+ * Below this percentage a row reads FAIL rather than REVIEW.
+ *
+ * A quarter of the value gone is not the kind of difference a filter explains, and the point of
+ * grading by magnitude is to separate the row that needs reading from the row that needs fixing.
+ */
+export const FAIL_BELOW_PERCENT = 75;
 /** Filter text quoted in the per-table header before it is cut. */
 const MAX_FILTER_CHARS = 160;
 
@@ -72,6 +103,24 @@ function padded(index: number): string {
   return String(index).padStart(2, "0");
 }
 
+/**
+ * `expr` in parentheses, unless nothing in it could reassociate.
+ *
+ * One row's deviation is a sum of two counts, and substituting it bare into `whole - deviation` gives
+ * `whole - values_added + values_dropped` — a different number, and one that reads as better agreement
+ * the more values went missing. The scan only looks at depth 0: an operator inside a function's own
+ * parentheses is already grouped by them.
+ */
+function grouped(expr: string): string {
+  let depth = 0;
+  for (const ch of expr) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (depth === 0 && "+-*/".includes(ch)) return `(${expr})`;
+  }
+  return expr;
+}
+
 // ---- the pieces a bundle is assembled from ----
 
 interface Cte {
@@ -80,6 +129,28 @@ interface Cte {
   body: string;
   /** Comment line written above the definition — used to head each table's block. */
   comment?: string;
+}
+
+/**
+ * The two numbers `accuracy` is worked out from: how far apart this check's two sides are, and the
+ * quantity that gap is a share *of*.
+ *
+ * `difference` already says how far apart they are, and on its own that is not readable across a
+ * table: 4,000 rows missing means one thing out of 4,100 and another out of four million. The
+ * percentage is the same fact scaled by the size of what was being compared, so every row of the
+ * result can be read against every other row and sorted by how wrong it is.
+ *
+ * Which quantity is the whole depends on what the row counted, and the row is the only thing that
+ * knows. A comparison of two values is a share of the *source's* value — the number the target was
+ * supposed to reproduce. A count of rows that failed a test is a share of the population it was
+ * counted over: the source's rows for keys that never arrived, the target's rows for everything the
+ * target is checked against on its own.
+ */
+interface Agreement {
+  /** The gap: `ABS(target - source)`, or the count of rows the check flagged. */
+  deviation: string;
+  /** What that gap is measured against. Never negative — magnitudes and counts only. */
+  whole: string;
 }
 
 interface BundleRow {
@@ -97,6 +168,8 @@ interface BundleRow {
   targetValue: string;
   /** Reads 0 when the check passes — every row obeys this, which is what makes the table scannable. */
   difference: string;
+  /** What `accuracy` is worked out from — see `Agreement`. */
+  agreement: Agreement;
   /**
    * The boolean condition under which this check passes — the one place a row says what "right" is.
    *
@@ -104,8 +177,6 @@ interface BundleRow {
    * the same verdict — an explanation, a severity — writes it from this and cannot drift out of step.
    */
   passWhen: string;
-  /** What the row reads when `passWhen` doesn't hold: `'REVIEW'` or `'FAIL'`. */
-  failStatus: string;
   /** The FROM clause tying the row to its CTEs. */
   from: string;
 }
@@ -130,10 +201,62 @@ const COLUMNS = [
   "source_value",
   "target_value",
   "difference",
+  "accuracy",
   "status"
 ];
 
+/**
+ * `accuracy` as SQL: 100 on a passing row, and otherwise how much of the whole the two sides still
+ * agree on.
+ *
+ * It is written from `passWhen` — the same condition `status` is written from — so 100 and PASS can
+ * only ever arrive together, and the column can never read 100 beside a REVIEW. The middle branch is
+ * the clamp: a gap at least as large as the whole it is measured against reads 0 rather than the
+ * negative number a target holding twice its source's total would otherwise produce.
+ *
+ * `100.0` leads the arithmetic deliberately. Every quantity here is a count or a total, and on SQL
+ * Server `(a - b) / c` over two integers is integer division — 0 or 1, never a percentage. A decimal
+ * literal first makes the whole expression decimal on every engine this file is meant to run on.
+ *
+ * The continuation lines are indented for the seven-character prefix `renderRow` puts on every value.
+ *
+ * Exported for the same reason `gradeExpr` and `percentText` are: `layerReconciliation.ts` and
+ * `businessReconciliation.ts` grade the same percentage, and three copies of this formula left to
+ * drift apart would be three tools, with no way for a reader to know which one they were holding.
+ */
+export function accuracyExpr(passWhen: string, deviation: string, whole: string): string {
+  return (
+    `CAST(CASE WHEN ${passWhen} THEN 100\n` +
+    `                       WHEN ${deviation} >= ${whole} THEN 0\n` +
+    `                       ELSE FLOOR(10000.0 * (${whole} - ${deviation}) / ${whole}) / 100\n` +
+    `                  END AS ${PCT_TYPE})`
+  );
+}
+
+function accuracyOf(row: BundleRow): string {
+  return accuracyExpr(row.passWhen, grouped(row.agreement.deviation), grouped(row.agreement.whole));
+}
+
+/**
+ * One row of the status table: what it measured, underneath, and what that means, on top.
+ *
+ * The row's numbers are worked out once in a derived table over its CTEs, and the columns above name
+ * them rather than repeating the expressions. That is what lets `status` be graded from the same
+ * percentage the reader sees — spelling the accuracy expression out a second time inside the verdict
+ * would let the two drift, which is the failure this whole file is arranged to prevent.
+ *
+ * `passes` is carried as 1/0 rather than as its condition, because the condition is written in terms
+ * of the CTE aliases and nothing outside the derived table can see them.
+ */
 function renderRow(row: BundleRow, seq: number, scope: string, first: boolean): string {
+  const measured = [
+    `${row.sourceValue} AS source_value`,
+    `${row.targetValue} AS target_value`,
+    `${row.difference} AS difference`,
+    `${accuracyOf(row)} AS accuracy_pct`,
+    `CASE WHEN ${row.passWhen} THEN 1 ELSE 0 END AS passes`
+  ];
+
   const values = [
     String(seq),
     quoted(scope),
@@ -141,17 +264,18 @@ function renderRow(row: BundleRow, seq: number, scope: string, first: boolean): 
     row.source === null ? "NULL" : quoted(row.source),
     quoted(row.checkName),
     quoted(row.metric),
-    row.sourceValue,
-    row.targetValue,
-    row.difference,
-    `CASE WHEN ${row.passWhen} THEN 'PASS' ELSE ${row.failStatus} END`
+    "x.source_value",
+    "x.target_value",
+    "x.difference",
+    percentText("x.accuracy_pct"),
+    gradeExpr("x.passes = 1", "x.accuracy_pct")
   ];
 
   const select = values
     .map((value, i) => `${i === 0 ? "SELECT " : "       "}${value}${first ? ` AS ${COLUMNS[i]}` : ""}`)
     .join(",\n");
 
-  return `${select}\n${row.from}`;
+  return `${select}\nFROM (SELECT ${measured.join(",\n             ")}\n      ${row.from}) x`;
 }
 
 function renderCte(cte: Cte): string {
@@ -243,11 +367,6 @@ function tidyFilter(filter: string): string {
   return flat.length > MAX_FILTER_CHARS ? `${flat.slice(0, MAX_FILTER_CHARS)}…` : flat;
 }
 
-/** Duplicate and null keys are a defect when the key is declared, and evidence the guess was wrong when it isn't. */
-function keyFailStatus(facts: ReconTargetFacts): string {
-  return facts.key.confidence === "declared" ? "'FAIL'" : "'REVIEW'";
-}
-
 function targetBundle(
   facts: ReconTargetFacts,
   script: ReconScript | undefined,
@@ -332,7 +451,10 @@ function targetBundle(
         // written once whether or not the transformation renamed the column.
         body:
           `    SELECT COALESCE(SUM(CASE WHEN s.value IS NULL THEN 1 ELSE 0 END), 0) AS values_added,\n` +
-          `           COALESCE(SUM(CASE WHEN t.value IS NULL THEN 1 ELSE 0 END), 0) AS values_dropped\n` +
+          `           COALESCE(SUM(CASE WHEN t.value IS NULL THEN 1 ELSE 0 END), 0) AS values_dropped,\n` +
+          // One row per distinct value on either side, so this counts what the two sets hold between
+          // them — which is what the unmatched ones are a share of.
+          `           COUNT(*) AS value_pairs\n` +
           `    FROM (SELECT DISTINCT ${column.target} AS value FROM ${facts.target}\n` +
           `          WHERE ${column.target} IS NOT NULL) t\n` +
           `    FULL OUTER JOIN (SELECT DISTINCT ${column.source} AS value FROM ${source}\n` +
@@ -393,10 +515,10 @@ function targetBundle(
       sourceValue: cast(value),
       targetValue: cast("t.row_count"),
       difference: cast(`t.row_count - ${value}`),
+      agreement: { deviation: `ABS(t.row_count - ${value})`, whole: value },
       // Grouping can only collapse rows, so under `at_most` fewer is the transformation working and
-      // more is rows appearing from nowhere — which is a defect on its own terms, not a REVIEW.
+      // more is rows appearing from nowhere. How bad that is the percentage decides.
       passWhen: countable.comparison === "equal" ? `t.row_count = ${value}` : `t.row_count <= ${value}`,
-      failStatus: countable.comparison === "equal" ? "'REVIEW'" : "'FAIL'",
       from: `FROM ${prefix} t CROSS JOIN ${s} s`
     });
   });
@@ -405,6 +527,10 @@ function targetBundle(
     const s = `${prefix}_s${i + 1}`;
     for (const measure of entry.measures) {
       const column = sumAlias(measure.target);
+      // An empty table sums to NULL, so both sides are defaulted once here and the difference, the
+      // verdict and the percentage are then all written from the same two expressions.
+      const total = `COALESCE(t.${column}, 0)`;
+      const sourceTotal = `COALESCE(s.${column}, 0)`;
       rows.push({
         checkName: "Measure total",
         target: facts.target,
@@ -415,9 +541,10 @@ function targetBundle(
             : `SUM(${measure.target}) against SUM(${measure.source})`,
         sourceValue: cast(`s.${column}`),
         targetValue: cast(`t.${column}`),
-        difference: cast(`COALESCE(t.${column}, 0) - COALESCE(s.${column}, 0)`),
-        passWhen: `COALESCE(t.${column}, 0) = COALESCE(s.${column}, 0)`,
-        failStatus: "'REVIEW'",
+        difference: cast(`${total} - ${sourceTotal}`),
+        // A share of the source's own total: the number the target was supposed to reproduce.
+        agreement: { deviation: `ABS(${total} - ${sourceTotal})`, whole: `ABS(${sourceTotal})` },
+        passWhen: `${total} = ${sourceTotal}`,
         from: `FROM ${prefix} t CROSS JOIN ${s} s`
       });
     }
@@ -426,6 +553,8 @@ function targetBundle(
   facts.perSource.forEach((entry, i) => {
     entry.categories.forEach((column, j) => {
       const alias = distinctAlias(column.target);
+      const targetValues = `COALESCE(t.${alias}, 0)`;
+      const sourceValues = `COALESCE(s.${alias}, 0)`;
       const label =
         column.target === column.source ? column.target : `${column.target} against ${column.source}`;
       rows.push({
@@ -435,9 +564,9 @@ function targetBundle(
         metric: `COUNT(DISTINCT ${label})`,
         sourceValue: cast(`s.${alias}`),
         targetValue: cast(`t.${alias}`),
-        difference: cast(`COALESCE(t.${alias}, 0) - COALESCE(s.${alias}, 0)`),
-        passWhen: `COALESCE(t.${alias}, 0) = COALESCE(s.${alias}, 0)`,
-        failStatus: "'REVIEW'",
+        difference: cast(`${targetValues} - ${sourceValues}`),
+        agreement: { deviation: `ABS(${targetValues} - ${sourceValues})`, whole: sourceValues },
+        passWhen: `${targetValues} = ${sourceValues}`,
         from: `FROM ${prefix} t CROSS JOIN ${prefix}_s${i + 1} s`
       });
 
@@ -447,14 +576,15 @@ function targetBundle(
         source: entry.source,
         metric: `unmatched values of ${label}`,
         // Equal distinct counts still hide a value swapped for another, which is what this row is
-        // for. Never FAIL, whichever direction it goes: a value dropped may be the filter doing its
-        // job, and a value added may be the transformation remapping codes on purpose. The two
-        // numbers sit side by side so the reader can tell which of the two happened.
+        // for. A value dropped may be the filter doing its job and a value added may be the
+        // transformation remapping codes on purpose, so the two numbers sit side by side for the
+        // reader to tell which happened, and the share of the value set involved sets the severity.
         sourceValue: cast("v.values_dropped"),
         targetValue: cast("v.values_added"),
         difference: cast("v.values_added + v.values_dropped"),
+        // Of every value the two sides hold between them, the share they hold in common.
+        agreement: { deviation: "v.values_added + v.values_dropped", whole: "v.value_pairs" },
         passWhen: "v.values_added + v.values_dropped = 0",
-        failStatus: "'REVIEW'",
         from: `FROM ${prefix}_s${i + 1}_v${j + 1} v`
       });
     });
@@ -473,9 +603,11 @@ function targetBundle(
       sourceValue: cast("m.rows_missing"),
       targetValue: NO_VALUE,
       difference: cast("m.rows_missing"),
+      // Of the source's rows, the share that arrived. Every count-of-failures row below reads the
+      // same way: the population the check looked at, less the rows it flagged.
+      agreement: { deviation: "m.rows_missing", whole: "s.row_count" },
       passWhen: "m.rows_missing = 0",
-      failStatus: "'REVIEW'",
-      from: `FROM ${prefix}_s${i + 1}_missing m`
+      from: `FROM ${prefix}_s${i + 1}_missing m CROSS JOIN ${prefix}_s${i + 1} s`
     });
 
     rows.push({
@@ -486,11 +618,11 @@ function targetBundle(
       sourceValue: NO_VALUE,
       targetValue: cast("o.rows_orphaned"),
       difference: cast("o.rows_orphaned"),
+      agreement: { deviation: "o.rows_orphaned", whole: "t.row_count" },
       // With more than one source, rows this source cannot account for may simply have come from
-      // another of them — a fact worth reading, not a defect on its own.
+      // another of them — which is why the share of the target they represent is what grades the row.
       passWhen: "o.rows_orphaned = 0",
-      failStatus: facts.sources.length > 1 ? "'REVIEW'" : "'FAIL'",
-      from: `FROM ${prefix}_s${i + 1}_orphan o`
+      from: `FROM ${prefix}_s${i + 1}_orphan o CROSS JOIN ${prefix} t`
     });
   });
 
@@ -504,9 +636,9 @@ function targetBundle(
       sourceValue: NO_VALUE,
       targetValue: cast("d.dup_rows"),
       difference: cast("d.dup_rows"),
+      agreement: { deviation: "d.dup_rows", whole: "t.row_count" },
       passWhen: "d.dup_rows = 0",
-      failStatus: keyFailStatus(facts),
-      from: `FROM ${prefix}_dup d`
+      from: `FROM ${prefix}_dup d CROSS JOIN ${prefix} t`
     });
 
     rows.push({
@@ -517,8 +649,8 @@ function targetBundle(
       sourceValue: NO_VALUE,
       targetValue: cast("t.null_key_rows"),
       difference: cast("t.null_key_rows"),
+      agreement: { deviation: "t.null_key_rows", whole: "t.row_count" },
       passWhen: "t.null_key_rows = 0",
-      failStatus: keyFailStatus(facts),
       from: `FROM ${prefix} t`
     });
   }
@@ -551,9 +683,9 @@ function targetBundle(
       sourceValue: NO_VALUE,
       targetValue: cast("c.rows_flagged"),
       difference: cast("c.rows_flagged"),
+      agreement: { deviation: "c.rows_flagged", whole: "t.row_count" },
       passWhen: "c.rows_flagged = 0",
-      failStatus: "'REVIEW'",
-      from: `FROM ${name} c`
+      from: `FROM ${name} c CROSS JOIN ${prefix} t`
     });
 
     appendix.push({
@@ -626,6 +758,42 @@ export function wrap(text: string, indentText: string, width = 76): string[] {
 
 export const RULE = "=".repeat(76);
 
+/**
+ * The verdict, from the two things a row already knows: whether it tied out, and how far off it was.
+ *
+ * Three bands, in the order they are tested:
+ *   - **PASS** only when the two numbers are equal. Not "close enough": the percentage is floored to
+ *     two places, so three missing keys in four million reads `99.99%`, and a row that did not tie out
+ *     must not read as one that did.
+ *   - **FAIL** under `FAIL_BELOW_PERCENT`. A quarter or more of the value never arrived, which is
+ *     structural — the wrong source, a join matching nothing, a predicate excluding almost everything —
+ *     rather than something a filter accounts for.
+ *   - **REVIEW** for everything between: the numbers differ, and something has to explain it.
+ *
+ * Exported and shared with `layerReconciliation.ts` for the same reason `RULE` and `wrap` are: two
+ * generated files that graded the same percentage differently would be two tools, and the reader has
+ * no way to know which one they are holding.
+ */
+export function gradeExpr(passWhen: string, percent: string): string {
+  return (
+    `CASE WHEN ${passWhen} THEN 'PASS'\n` +
+    `            WHEN ${percent} < ${FAIL_BELOW_PERCENT} THEN 'FAIL'\n` +
+    `            ELSE 'REVIEW' END`
+  );
+}
+
+/**
+ * The percentage as it is printed: `99.99%`, not `99.99`.
+ *
+ * `CONCAT` rather than `||` or `+`: the one spelling SQL Server, Snowflake and Databricks SQL share,
+ * and each converts the number for it. The column is therefore text — sort on it and you get string
+ * order — which is the trade for a figure that reads as a percentage without a header to explain it.
+ * The grading above is done on the number, before it becomes one.
+ */
+export function percentText(percent: string): string {
+  return `CONCAT(${percent}, '%')`;
+}
+
 function fileHeader(
   hopLabel: string,
   folderName: string,
@@ -644,14 +812,32 @@ function fileHeader(
     ),
     "",
     "     check_seq | scope | target_table | source_table | check_name | metric |",
-    "     source_value | target_value | difference | status",
+    "     source_value | target_value | difference | accuracy | status",
     "",
-    ...wrap("`difference` is 0 and `status` is PASS on every row when the hop ties out. Otherwise:", "   "),
+    ...wrap(
+      "`difference` is 0, `accuracy` is 100.00% and `status` is PASS on every row when the hop ties " +
+        "out. PASS means exactly that and nothing looser — the percentage is floored, so a row three " +
+        "keys short of four million reads 99.99% and reviews. Otherwise:",
+      "   "
+    ),
     "",
-    "     REVIEW  the numbers differ, and something has to explain it — a filter or an",
-    "             aggregation in the transformation (the ones found are listed per table",
-    "             below), or a reconciliation break.",
-    "     FAIL    wrong on its own terms: target rows the only source cannot account for.",
+    "     REVIEW  the numbers differ by less than a quarter of what they were measured",
+    "             against. Something has to explain it — a filter or an aggregation in",
+    "             the transformation (the ones found are listed per table below), or a",
+    "             reconciliation break.",
+    "     FAIL    accuracy below 75%: a quarter or more of what was measured never",
+    "             arrived. That is structural — the wrong source, a join matching",
+    "             nothing, a predicate excluding almost everything — rather than",
+    "             something a filter accounts for.",
+    "",
+    ...wrap(
+      "`accuracy` is that same difference as a percentage of what it was measured against — the " +
+        "source's own value where two values are compared, and the rows the check looked at where it " +
+        "counts the ones that failed. It is what makes two rows comparable: 300 rows missing out of " +
+        "320 and 300 out of three million are the same `difference` and are not the same problem, and " +
+        "it is what `status` above is graded from.",
+      "   "
+    ),
     "",
     ...targetOnlyNote(targets),
     ...wrap(
@@ -761,7 +947,7 @@ function projectHeader(
     ...hopLabels.map((label) => `     ${label}`),
     "",
     "     check_seq | scope | target_table | source_table | check_name | metric |",
-    "     source_value | target_value | difference | status",
+    "     source_value | target_value | difference | accuracy | status",
     "",
     ...wrap(
       "`scope` names the hop each row belongs to, so one result set covers the whole pipeline — " +
@@ -769,12 +955,30 @@ function projectHeader(
       "   "
     ),
     "",
-    ...wrap("`difference` is 0 and `status` is PASS on every row when the pipeline ties out. Otherwise:", "   "),
+    ...wrap(
+      "`difference` is 0, `accuracy` is 100.00% and `status` is PASS on every row when the pipeline " +
+        "ties out. PASS means exactly that and nothing looser — the percentage is floored, so a row " +
+        "three keys short of four million reads 99.99% and reviews. Otherwise:",
+      "   "
+    ),
     "",
-    "     REVIEW  the numbers differ, and something has to explain it — a filter or an",
-    "             aggregation in the transformation (the ones found are listed per table",
-    "             below), or a reconciliation break.",
-    "     FAIL    wrong on its own terms: target rows the only source cannot account for.",
+    "     REVIEW  the numbers differ by less than a quarter of what they were measured",
+    "             against. Something has to explain it — a filter or an aggregation in",
+    "             the transformation (the ones found are listed per table below), or a",
+    "             reconciliation break.",
+    "     FAIL    accuracy below 75%: a quarter or more of what was measured never",
+    "             arrived. That is structural — the wrong source, a join matching",
+    "             nothing, a predicate excluding almost everything — rather than",
+    "             something a filter accounts for.",
+    "",
+    ...wrap(
+      "`accuracy` is that same difference as a percentage of what it was measured against — the " +
+        "source's own value where two values are compared, and the rows the check looked at where it " +
+        "counts the ones that failed. It is what makes two rows comparable: 300 rows missing out of " +
+        "320 and 300 out of three million are the same `difference` and are not the same problem, and " +
+        "it is what `status` above is graded from.",
+      "   "
+    ),
     "",
     ...wrap(
       "Keep the result by wrapping it: `CREATE TABLE recon_results AS <query>` on Databricks SQL, " +

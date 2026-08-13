@@ -685,7 +685,7 @@ function generatedOutput(): DocBlock[] {
         "bundle is the file to run; the scripts are the detail behind it, and the row-listing queries the " +
         "fold turns into counts are repeated at the foot of the bundle inside block comments."
     ),
-    p("Every bundle returns the same ten columns, one row per check:"),
+    p("Every bundle returns the same eleven columns, one row per check:"),
     table(
       [
         { header: "Column", mono: true, widthPct: 24 },
@@ -700,6 +700,12 @@ function generatedOutput(): DocBlock[] {
         ["metric", "What was measured — a count, a total, a value set"],
         ["source_value / target_value", "The two numbers"],
         ["difference", "target_value − source_value; 0 when the hop ties out"],
+        [
+          "accuracy",
+          "That difference as a percentage of what it was measured against — what makes two rows " +
+            "comparable when one is 300 rows out of 320 and the other 300 out of three million. Floored, " +
+            "so only a check that tied out exactly reads 100.00%"
+        ],
         ["status", "PASS, REVIEW or FAIL"]
       ]
     ),
@@ -709,14 +715,16 @@ function generatedOutput(): DocBlock[] {
         { header: "What it means", widthPct: 84 }
       ],
       [
-        ["PASS", "The two sides agree"],
+        ["PASS", "accuracy 100.00% — the two sides agree exactly"],
         [
           "REVIEW",
-          "The numbers differ and something has to explain it — a filter, an aggregation, a deliberate exclusion"
+          "75% or better but not exact: the numbers differ and something has to explain it — a filter, " +
+            "an aggregation, a deliberate exclusion"
         ],
         [
           "FAIL",
-          "Wrong on its own terms: duplicate keys, null keys, or target rows no source accounts for"
+          "Below 75%: a quarter or more of what was measured never arrived, which is structural rather " +
+            "than incidental"
         ]
       ]
     ),
